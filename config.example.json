@@ -1,0 +1,61 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "public_prefix": "/v1",
+    "auth_token_env": "CODEX_POOL_API_KEY",
+    "max_body_bytes": 52428800,
+    "request_timeout_ms": 180000,
+    "admin_auth_token_env": ""
+  },
+  "model_override": "",
+  "retry": {
+    "max_attempts": 4,
+    "failure_threshold": 2,
+    "base_cooldown_ms": 30000,
+    "key_cooldown_ms": 60000,
+    "retryable_statuses": [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524]
+  },
+  "upstreams": [
+    {
+      "name": "rawchat",
+      "base_url": "https://new.sharedchat.cc/codex",
+      "weight": 3,
+      "keys": [
+        {
+          "env": "RAWCHAT_API_KEY"
+        }
+      ]
+    },
+    {
+      "name": "sub2codex",
+      "base_url": "https://muyuan.do/v1",
+      "weight": 2,
+      "keys": [
+        {
+          "env": "SUB2API_API_KEY"
+        }
+      ]
+    },
+    {
+      "name": "blackandwhilt",
+      "base_url": "https://api.42w.shop/v1",
+      "weight": 1,
+      "keys": [
+        {
+          "env": "BLACK_API_KEY"
+        }
+      ]
+    }
+  ],
+  "health": {
+    "enabled": false,
+    "interval_ms": 60000,
+    "timeout_ms": 10000,
+    "concurrency": 4,
+    "path": "/models"
+  },
+  "stats": {
+    "path": "stats.local.json"
+  }
+}

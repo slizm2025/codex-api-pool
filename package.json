@@ -1,0 +1,15 @@
+{
+  "name": "codex-api-pool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local OpenAI-compatible API pool/router for Codex provider failover.",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "smoke": "node test/smoke-test.mjs",
+    "add": "node scripts/add-upstream.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

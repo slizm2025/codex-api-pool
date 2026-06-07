@@ -1,0 +1,4 @@
+config.local.json
+*.log
+.DS_Store
+stats.local.json

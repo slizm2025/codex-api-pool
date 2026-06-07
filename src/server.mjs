@@ -224,12 +224,17 @@ function isClaudeModel(model) {
   return /^claude(?:-|$)/i.test(String(model || '').trim());
 }
 
-function isAnthropicUpstream(upstream) {
-  return String(upstream?.probeAuth || '').toLowerCase() === 'anthropic';
+function shouldUseAnthropicResponsesAdapter(pathname, model) {
+  return pathname === '/v1/responses' && isClaudeModel(model);
 }
 
-function shouldUseAnthropicResponsesAdapter(pathname, upstream, model) {
-  return pathname === '/v1/responses' && isAnthropicUpstream(upstream) && isClaudeModel(model);
+function anthropicMessagesPathForBaseUrl(baseUrl) {
+  try {
+    const pathname = new URL(baseUrl).pathname.replace(/\/$/, '');
+    return pathname.endsWith('/v1') ? '/messages' : '/v1/messages';
+  } catch {
+    return '/v1/messages';
+  }
 }
 
 function textFromResponsesContent(content) {
@@ -371,15 +376,55 @@ function sseEvent(eventName, payload) {
   return `${event}data: ${JSON.stringify(payload)}\n\n`;
 }
 
-function outputTextDeltaEvent(delta) {
-  return sseEvent('response.output_text.delta', {
+function outputTextDeltaEvent(delta, context = {}) {
+  const payload = {
     type: 'response.output_text.delta',
     delta
-  });
+  };
+  if (context.itemId) payload.item_id = context.itemId;
+  if (context.outputIndex !== undefined) payload.output_index = context.outputIndex;
+  if (context.contentIndex !== undefined) payload.content_index = context.contentIndex;
+  return sseEvent('response.output_text.delta', payload);
 }
 
 function completedResponsesEvent(model, response = {}) {
   return sseEvent('response.completed', responsesCompletedPayload(model, response));
+}
+
+function responseLifecycleEvent(eventName, response) {
+  return sseEvent(eventName, {
+    type: eventName,
+    response
+  });
+}
+
+function responseOutputItemEvent(eventName, item, outputIndex = 0) {
+  return sseEvent(eventName, {
+    type: eventName,
+    output_index: outputIndex,
+    item
+  });
+}
+
+function responseContentPartEvent(eventName, itemId, part, outputIndex = 0, contentIndex = 0) {
+  return sseEvent(eventName, {
+    type: eventName,
+    item_id: itemId,
+    output_index: outputIndex,
+    content_index: contentIndex,
+    part
+  });
+}
+
+function outputTextDoneEvent(text, context = {}) {
+  const payload = {
+    type: 'response.output_text.done',
+    text
+  };
+  if (context.itemId) payload.item_id = context.itemId;
+  if (context.outputIndex !== undefined) payload.output_index = context.outputIndex;
+  if (context.contentIndex !== undefined) payload.content_index = context.contentIndex;
+  return sseEvent('response.output_text.done', payload);
 }
 
 function resolveKey(entry) {
@@ -523,6 +568,8 @@ function createUpstreamState(upstream, index) {
       lastStatus: 0,
       tokenUsage: {
         totalTokens: 0,
+        inputTokens: 0,
+        outputTokens: 0,
         byDay: {}
       }
     },
@@ -823,14 +870,44 @@ function numberFromUnknown(value) {
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
 }
 
+function emptyTokenUsage() {
+  return { totalTokens: 0, inputTokens: 0, outputTokens: 0 };
+}
+
+function normalizeTokenUsage(value) {
+  if (!value || typeof value !== 'object') {
+    const totalTokens = numberFromUnknown(value);
+    return { totalTokens, inputTokens: 0, outputTokens: 0 };
+  }
+  const inputTokens = numberFromUnknown(value.inputTokens ?? value.input_tokens ?? value.promptTokens ?? value.prompt_tokens);
+  const outputTokens = numberFromUnknown(value.outputTokens ?? value.output_tokens ?? value.completionTokens ?? value.completion_tokens);
+  const totalTokens = numberFromUnknown(value.totalTokens ?? value.total_tokens) || inputTokens + outputTokens;
+  return { totalTokens, inputTokens, outputTokens };
+}
+
+function hasTokenUsage(value) {
+  const usage = normalizeTokenUsage(value);
+  return usage.totalTokens > 0 || usage.inputTokens > 0 || usage.outputTokens > 0;
+}
+
+function tokenUsageFromParts({ totalTokens = 0, inputTokens = 0, outputTokens = 0 } = {}) {
+  const normalized = {
+    totalTokens: numberFromUnknown(totalTokens),
+    inputTokens: numberFromUnknown(inputTokens),
+    outputTokens: numberFromUnknown(outputTokens)
+  };
+  if (!normalized.totalTokens) normalized.totalTokens = normalized.inputTokens + normalized.outputTokens;
+  return hasTokenUsage(normalized) ? normalized : emptyTokenUsage();
+}
+
 function extractTokenUsageFromJson(value) {
-  if (!value || typeof value !== 'object') return 0;
+  if (!value || typeof value !== 'object') return emptyTokenUsage();
   if (Array.isArray(value)) {
     for (const item of value) {
-      const total = extractTokenUsageFromJson(item);
-      if (total) return total;
+      const usage = extractTokenUsageFromJson(item);
+      if (hasTokenUsage(usage)) return usage;
     }
-    return 0;
+    return emptyTokenUsage();
   }
   const usage = value.usage && typeof value.usage === 'object'
     ? value.usage
@@ -839,9 +916,19 @@ function extractTokenUsageFromJson(value) {
       : value.usageMetadata && typeof value.usageMetadata === 'object'
         ? value.usageMetadata
         : value;
+  const cacheInputTokens =
+    numberFromUnknown(usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens) +
+    numberFromUnknown(usage.cache_read_input_tokens ?? usage.cacheReadInputTokens);
   for (const key of ['total_tokens', 'totalTokens', 'total_token_count', 'totalTokenCount']) {
     const total = numberFromUnknown(usage[key]);
-    if (total) return total;
+    if (total) {
+      const nested = tokenUsageFromParts({
+        totalTokens: total,
+        inputTokens: numberFromUnknown(usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens) + cacheInputTokens,
+        outputTokens: numberFromUnknown(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens)
+      });
+      return nested.totalTokens || nested.inputTokens || nested.outputTokens ? nested : tokenUsageFromParts({ totalTokens: total });
+    }
   }
   const pairs = [
     ['input_tokens', 'output_tokens'],
@@ -851,28 +938,43 @@ function extractTokenUsageFromJson(value) {
     ['promptTokenCount', 'candidatesTokenCount']
   ];
   for (const [inputKey, outputKey] of pairs) {
-    const total = numberFromUnknown(usage[inputKey]) + numberFromUnknown(usage[outputKey]);
-    if (total) return total;
+    const inputTokens = numberFromUnknown(usage[inputKey]) + cacheInputTokens;
+    const outputTokens = numberFromUnknown(usage[outputKey]);
+    const tokens = tokenUsageFromParts({ inputTokens, outputTokens });
+    if (hasTokenUsage(tokens)) return tokens;
   }
   for (const key of ['response', 'data', 'result']) {
-    const total = extractTokenUsageFromJson(value[key]);
-    if (total) return total;
+    const nested = extractTokenUsageFromJson(value[key]);
+    if (hasTokenUsage(nested)) return nested;
   }
-  return 0;
+  return emptyTokenUsage();
 }
 
 function extractTokenUsageFromHeaders(headers = {}) {
-  return numberFromUnknown(firstHeader(headers, [
+  const inputTokens = numberFromUnknown(firstHeader(headers, [
+    'x-usage-input-tokens',
+    'x-input-tokens',
+    'x-openai-prompt-tokens',
+    'x-prompt-tokens'
+  ]));
+  const outputTokens = numberFromUnknown(firstHeader(headers, [
+    'x-usage-output-tokens',
+    'x-output-tokens',
+    'x-openai-completion-tokens',
+    'x-completion-tokens'
+  ]));
+  const totalTokens = numberFromUnknown(firstHeader(headers, [
     'x-usage-total-tokens',
     'x-total-tokens',
     'x-openai-total-tokens',
     'x-ratelimit-used-tokens',
     'x-used-tokens'
   ]));
+  return tokenUsageFromParts({ totalTokens, inputTokens, outputTokens });
 }
 
 function extractTokenUsageFromBody(body) {
-  if (!body || body.length === 0) return 0;
+  if (!body || body.length === 0) return emptyTokenUsage();
   const text = body.toString('utf8');
   try {
     return extractTokenUsageFromJson(JSON.parse(text));
@@ -882,7 +984,7 @@ function extractTokenUsageFromBody(body) {
 }
 
 function extractTokenUsageFromSse(text) {
-  let lastTotal = 0;
+  let lastUsage = emptyTokenUsage();
   for (const event of String(text).split(/\r?\n\r?\n/)) {
     const payload = event
       .split(/\r?\n/)
@@ -893,13 +995,13 @@ function extractTokenUsageFromSse(text) {
       .trim();
     if (!payload || payload === '[DONE]') continue;
     try {
-      const total = extractTokenUsageFromJson(JSON.parse(payload));
-      if (total) lastTotal = total;
+      const usage = extractTokenUsageFromJson(JSON.parse(payload));
+      if (hasTokenUsage(usage)) lastUsage = usage;
     } catch {
       // Ignore non-JSON event payloads; upstream response is still forwarded unchanged.
     }
   }
-  return lastTotal;
+  return lastUsage;
 }
 
 function shouldCaptureUsageBody(headers = {}) {
@@ -927,7 +1029,8 @@ function createUsageCapture(headers = {}) {
     },
     tokenCount() {
       if (!captureBody || tooLarge || chunks.length === 0) return extractTokenUsageFromHeaders(headers);
-      return extractTokenUsageFromBody(Buffer.concat(chunks, size)) || extractTokenUsageFromHeaders(headers);
+      const bodyUsage = extractTokenUsageFromBody(Buffer.concat(chunks, size));
+      return hasTokenUsage(bodyUsage) ? bodyUsage : extractTokenUsageFromHeaders(headers);
     }
   };
 }
@@ -1078,10 +1181,22 @@ function anthropicUsageToResponsesUsage(usage = {}) {
 function createAnthropicResponsesStreamAdapter(res, model) {
   let buffer = '';
   let completed = false;
+  let started = false;
+  let contentStarted = false;
+  let textDone = false;
   let responseId = '';
+  let itemId = '';
   let responseModel = model || '';
   let outputText = '';
   let usage = null;
+  const createdAt = Math.floor(now() / 1000);
+  const outputIndex = 0;
+  const contentIndex = 0;
+
+  function ensureIds() {
+    if (!responseId) responseId = `resp_pool_${now().toString(36)}`;
+    if (!itemId) itemId = responseId;
+  }
 
   function mergeUsage(nextUsage) {
     const normalized = anthropicUsageToResponsesUsage(nextUsage);
@@ -1093,15 +1208,81 @@ function createAnthropicResponsesStreamAdapter(res, model) {
     };
   }
 
+  function responsePayload(status = 'in_progress', output = []) {
+    ensureIds();
+    return {
+      id: responseId,
+      object: 'response',
+      created_at: createdAt,
+      status,
+      model: responseModel || model || '',
+      output,
+      usage: status === 'completed' ? (usage === undefined ? null : usage) : null
+    };
+  }
+
+  function messageItem(status = 'in_progress') {
+    ensureIds();
+    return {
+      id: itemId,
+      type: 'message',
+      status,
+      role: 'assistant',
+      content: status === 'completed' && outputText
+        ? [{ type: 'output_text', text: outputText, annotations: [] }]
+        : []
+    };
+  }
+
+  function outputTextPart(text = '') {
+    return { type: 'output_text', text, annotations: [] };
+  }
+
+  function ensureStarted() {
+    if (started) return;
+    started = true;
+    res.write(responseLifecycleEvent('response.created', responsePayload('in_progress')));
+    res.write(responseLifecycleEvent('response.in_progress', responsePayload('in_progress')));
+    res.write(responseOutputItemEvent('response.output_item.added', messageItem('in_progress'), outputIndex));
+  }
+
+  function ensureContentStarted() {
+    ensureStarted();
+    if (contentStarted) return;
+    contentStarted = true;
+    res.write(responseContentPartEvent(
+      'response.content_part.added',
+      itemId || responseId,
+      outputTextPart(''),
+      outputIndex,
+      contentIndex
+    ));
+  }
+
+  function writeTextDone() {
+    if (textDone || !contentStarted) return;
+    textDone = true;
+    res.write(outputTextDoneEvent(outputText, { itemId: itemId || responseId, outputIndex, contentIndex }));
+    res.write(responseContentPartEvent(
+      'response.content_part.done',
+      itemId || responseId,
+      outputTextPart(outputText),
+      outputIndex,
+      contentIndex
+    ));
+  }
+
   function writeCompleted() {
     if (completed) return;
     completed = true;
+    ensureStarted();
+    writeTextDone();
+    const finalItem = messageItem('completed');
+    res.write(responseOutputItemEvent('response.output_item.done', finalItem, outputIndex));
     res.write(completedResponsesEvent(model, {
       id: responseId,
       model: responseModel,
-      output: outputText
-        ? [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: outputText }] }]
-        : [],
+      output: outputText ? [finalItem] : [],
       usage
     }));
     res.write('data: [DONE]\n\n');
@@ -1119,16 +1300,19 @@ function createAnthropicResponsesStreamAdapter(res, model) {
 
     if (event.type === 'message_start' && event.message) {
       responseId = event.message.id || responseId;
+      itemId = event.message.id || itemId || responseId;
       responseModel = event.message.model || responseModel;
       mergeUsage(event.message.usage);
+      ensureStarted();
       return;
     }
 
     if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
       const delta = String(event.delta.text || '');
       if (!delta) return;
+      ensureContentStarted();
       outputText += delta;
-      res.write(outputTextDeltaEvent(delta));
+      res.write(outputTextDeltaEvent(delta, { itemId: itemId || responseId, outputIndex, contentIndex }));
       return;
     }
 
@@ -1193,9 +1377,11 @@ function anthropicMessageToResponsesJson(body, model) {
 
 function ensureTokenUsage(stats) {
   if (!stats.tokenUsage || typeof stats.tokenUsage !== 'object') {
-    stats.tokenUsage = { totalTokens: 0, byDay: {} };
+    stats.tokenUsage = { totalTokens: 0, inputTokens: 0, outputTokens: 0, byDay: {} };
   }
   stats.tokenUsage.totalTokens = numberFromUnknown(stats.tokenUsage.totalTokens);
+  stats.tokenUsage.inputTokens = numberFromUnknown(stats.tokenUsage.inputTokens);
+  stats.tokenUsage.outputTokens = numberFromUnknown(stats.tokenUsage.outputTokens);
   if (!stats.tokenUsage.byDay || typeof stats.tokenUsage.byDay !== 'object' || Array.isArray(stats.tokenUsage.byDay)) {
     stats.tokenUsage.byDay = {};
   }
@@ -1203,12 +1389,14 @@ function ensureTokenUsage(stats) {
 }
 
 function recordTokenUsage(upstream, tokenCount, timestamp = now()) {
-  const tokens = numberFromUnknown(tokenCount);
-  if (!tokens) return 0;
+  const tokens = normalizeTokenUsage(tokenCount);
+  if (!hasTokenUsage(tokens)) return emptyTokenUsage();
   const usage = ensureTokenUsage(upstream.stats);
   const day = localDateKey(timestamp);
-  usage.totalTokens += tokens;
-  usage.byDay[day] = numberFromUnknown(usage.byDay[day]) + tokens;
+  usage.totalTokens += tokens.totalTokens;
+  usage.inputTokens += tokens.inputTokens;
+  usage.outputTokens += tokens.outputTokens;
+  usage.byDay[day] = numberFromUnknown(usage.byDay[day]) + tokens.totalTokens;
   return tokens;
 }
 
@@ -1216,6 +1404,8 @@ function usagePayload(stats, today = localDateKey()) {
   const usage = ensureTokenUsage(stats);
   return {
     total_tokens: usage.totalTokens,
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
     today_tokens: numberFromUnknown(usage.byDay[today]),
     by_day: { ...usage.byDay }
   };
@@ -1224,15 +1414,21 @@ function usagePayload(stats, today = localDateKey()) {
 function aggregateUsage(upstreams, today = localDateKey()) {
   const byDay = {};
   let totalTokens = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
   for (const upstream of upstreams) {
     const usage = ensureTokenUsage(upstream.stats);
     totalTokens += usage.totalTokens;
+    inputTokens += usage.inputTokens;
+    outputTokens += usage.outputTokens;
     for (const [day, value] of Object.entries(usage.byDay)) {
       byDay[day] = numberFromUnknown(byDay[day]) + numberFromUnknown(value);
     }
   }
   return {
     total_tokens: totalTokens,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
     today_tokens: numberFromUnknown(byDay[today]),
     by_day: byDay
   };
@@ -1588,7 +1784,7 @@ function recordFailure(state, upstream, key, reason, statusCode, retryAfter) {
 }
 
 function finishResponseAttempt({ state, upstream, key, method, pathname, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, statsPath }) {
-  const recordedTokens = statusCode >= 200 && statusCode < 400 ? recordTokenUsage(upstream, tokenCount, startedAt) : 0;
+  const recordedTokens = statusCode >= 200 && statusCode < 400 ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
   if (statusCode >= 200 && statusCode < 400) {
     recordSuccess(upstream, startedAt, statusCode);
   } else {
@@ -1606,7 +1802,9 @@ function finishResponseAttempt({ state, upstream, key, method, pathname, origina
     retried: attempt > 1,
     outcome: statusCode >= 200 && statusCode < 400 ? 'ok' : 'error',
     reason: statusCode >= 400 ? reason || `HTTP ${statusCode}` : '',
-    tokens: recordedTokens
+    tokens: recordedTokens.totalTokens,
+    inputTokens: recordedTokens.inputTokens,
+    outputTokens: recordedTokens.outputTokens
   });
   persistStats(state, statsPath);
 }
@@ -1646,11 +1844,21 @@ function requestUpstream({ req, body, targetUrl, upstream, key, timeoutMs, allow
         const retryAfter = upstreamRes.headers['retry-after'];
 
         if (allowRetry && retryableStatus.has(statusCode)) {
-          upstreamRes.resume();
+          const chunks = [];
+          let total = 0;
+          upstreamRes.on('data', (chunk) => {
+            if (total >= 4096) return;
+            const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            const available = Math.max(0, 4096 - total);
+            chunks.push(next.subarray(0, available));
+            total += Math.min(next.length, available);
+          });
           upstreamRes.on('end', () => {
             if (settled) return;
             settled = true;
-            resolve({ type: 'retry', statusCode, retryAfter, headers: upstreamRes.headers, reason: `HTTP ${statusCode}`, startedAt });
+            const bodyText = chunks.length ? Buffer.concat(chunks, total).toString('utf8').trim() : '';
+            const reason = bodyText ? `HTTP ${statusCode}: ${bodyText.slice(0, 1000)}` : `HTTP ${statusCode}`;
+            resolve({ type: 'retry', statusCode, retryAfter, headers: upstreamRes.headers, reason, startedAt });
           });
           upstreamRes.on('error', (error) => {
             if (settled) return;
@@ -2045,7 +2253,7 @@ function dashboardHtml() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Codex API Pool Radar</title>
+  <title>Codex API Pool Console</title>
   <style>
     :root {
       --ink: #17211d;
@@ -2081,9 +2289,10 @@ function dashboardHtml() {
       background: linear-gradient(180deg, rgba(255,255,255,.64), rgba(255,255,255,0));
     }
     .shell { position: relative; width: min(1240px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 48px; }
-    header { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: end; margin-bottom: 20px; }
-    h1 { font-family: Didot, Bodoni 72, Georgia, serif; font-size: clamp(38px, 5.6vw, 72px); line-height: .92; margin: 0; letter-spacing: 0; }
+    header { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: end; margin-bottom: 16px; }
+    h1 { font-size: clamp(28px, 3.4vw, 42px); line-height: 1; margin: 0; letter-spacing: 0; }
     .lede { color: var(--muted); font-size: 14px; line-height: 1.6; max-width: 620px; }
+    .eyebrow { color: var(--muted); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; margin-bottom: 8px; }
     .toolbar { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
     button, input, select { font: inherit; }
     a { color: inherit; }
@@ -2104,7 +2313,7 @@ function dashboardHtml() {
       white-space: nowrap;
     }
     button:hover { transform: translateY(-1px); box-shadow: 0 12px 22px rgba(23,33,29,.18); }
-    button:focus-visible, input:focus-visible, select:focus-visible, .card:focus-visible, .site-link:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
+    button:focus-visible, input:focus-visible, select:focus-visible, .card:focus-visible, .site-link:focus-visible, .metric[role="button"]:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     .ghost { color: var(--ink); background: transparent; }
     .panel {
       border: 1px solid var(--line);
@@ -2113,21 +2322,53 @@ function dashboardHtml() {
       border-radius: 8px;
       box-shadow: 0 18px 48px rgba(31, 45, 39, .1);
     }
+    .dashboard-region { margin-top: 14px; }
+    .section-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 12px; }
+    .section-head h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
+    .section-head p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; max-width: 560px; }
+    .top-diagnostic { padding: 16px; }
+    .diagnostic-strip { display: grid; grid-template-columns: minmax(168px, .65fr) minmax(260px, 1.35fr) minmax(330px, 1.25fr); gap: 12px; align-items: stretch; margin-bottom: 14px; }
+    .diagnostic-strip > div { border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.4); padding: 12px 14px; min-width: 0; }
+    .diagnostic-state { border-left: 4px solid var(--cold) !important; }
+    .diagnostic-strip[data-state="usable"] .diagnostic-state { border-left-color: var(--good) !important; background: rgba(22,136,90,.08); }
+    .diagnostic-strip[data-state="degraded"] .diagnostic-state { border-left-color: var(--warn) !important; background: rgba(183,121,8,.1); }
+    .diagnostic-strip[data-state="blocked"] .diagnostic-state { border-left-color: var(--bad) !important; background: rgba(180,59,50,.1); }
+    .diagnostic-label { display: block; color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 6px; }
+    .diagnostic-state b { display: block; font-size: 27px; line-height: 1.05; letter-spacing: 0; }
+    .diagnostic-message strong { display: block; font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+    .diagnostic-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .diagnostic-meta div { min-width: 0; }
+    .diagnostic-meta strong { display: block; font-size: 13px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin-bottom: 14px; }
     .metric { padding: 14px 16px; position: relative; overflow: hidden; border-left: 4px solid var(--accent); }
     .metric b { display: block; font-size: 28px; letter-spacing: 0; line-height: 1.05; }
     .metric span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; }
-    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-    .card { padding: 16px; min-height: 278px; animation: rise .35s ease both; cursor: pointer; transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
-    .grid.stable .card { animation: none; }
-    .card:hover { transform: translateY(-2px); border-color: var(--line-strong); box-shadow: 0 20px 54px rgba(31, 45, 39, .14); }
+    .metric[role="button"] { cursor: pointer; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; background: rgba(255,255,255,.3); }
+    .metric[role="button"]:hover { border-color: var(--line-strong); }
+    .token-breakdown { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); display: grid; gap: 5px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .token-breakdown[hidden] { display: none; }
+    .token-breakdown div { display: flex; justify-content: space-between; gap: 10px; }
+    .token-breakdown strong { color: var(--ink); font-size: 12px; line-height: 1.35; }
+    .grid { display: grid; gap: 8px; }
+    .workbench-list { display: grid; gap: 8px; }
+    .workbench-head, .workbench-row { display: grid; grid-template-columns: minmax(190px, 1.35fr) 116px 112px minmax(150px, .9fr) minmax(150px, .85fr) minmax(170px, .95fr) 238px; gap: 10px; align-items: center; }
+    .workbench-head { padding: 0 12px 2px; color: var(--muted); font-size: 11px; letter-spacing: .11em; text-transform: uppercase; }
+    .card { padding: 12px; min-height: 0; animation: rise .35s ease both; cursor: pointer; transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
+    .workbench-list.stable .card { animation: none; }
+    .card:hover { transform: translateY(-1px); border-color: var(--line-strong); box-shadow: 0 16px 42px rgba(31, 45, 39, .13); }
     .card.editing { border-color: rgba(18, 128, 92, .62); box-shadow: 0 0 0 4px var(--glow), 0 18px 48px rgba(31, 45, 39, .1); }
     .card.paused { border-style: dashed; opacity: .76; }
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
     .card-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 14px; }
-    .name { font-family: Didot, Bodoni 72, Georgia, serif; font-size: 28px; letter-spacing: 0; line-height: 1.02; word-break: break-word; }
+    .name { font-size: 17px; font-weight: 700; letter-spacing: 0; line-height: 1.12; word-break: break-word; }
     .url { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 5px; }
     .card-actions { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+    .workbench-cell { min-width: 0; display: grid; gap: 5px; }
+    .workbench-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .workbench-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mini-line { color: var(--muted); font-size: 12px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mini-line strong { color: var(--ink); font-weight: 700; }
+    .workbench-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
     .pill { border-radius: 999px; border: 1px solid currentColor; padding: 6px 10px; font-size: 12px; white-space: nowrap; }
     .site-link { border: 1px solid var(--line-strong); border-radius: 7px; padding: 7px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; background: rgba(255,255,255,.46); min-width: 58px; text-align: center; }
     .site-link:hover { background: var(--ink); color: var(--paper); }
@@ -2151,47 +2392,49 @@ function dashboardHtml() {
     .fact strong.money[data-size="medium"] { font-size: 15px; }
     .fact strong.money[data-size="long"] { font-size: 13px; }
     .fact strong.money[data-size="tiny"] { font-size: 11px; }
-    .keys { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .keys { display: flex; gap: 6px; flex-wrap: wrap; }
     .key { border: 1px dashed var(--line-strong); border-radius: 7px; padding: 6px 8px; color: var(--muted); font-size: 12px; }
     .key.ok { color: var(--good); background: rgba(22,136,90,.06); }
     .key.warn { color: var(--warn); background: rgba(183,121,8,.08); }
     .key.bad { color: var(--bad); background: rgba(180,59,50,.08); }
     .key.cold { color: var(--cold); background: rgba(49,95,125,.08); }
     form { margin-top: 18px; padding: 18px; display: grid; grid-template-columns: 1fr 1.5fr 1.5fr .6fr 1fr auto auto; gap: 10px; align-items: end; }
+    form .section-head { grid-column: 1 / -1; }
     .form-mode { grid-column: 1 / -1; color: var(--muted); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
     input, select { width: 100%; min-height: 38px; border: 1px solid var(--line); background: rgba(255,255,255,.62); border-radius: 7px; padding: 9px 11px; color: var(--ink); outline: none; }
     input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     .token-input { width: 180px; }
-    .model-panel { margin-bottom: 14px; padding: 16px; display: grid; grid-template-columns: minmax(220px, .8fr) 1.2fr auto; gap: 14px; align-items: end; }
+    .model-panel { padding: 14px; display: grid; grid-template-columns: minmax(220px, .8fr) 1.2fr auto; gap: 14px; align-items: end; }
     .model-readout { color: var(--muted); font-size: 13px; line-height: 1.45; }
-    .requests { margin-top: 18px; padding: 18px; }
+    .requests { padding: 18px; }
     .requests-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 12px; }
     .requests-head h2 { margin: 0; font-family: Didot, Bodoni 72, Georgia, serif; font-size: 28px; letter-spacing: 0; }
     .request-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
     .request-row { display: grid; grid-template-columns: 1.2fr 1fr 1fr .6fr; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: rgba(255,255,255,.48); font-size: 12px; }
     .request-row strong { font-size: 13px; overflow-wrap: anywhere; }
     .request-row small { color: var(--muted); display: block; letter-spacing: .08em; text-transform: uppercase; }
-    .models { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; max-height: 112px; overflow: auto; }
+    .models { display: flex; gap: 6px; flex-wrap: wrap; max-height: 62px; overflow: auto; }
     .model-chip { color: var(--ink); background: rgba(255,255,255,.54); border-color: var(--line); box-shadow: none; padding: 6px 8px; font-size: 12px; max-width: 100%; overflow-wrap: anywhere; }
     .model-chip.active { color: var(--paper); background: var(--ink); border-color: var(--ink); }
-    .usage-days { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; max-height: 78px; overflow: auto; }
+    .usage-days { display: flex; gap: 8px; flex-wrap: wrap; max-height: 78px; overflow: auto; }
     .usage-day { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: rgba(255,255,255,.44); color: var(--muted); font-size: 12px; }
     .usage-day strong { color: var(--ink); margin-left: 6px; }
     .statusbar { min-height: 24px; margin-top: 12px; display: flex; justify-content: space-between; gap: 16px; align-items: center; color: var(--muted); font-size: 13px; }
     .toast { min-width: 0; overflow-wrap: anywhere; }
     .last-refresh { flex: 0 0 auto; color: rgba(99,112,107,.82); }
     .empty { padding: 24px; color: var(--muted); }
-    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, 1fr); } .facts { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 760px) { header, .summary, .model-panel, .grid, form { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .request-row { grid-template-columns: 1fr; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
+    @media (max-width: 1100px) { .diagnostic-strip { grid-template-columns: 1fr; } .workbench-head { display: none; } .workbench-row { grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(120px, 1fr)); } .facts { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 760px) { header, .summary, .model-panel, .grid, .workbench-row, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .workbench-actions { justify-content: flex-start; } .request-row { grid-template-columns: 1fr; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
   </style>
 </head>
 <body>
   <main class="shell">
     <header>
       <div>
-        <h1>API Pool<br/>Radar</h1>
-        <p class="lede">本地 Codex API 池检测面板。自动刷新每个站点的健康状态、延迟、状态码、模型数量、冷却时间，并支持运行时添加新站点。</p>
+        <div class="eyebrow">Management Dashboard</div>
+        <h1>Codex API Pool</h1>
+        <p class="lede">本地 Operational Console，用于快速诊断 Codex 请求失败、查看 Upstream Runtime State，并执行安全的 Management API 操作。</p>
       </div>
       <div class="toolbar">
         <input id="adminToken" class="token-input" type="password" placeholder="Admin token" autocomplete="off" />
@@ -2201,31 +2444,77 @@ function dashboardHtml() {
       </div>
     </header>
 
-    <section class="summary">
-      <div class="metric panel"><span>Upstreams</span><b id="total">0</b></div>
-      <div class="metric panel"><span>Available</span><b id="available">0</b></div>
-      <div class="metric panel"><span>Healthy</span><b id="healthy">0</b></div>
-      <div class="metric panel"><span>Cooling</span><b id="cooling">0</b></div>
-      <div class="metric panel"><span>Tokens</span><b id="totalTokens">0</b></div>
+    <section class="top-diagnostic panel dashboard-region" data-dashboard-region="top-diagnostic-bar" aria-labelledby="top-diagnostic-title">
+      <div class="section-head">
+        <h2 id="top-diagnostic-title">Top Diagnostic Bar</h2>
+        <p>API Pool 可用性、Selection 候选、Model Override 和请求失败诊断入口。</p>
+      </div>
+      <div class="diagnostic-strip" id="poolDiagnostic" data-state="blocked" aria-live="polite">
+        <div class="diagnostic-state">
+          <span class="diagnostic-label">Pool Usability</span>
+          <b id="poolUsability">Checking</b>
+        </div>
+        <div class="diagnostic-message">
+          <span class="diagnostic-label">Most Likely Reason</span>
+          <strong id="diagnosticReason">等待 Management API 状态。</strong>
+        </div>
+        <div class="diagnostic-meta">
+          <div>
+            <span class="diagnostic-label">Selection</span>
+            <strong id="selectionCount">0 eligible</strong>
+          </div>
+          <div>
+            <span class="diagnostic-label">Model Override</span>
+            <strong id="modelOverrideState">Following request</strong>
+          </div>
+          <div>
+            <span class="diagnostic-label">Admin Token</span>
+            <strong id="adminTokenState">Checking</strong>
+          </div>
+        </div>
+      </div>
+      <div class="summary">
+        <div class="metric"><span>Upstreams</span><b id="total">0</b></div>
+        <div class="metric"><span>Available</span><b id="available">0</b></div>
+        <div class="metric"><span>Healthy</span><b id="healthy">0</b></div>
+        <div class="metric"><span>Cooling</span><b id="cooling">0</b></div>
+        <div class="metric" id="totalTokensMetric" role="button" tabindex="0" aria-expanded="false" aria-controls="totalTokenBreakdown">
+          <span>Tokens</span><b id="totalTokens">0</b>
+          <div class="token-breakdown" id="totalTokenBreakdown" hidden>
+            <div><span>Input</span><strong id="inputTokens">0</strong></div>
+            <div><span>Output</span><strong id="outputTokens">0</strong></div>
+            <div><span>Unclassified</span><strong id="unknownTokens">0</strong></div>
+          </div>
+        </div>
+      </div>
+      <div class="model-panel panel">
+        <label>当前模型<select id="modelSelect"><option value="">跟随 Codex 请求</option></select></label>
+        <div class="model-readout" id="modelReadout">尚未完成模型探测。</div>
+        <button class="ghost" id="clearModel" type="button">清空覆盖</button>
+      </div>
     </section>
 
-    <section class="model-panel panel">
-      <label>当前模型<select id="modelSelect"><option value="">跟随 Codex 请求</option></select></label>
-      <div class="model-readout" id="modelReadout">尚未完成模型探测。</div>
-      <button class="ghost" id="clearModel" type="button">清空覆盖</button>
+    <section class="dashboard-region" data-dashboard-region="upstream-workbench" aria-labelledby="upstream-workbench-title">
+      <div class="section-head">
+        <h2 id="upstream-workbench-title">Upstream Workbench</h2>
+        <p>扫描每个 Upstream 的 Health State、Cooldown、Usage、Billing、Quota 和安全操作。</p>
+      </div>
+      <section id="cards" class="workbench-list" aria-label="Upstream Workbench rows"></section>
     </section>
 
-    <section id="cards" class="grid"></section>
-
-    <section class="requests panel">
+    <section class="requests panel dashboard-region" data-dashboard-region="recent-request-timeline" aria-labelledby="recent-request-timeline-title">
       <div class="requests-head">
-        <h2>最近请求</h2>
+        <h2 id="recent-request-timeline-title">Recent Request Timeline</h2>
         <div class="model-readout">原模型 -> 实际模型 -> 上游</div>
       </div>
       <div id="requestList" class="request-list"></div>
     </section>
 
-    <form id="addForm" class="panel">
+    <form id="addForm" class="panel dashboard-region" data-dashboard-region="upstream-editor" aria-labelledby="upstream-editor-title">
+      <div class="section-head">
+        <h2 id="upstream-editor-title">Upstream Editor</h2>
+        <p>添加或编辑 Upstream Pool Configuration，同时保持 Request Failure Diagnosis 为主。</p>
+      </div>
       <div class="form-mode" id="formMode">添加新站点</div>
       <label>名称<input name="name" placeholder="mysite" required /></label>
       <label>Base URL<input name="base_url" placeholder="https://example.com/v1" required /></label>
@@ -2253,6 +2542,14 @@ function dashboardHtml() {
     const formMode = document.querySelector('#formMode');
     const submitUpstream = document.querySelector('#submitUpstream');
     const cancelEdit = document.querySelector('#cancelEdit');
+    const totalTokensMetric = document.querySelector('#totalTokensMetric');
+    const totalTokenBreakdown = document.querySelector('#totalTokenBreakdown');
+    const poolDiagnostic = document.querySelector('#poolDiagnostic');
+    const poolUsability = document.querySelector('#poolUsability');
+    const diagnosticReason = document.querySelector('#diagnosticReason');
+    const selectionCount = document.querySelector('#selectionCount');
+    const modelOverrideState = document.querySelector('#modelOverrideState');
+    const adminTokenState = document.querySelector('#adminTokenState');
     let editingName = '';
     let upstreamCache = new Map();
     let cardsSignature = '';
@@ -2296,6 +2593,21 @@ function dashboardHtml() {
       return Number.isFinite(number)
         ? number.toLocaleString(undefined, { maximumFractionDigits: 8 })
         : String(value);
+    }
+    function tokenBreakdownText(usage = {}) {
+      const total = Number(usage.total_tokens || usage.tokens || 0);
+      const input = Number(usage.input_tokens || usage.inputTokens || 0);
+      const output = Number(usage.output_tokens || usage.outputTokens || 0);
+      const unknown = Math.max(0, total - input - output);
+      return { total, input, output, unknown };
+    }
+    function updateTokenBreakdown(usage = {}) {
+      const tokens = tokenBreakdownText(usage);
+      document.querySelector('#totalTokens').textContent = fmt(tokens.total);
+      document.querySelector('#inputTokens').textContent = fmt(tokens.input);
+      document.querySelector('#outputTokens').textContent = fmt(tokens.output);
+      document.querySelector('#unknownTokens').textContent = fmt(tokens.unknown);
+      totalTokensMetric.title = \`Input \${tokens.input} · Output \${tokens.output} · Unclassified \${tokens.unknown}\`;
     }
     function fmtMoney(value, currency = '') {
       if (value === null || value === undefined || value === '') return '—';
@@ -2343,6 +2655,77 @@ function dashboardHtml() {
     const quotaReqValue = (upstream) => upstream.quota?.requestsRemaining || upstream.quota?.quotaRemaining || '';
     const quotaTokValue = (upstream) => upstream.quota?.tokensRemaining || '';
     const sortedUpstreams = (items) => [...items].sort((a, b) => Number(b.weight || 0) - Number(a.weight || 0) || String(a.name).localeCompare(String(b.name)));
+    const upstreamSupportsModel = (upstream, model) => {
+      if (!model) return true;
+      const models = upstream.health?.models || [];
+      return models.length === 0 || models.includes(model);
+    };
+    const hasConfiguredKey = (upstream) => (upstream.keys || []).some((key) => key.configured);
+    const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key'].includes(upstream.health?.state || '');
+    function requestFailureText(request) {
+      if (!request || request.outcome === 'ok') return '';
+      const upstream = request.upstream ? ' on ' + request.upstream : '';
+      const status = request.status ? 'HTTP ' + request.status : 'request failed';
+      const reason = request.reason ? ': ' + request.reason : '';
+      return 'Latest request failed' + upstream + ': ' + status + reason;
+    }
+    function likelyDiagnosticReason(ups, activeModel, eligible, latestFailure) {
+      const enabled = ups.filter((upstream) => upstream.enabled);
+      const available = ups.filter((upstream) => upstream.available);
+      const cooling = enabled.filter((upstream) => upstream.cooldown_ms > 0);
+      const missingKeys = enabled.filter((upstream) => !hasConfiguredKey(upstream));
+      const disabled = ups.filter((upstream) => !upstream.enabled);
+      const modelExcluded = activeModel
+        ? available.filter((upstream) => {
+          const models = upstream.health?.models || [];
+          return models.length > 0 && !models.includes(activeModel);
+        })
+        : [];
+      const hardFailures = enabled.filter(isHardHealthFailure);
+      if (ups.length === 0) return 'Blocked: no Upstreams configured.';
+      if (enabled.length === 0) return 'Blocked: all Upstreams are Disabled.';
+      if (eligible.length === 0 && missingKeys.length === enabled.length) return 'Blocked: no configured Upstream Keys are available.';
+      if (eligible.length === 0 && modelExcluded.length > 0) return 'Blocked: Model Override ' + activeModel + ' is not a Discovered Model on any available Upstream.';
+      if (eligible.length === 0 && cooling.length > 0) return 'Blocked: all Selection candidates are in Cooldown.';
+      if (eligible.length === 0) return 'Blocked: zero Upstreams can currently participate in Selection.';
+      if (latestFailure) return latestFailure;
+      if (disabled.length > 0) return 'Degraded: ' + disabled.length + ' Upstream' + (disabled.length === 1 ? '' : 's') + ' Disabled.';
+      if (cooling.length > 0) return 'Degraded: ' + cooling.length + ' Upstream' + (cooling.length === 1 ? '' : 's') + ' in Cooldown.';
+      if (missingKeys.length > 0) return 'Degraded: ' + missingKeys.length + ' enabled Upstream' + (missingKeys.length === 1 ? '' : 's') + ' missing configured Upstream Keys.';
+      if (modelExcluded.length > 0) return 'Degraded: ' + modelExcluded.length + ' available Upstream' + (modelExcluded.length === 1 ? '' : 's') + ' excluded by Model Override.';
+      if (hardFailures.length > 0) return 'Degraded: ' + hardFailures.length + ' enabled Upstream' + (hardFailures.length === 1 ? '' : 's') + ' reporting hard Health State.';
+      if (available.length < enabled.length) return 'Degraded: ' + available.length + ' of ' + enabled.length + ' enabled Upstreams are available.';
+      return 'Usable: Selection has eligible Upstreams and no current blocking reason.';
+    }
+    function updateTopDiagnostic(data, ups, activeModel) {
+      const eligible = ups.filter((upstream) => upstream.available && upstreamSupportsModel(upstream, activeModel));
+      const latestFailure = requestFailureText((data.recent_requests || [])[0]);
+      const enabled = ups.filter((upstream) => upstream.enabled);
+      const degraded = eligible.length > 0 && (
+        eligible.length < enabled.length ||
+        ups.some((upstream) => !upstream.enabled || upstream.cooldown_ms > 0 || isHardHealthFailure(upstream)) ||
+        Boolean(latestFailure)
+      );
+      const state = eligible.length === 0 ? 'blocked' : degraded ? 'degraded' : 'usable';
+      poolDiagnostic.dataset.state = state;
+      poolUsability.textContent = state[0].toUpperCase() + state.slice(1);
+      selectionCount.textContent = eligible.length + ' / ' + ups.length + ' eligible';
+      selectionCount.title = eligible.length + ' Upstreams can participate in Selection; ' + ups.filter((upstream) => upstream.available).length + ' are currently available before Model Override filtering.';
+      modelOverrideState.textContent = activeModel || 'Following request';
+      modelOverrideState.title = activeModel ? 'Model Override: ' + activeModel : 'No Model Override; use Requested Model.';
+      adminTokenState.textContent = adminToken ? 'Accepted' : 'Not required';
+      diagnosticReason.textContent = likelyDiagnosticReason(ups, activeModel, eligible, latestFailure);
+    }
+    function updateTopDiagnosticAuthBlocked() {
+      poolDiagnostic.dataset.state = 'blocked';
+      poolUsability.textContent = 'Blocked';
+      diagnosticReason.textContent = 'Management API rejected the request: Admin Token is missing or invalid.';
+      selectionCount.textContent = 'unknown';
+      selectionCount.title = 'Selection state is unavailable until Management API authentication succeeds.';
+      modelOverrideState.textContent = 'unknown';
+      modelOverrideState.title = 'Model Override state is unavailable until Management API authentication succeeds.';
+      adminTokenState.textContent = adminToken ? 'Invalid' : 'Required';
+    }
     const cardSignature = (items, activeModel) => items.map((u) => [
       u.name,
       u.base_url,
@@ -2351,6 +2734,8 @@ function dashboardHtml() {
       u.weight,
       u.usage?.today_tokens || 0,
       u.usage?.total_tokens || 0,
+      u.usage?.input_tokens || 0,
+      u.usage?.output_tokens || 0,
       JSON.stringify(u.usage?.by_day || {}),
       u.billing?.state || '',
       u.billing?.balance_amount ?? '',
@@ -2431,6 +2816,8 @@ function dashboardHtml() {
       setText(card, '[data-field="calls"]', upstream.stats?.attempts || 0);
       setText(card, '[data-field="today_tokens"]', fmt(upstream.usage?.today_tokens));
       setText(card, '[data-field="total_tokens"]', fmt(upstream.usage?.total_tokens));
+      const totalTokenNode = card.querySelector('[data-field="total_tokens"]');
+      if (totalTokenNode) totalTokenNode.title = \`Input \${fmt(upstream.usage?.input_tokens || 0)} · Output \${fmt(upstream.usage?.output_tokens || 0)}\`;
       setText(card, '[data-field="billing_state"]', upstream.billing?.state || 'unknown');
       const billingFact = card.querySelector('[data-billing-fact]');
       if (billingFact) billingFact.title = upstream.billing?.error || '';
@@ -2470,7 +2857,7 @@ function dashboardHtml() {
         <div class="request-row">
           <div><small>Model</small><strong>\${esc(item.originalModel || 'none')} -> \${esc(item.actualModel || 'none')}</strong></div>
           <div><small>Upstream</small><strong>\${esc(item.upstream || 'unknown')}</strong></div>
-          <div><small>Status</small><strong>\${esc(item.outcome || '')} · \${esc(item.status ?? 0)} · \${esc(item.durationMs ?? 0)}ms · \${esc(item.tokens ?? 0)} tok</strong></div>
+          <div><small>Status</small><strong>\${esc(item.outcome || '')} · \${esc(item.status ?? 0)} · \${esc(item.durationMs ?? 0)}ms · \${esc(item.tokens ?? 0)} tok · in \${esc(item.inputTokens ?? 0)} / out \${esc(item.outputTokens ?? 0)}</strong></div>
           <div><small>When</small><strong>\${new Date(item.at).toLocaleTimeString()}</strong></div>
         </div>\`).join('') : '<div class="empty">暂无请求记录。</div>';
     }
@@ -2515,6 +2902,7 @@ function dashboardHtml() {
     async function load() {
       const response = await fetch('/pool/status', { headers: authHeaders() });
       if (response.status === 401) {
+        updateTopDiagnosticAuthBlocked();
         setToast('管理接口需要 admin token。');
         lastRefresh.textContent = '鉴权失败';
         return;
@@ -2526,11 +2914,12 @@ function dashboardHtml() {
       const knownModels = data.model?.known || [];
       const activeModel = data.model?.override || '';
       const selectModels = activeModel && !knownModels.includes(activeModel) ? [activeModel, ...knownModels] : knownModels;
+      updateTopDiagnostic(data, ups, activeModel);
       document.querySelector('#total').textContent = ups.length;
       document.querySelector('#available').textContent = ups.filter(u => u.available).length;
       document.querySelector('#healthy').textContent = ups.filter(u => u.health?.state === 'ok').length;
       document.querySelector('#cooling').textContent = ups.filter(u => u.cooldown_ms > 0).length;
-      document.querySelector('#totalTokens').textContent = fmt(data.usage?.total_tokens || 0);
+      updateTokenBreakdown(data.usage || {});
       const nextModelOptionsSignature = selectModels.join('|');
       if (nextModelOptionsSignature !== modelOptionsSignature) {
         modelSelect.innerHTML = '<option value="">跟随 Codex 请求</option>' + selectModels.map((model) => \`<option value="\${esc(model)}">\${esc(model)}</option>\`).join('');
@@ -2544,37 +2933,45 @@ function dashboardHtml() {
       const nextCardsSignature = cardSignature(ups, activeModel);
       if (nextCardsSignature !== cardsSignature) {
         cards.classList.toggle('stable', Boolean(cardsSignature));
-        cards.innerHTML = ups.length ? ups.map((u, index) => \`
-        <article class="card panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'}" data-upstream="\${esc(u.name)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 45}ms">
-          <div class="card-head">
-            <div><div class="name">\${esc(u.name)}</div><div class="url">\${esc(u.base_url)}</div></div>
-            <div class="card-actions">
-              <div class="pill \${stateClass(u.health?.state)}" data-field="state">\${esc(u.health?.state || 'unknown')}</div>
-              <button class="ghost toggle-site \${u.enabled ? 'is-on' : 'is-off'}" type="button" data-toggle="\${esc(u.name)}" data-enabled="\${u.enabled ? 'true' : 'false'}" aria-pressed="\${u.enabled ? 'true' : 'false'}">\${u.enabled ? '停用' : '启用'}</button>
-              <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
-              <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
-              \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">签到</a>\` : ''}
-            </div>
+        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Models</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + ups.map((u, index) => \`
+        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'}" data-upstream="\${esc(u.name)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
+          <div class="workbench-cell">
+            <div class="name">\${esc(u.name)}</div>
+            <div class="url">\${esc(u.base_url)}</div>
+            <div class="keys">\${keySummaryHtml(u)}</div>
           </div>
-          <div class="facts">
-            <div class="fact"><small>HTTP</small><strong data-field="http">\${fmt(u.health?.http_status)}</strong></div>
-            <div class="fact"><small>Latency</small><strong data-field="latency">\${fmt(u.health?.latency_ms, 'ms')}</strong></div>
-            <div class="fact"><small>Models</small><strong data-field="models_count">\${fmt(u.health?.models_count)}</strong></div>
-            <div class="fact"><small>Cooldown</small><strong data-field="cooldown">\${Math.ceil((u.cooldown_ms || 0) / 1000)}s</strong></div>
-            <div class="fact"><small>Weight</small><strong data-field="weight">\${u.weight}</strong></div>
-            <div class="fact"><small>Failures</small><strong data-field="failures">\${u.failures}</strong></div>
-            <div class="fact"><small>Calls</small><strong data-field="calls">\${u.stats?.attempts || 0}</strong></div>
-            <div class="fact"><small>Today Tok</small><strong data-field="today_tokens">\${fmt(u.usage?.today_tokens)}</strong></div>
-            <div class="fact"><small>Total Tok</small><strong data-field="total_tokens">\${fmt(u.usage?.total_tokens)}</strong></div>
-            <div class="fact" data-billing-fact title="\${esc(u.billing?.error || '')}"><small>Billing</small><strong data-field="billing_state">\${esc(u.billing?.state || 'unknown')}</strong></div>
-            <div class="fact"><small>Balance</small><strong class="money" data-field="balance" data-size="\${billingAmountSize(u, 'balance')}" title="\${esc(billingAmountTitle(u, 'balance'))}">\${billingAmountText(u, 'balance')}</strong></div>
-            <div class="fact"><small>Spent</small><strong class="money" data-field="spent" data-size="\${moneySize(u.billing?.used_amount, u.billing?.currency)}" title="\${esc(fullMoney(u.billing?.used_amount, u.billing?.currency))}">\${fmtMoney(u.billing?.used_amount, u.billing?.currency)}</strong></div>
-            <div class="fact"><small>Limit</small><strong class="money" data-field="limit" data-size="\${billingAmountSize(u, 'limit')}" title="\${esc(billingAmountTitle(u, 'limit'))}">\${billingAmountText(u, 'limit')}</strong></div>
-            \${quotaFactsHtml(u)}
+          <div class="workbench-cell">
+            <div class="workbench-main"><span class="pill \${stateClass(u.health?.state)}" data-field="state">\${esc(u.health?.state || 'unknown')}</span></div>
+            <div class="mini-line">HTTP <strong data-field="http">\${fmt(u.health?.http_status)}</strong></div>
+            <div class="mini-line">Latency <strong data-field="latency">\${fmt(u.health?.latency_ms, 'ms')}</strong></div>
           </div>
-          <div class="keys">\${keySummaryHtml(u)}</div>
-          <div class="usage-days">\${usageDaysHtml(u)}</div>
-          <div class="models">\${(u.health?.models || []).length ? (u.health.models || []).map(model => \`<button class="model-chip \${model === activeModel ? 'active' : ''}" type="button" data-model="\${esc(model)}">\${esc(model)}</button>\`).join('') : '<span class="key">暂无模型列表</span>'}</div>
+          <div class="workbench-cell">
+            <div class="mini-line">Weight <strong data-field="weight">\${u.weight}</strong></div>
+            <div class="mini-line">Cooldown <strong data-field="cooldown">\${Math.ceil((u.cooldown_ms || 0) / 1000)}s</strong></div>
+            <div class="mini-line">Failures <strong data-field="failures">\${u.failures}</strong></div>
+          </div>
+          <div class="workbench-cell">
+            <div class="mini-line">Discovered <strong data-field="models_count">\${fmt(u.health?.models_count)}</strong></div>
+            <div class="models">\${(u.health?.models || []).length ? (u.health.models || []).map(model => \`<button class="model-chip \${model === activeModel ? 'active' : ''}" type="button" data-model="\${esc(model)}">\${esc(model)}</button>\`).join('') : '<span class="key">暂无模型列表</span>'}</div>
+          </div>
+          <div class="workbench-cell">
+            <div class="mini-line">Calls <strong data-field="calls">\${u.stats?.attempts || 0}</strong></div>
+            <div class="mini-line">Today <strong data-field="today_tokens">\${fmt(u.usage?.today_tokens)}</strong></div>
+            <div class="mini-line">Total <strong data-field="total_tokens" title="Input \${fmt(u.usage?.input_tokens || 0)} · Output \${fmt(u.usage?.output_tokens || 0)}">\${fmt(u.usage?.total_tokens)}</strong></div>
+          </div>
+          <div class="workbench-cell" data-billing-fact title="\${esc(u.billing?.error || '')}">
+            <div class="mini-line">Billing <strong data-field="billing_state">\${esc(u.billing?.state || 'unknown')}</strong></div>
+            <div class="mini-line">Balance <strong class="money" data-field="balance" data-size="\${billingAmountSize(u, 'balance')}" title="\${esc(billingAmountTitle(u, 'balance'))}">\${billingAmountText(u, 'balance')}</strong></div>
+            <div class="mini-line">Limit <strong class="money" data-field="limit" data-size="\${billingAmountSize(u, 'limit')}" title="\${esc(billingAmountTitle(u, 'limit'))}">\${billingAmountText(u, 'limit')}</strong></div>
+            <div class="mini-line">Spent <strong class="money" data-field="spent" data-size="\${moneySize(u.billing?.used_amount, u.billing?.currency)}" title="\${esc(fullMoney(u.billing?.used_amount, u.billing?.currency))}">\${fmtMoney(u.billing?.used_amount, u.billing?.currency)}</strong></div>
+            <div class="mini-line">Quota <strong data-field="req_left">\${fmt(quotaReqValue(u))}</strong> req / <strong data-field="tok_left">\${fmt(quotaTokValue(u))}</strong> tok</div>
+          </div>
+          <div class="workbench-actions">
+            <button class="ghost toggle-site \${u.enabled ? 'is-on' : 'is-off'}" type="button" data-toggle="\${esc(u.name)}" data-enabled="\${u.enabled ? 'true' : 'false'}" aria-pressed="\${u.enabled ? 'true' : 'false'}">\${u.enabled ? '停用' : '启用'}</button>
+            <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
+            <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
+            \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">签到</a>\` : ''}
+          </div>
         </article>\`).join('') : '<div class="empty panel">暂无站点。</div>';
         cardsSignature = nextCardsSignature;
       } else {
@@ -2665,6 +3062,17 @@ function dashboardHtml() {
     document.querySelector('#refresh').addEventListener('click', load);
     document.querySelector('#probeAll').addEventListener('click', probeAll);
     document.querySelector('#billingAll').addEventListener('click', probeBillingAll);
+    function toggleTokenBreakdown() {
+      const hidden = totalTokenBreakdown.hasAttribute('hidden');
+      totalTokenBreakdown.toggleAttribute('hidden', !hidden);
+      totalTokensMetric.setAttribute('aria-expanded', String(hidden));
+    }
+    totalTokensMetric.addEventListener('click', toggleTokenBreakdown);
+    totalTokensMetric.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      toggleTokenBreakdown();
+    });
     adminTokenInput.addEventListener('change', () => {
       adminToken = adminTokenInput.value.trim();
       if (adminToken) localStorage.setItem('codexPoolAdminToken', adminToken);
@@ -3065,8 +3473,10 @@ export function createPoolServer(config, options = {}) {
       }
 
       const originalBody = await readBody(req, maxBodyBytes);
-      const requestedModel = state.modelOverride || modelFromBody(req, originalBody);
       const originalModel = modelFromBody(req, originalBody);
+      const requestedModel = isClaudeModel(originalModel)
+        ? originalModel
+        : state.modelOverride || originalModel;
       const tried = new Set();
       const attempts = [];
       const maxAttempts = Math.max(1, state.retry.maxAttempts);
@@ -3080,9 +3490,9 @@ export function createPoolServer(config, options = {}) {
         upstream.inFlight += 1;
         const allowRetry = attempt < maxAttempts;
         const attemptedModel = requestedModel;
-        const useAnthropicAdapter = shouldUseAnthropicResponsesAdapter(pathname, upstream, attemptedModel);
+        const useAnthropicAdapter = shouldUseAnthropicResponsesAdapter(pathname, attemptedModel);
         const targetUrl = useAnthropicAdapter
-          ? joinUrlPath(upstream.baseUrl, '/v1/messages')
+          ? joinUrlPath(upstream.baseUrl, anthropicMessagesPathForBaseUrl(upstream.baseUrl))
           : joinTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix);
         const body = useAnthropicAdapter
           ? buildAnthropicMessagesPayload(rewriteModelInBody(req, originalBody, attemptedModel), attemptedModel)

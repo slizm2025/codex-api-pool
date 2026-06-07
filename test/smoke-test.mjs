@@ -69,6 +69,13 @@ async function getJson(url, token = '') {
   return { response, text, json: JSON.parse(text) };
 }
 
+async function getText(url, token = '') {
+  const headers = token ? { authorization: `Bearer ${token}` } : {};
+  const response = await fetch(url, { headers });
+  const text = await response.text();
+  return { response, text };
+}
+
 const bad = createFakeUpstream('bad', ({ res }) => {
   res.writeHead(503, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'temporary failure' }));
@@ -334,6 +341,34 @@ const pool = createTestPool({
 const poolInfo = await listen(pool);
 
 try {
+  const dashboard = await getText(`${poolInfo.url}/pool/dashboard`);
+  const requiredDashboardRegions = [
+    'data-dashboard-region="top-diagnostic-bar"',
+    'data-dashboard-region="upstream-workbench"',
+    'data-dashboard-region="recent-request-timeline"',
+    'data-dashboard-region="upstream-editor"',
+    'id="poolDiagnostic"',
+    'Pool Usability',
+    'Most Likely Reason',
+    'id="selectionCount"',
+    'id="modelOverrideState"',
+    'id="adminTokenState"',
+    'function updateTopDiagnostic(data, ups, activeModel)',
+    "eligible.length === 0 ? 'blocked' : degraded ? 'degraded' : 'usable'",
+    'class="workbench-list"',
+    'class="workbench-head"',
+    'class="card workbench-row panel',
+    'Upstream Workbench rows'
+  ];
+  for (const marker of requiredDashboardRegions) {
+    if (!dashboard.text.includes(marker)) {
+      throw new Error(`expected dashboard HTML to include ${marker}`);
+    }
+  }
+  if (!dashboard.text.includes('Management Dashboard') || !dashboard.text.includes('Operational Console')) {
+    throw new Error('expected dashboard HTML to expose Management Dashboard / Operational Console structure');
+  }
+
   const authFailPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -467,15 +502,15 @@ try {
     const usageStatus = (await getJson(`${usagePoolInfo.url}/pool/status`, 'pool-secret')).json;
     const usageSite = usageStatus.upstreams.find((upstream) => upstream.name === 'usage-site');
     const usageByDayTotal = Object.values(usageSite?.usage?.by_day || {}).reduce((sum, value) => sum + Number(value || 0), 0);
-    if (!usageSite || usageSite.usage?.total_tokens !== 93 || usageSite.usage?.today_tokens !== 93 || usageByDayTotal !== 93) {
-      throw new Error(`expected per-upstream token usage to total 93: ${JSON.stringify(usageSite?.usage)}`);
+    if (!usageSite || usageSite.usage?.total_tokens !== 93 || usageSite.usage?.input_tokens !== 29 || usageSite.usage?.output_tokens !== 64 || usageSite.usage?.today_tokens !== 93 || usageByDayTotal !== 93) {
+      throw new Error(`expected per-upstream token usage to total 93 with input/output split: ${JSON.stringify(usageSite?.usage)}`);
     }
-    if (usageStatus.usage?.total_tokens !== 93 || usageStatus.usage?.today_tokens !== 93) {
-      throw new Error(`expected global token usage to total 93: ${JSON.stringify(usageStatus.usage)}`);
+    if (usageStatus.usage?.total_tokens !== 93 || usageStatus.usage?.input_tokens !== 29 || usageStatus.usage?.output_tokens !== 64 || usageStatus.usage?.today_tokens !== 93) {
+      throw new Error(`expected global token usage to total 93 with input/output split: ${JSON.stringify(usageStatus.usage)}`);
     }
     const latestUsage = usageStatus.recent_requests?.[0];
-    if (!latestUsage || latestUsage.tokens !== 19 || latestUsage.upstream !== 'usage-site') {
-      throw new Error(`expected recent request to include token usage: ${JSON.stringify(latestUsage)}`);
+    if (!latestUsage || latestUsage.tokens !== 19 || latestUsage.inputTokens !== 7 || latestUsage.outputTokens !== 12 || latestUsage.upstream !== 'usage-site') {
+      throw new Error(`expected recent request to include token usage split: ${JSON.stringify(latestUsage)}`);
     }
   } finally {
     await close(usagePool);
@@ -569,7 +604,19 @@ try {
       body: streamBody
     });
     const streamText = await streamResponse.text();
-    if (streamResponse.status !== 200 || !streamText.includes('response.output_text.delta') || !streamText.includes('pong') || !streamText.includes('response.completed') || !streamText.includes('[DONE]')) {
+    const requiredAnthropicStreamEvents = [
+      'response.created',
+      'response.in_progress',
+      'response.output_item.added',
+      'response.content_part.added',
+      'response.output_text.delta',
+      'response.output_text.done',
+      'response.content_part.done',
+      'response.output_item.done',
+      'response.completed',
+      '[DONE]'
+    ];
+    if (streamResponse.status !== 200 || !streamText.includes('pong') || requiredAnthropicStreamEvents.some((event) => !streamText.includes(event))) {
       throw new Error(`expected Anthropic stream to be adapted to Responses SSE: ${streamResponse.status} ${streamText}`);
     }
 
@@ -595,6 +642,117 @@ try {
     }
   } finally {
     await close(anthropicMessagesPool);
+  }
+
+  const explicitClaudePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-test',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      {
+        name: 'explicit-claude-site',
+        base_url: anthropicMessagesInfo.url,
+        health_path: '/v1/models',
+        probe_auth: 'anthropic',
+        weight: 1,
+        keys: [{ env: 'TEST_UPSTREAM_KEY' }]
+      }
+    ]
+  });
+  const explicitClaudePoolInfo = await listen(explicitClaudePool);
+  try {
+    const streamBody = JSON.stringify({
+      model: 'claude-opus-test',
+      stream: true,
+      max_output_tokens: 128,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const response = await fetch(`${explicitClaudePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(streamBody))
+      },
+      body: streamBody
+    });
+    const text = await response.text();
+    if (response.status !== 200 || !text.includes('response.completed') || !text.includes('pong')) {
+      throw new Error(`expected explicit Claude request model to bypass non-Claude override: ${response.status} ${text}`);
+    }
+    const status = (await getJson(`${explicitClaudePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const latest = status.recent_requests?.[0];
+    if (!latest || latest.originalModel !== 'claude-opus-test' || latest.actualModel !== 'claude-opus-test' || latest.upstream !== 'explicit-claude-site') {
+      throw new Error(`expected explicit Claude request to stay Claude despite non-Claude override: ${JSON.stringify(latest)}`);
+    }
+  } finally {
+    await close(explicitClaudePool);
+  }
+
+  const listedClaudePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'claude-opus-test',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      {
+        name: 'listed-claude-site',
+        base_url: `${anthropicMessagesInfo.url}/v1`,
+        weight: 1,
+        keys: [{ env: 'TEST_UPSTREAM_KEY' }]
+      }
+    ]
+  });
+  listedClaudePool.state.upstreams[0].health.models = ['claude-opus-test'];
+  listedClaudePool.state.upstreams[0].health.modelsCount = 1;
+  const listedClaudePoolInfo = await listen(listedClaudePool);
+  try {
+    const streamBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: true,
+      max_output_tokens: 128,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const response = await fetch(`${listedClaudePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(streamBody))
+      },
+      body: streamBody
+    });
+    const text = await response.text();
+    if (response.status !== 200 || !text.includes('response.output_item.done') || !text.includes('response.completed') || !text.includes('pong')) {
+      throw new Error(`expected listed Claude model upstream to use Anthropic Messages adapter: ${response.status} ${text}`);
+    }
+  } finally {
+    await close(listedClaudePool);
   }
 
   const billingPool = createTestPool({

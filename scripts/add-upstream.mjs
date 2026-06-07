@@ -3,7 +3,8 @@ function parseArgs(argv) {
     replace: false,
     poolUrl: process.env.CODEX_POOL_URL || 'http://127.0.0.1:8787',
     tokenEnv: process.env.CODEX_POOL_ADMIN_TOKEN_ENV || 'CODEX_POOL_API_KEY',
-    siteUrl: ''
+    siteUrl: '',
+    hasSiteUrl: false
   };
   const positional = [];
 
@@ -15,6 +16,7 @@ function parseArgs(argv) {
     }
     if (arg === '--site-url') {
       flags.siteUrl = argv[++index] || '';
+      flags.hasSiteUrl = true;
       continue;
     }
     if (arg === '--pool-url') {
@@ -32,9 +34,9 @@ function parseArgs(argv) {
 }
 
 const { flags, positional } = parseArgs(process.argv.slice(2));
-const [name, baseUrl, weightArg = '1', keyEnvArg] = positional;
+const [name, baseUrl, weightArg, keyEnvArg] = positional;
 const defaultKeyEnv = name ? `${name.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY` : '';
-const keyEnv = keyEnvArg || defaultKeyEnv;
+const keyEnv = keyEnvArg || (!flags.replace ? defaultKeyEnv : '');
 
 if (!name || !baseUrl) {
   console.error('usage: node scripts/add-upstream.mjs <name> <base_url> [weight] [key_env] [--site-url URL] [--replace] [--pool-url URL] [--token-env ENV]');
@@ -45,11 +47,11 @@ if (!name || !baseUrl) {
 const payload = {
   name,
   base_url: baseUrl,
-  site_url: flags.siteUrl,
-  weight: Number(weightArg || 1),
-  keys: [{ env: keyEnv }],
   replace: flags.replace
 };
+if (flags.hasSiteUrl) payload.site_url = flags.siteUrl;
+if (weightArg !== undefined || !flags.replace) payload.weight = Number(weightArg || 1);
+if (keyEnv) payload.keys = [{ env: keyEnv }];
 
 const token = flags.tokenEnv ? process.env[flags.tokenEnv] || '' : '';
 const headers = { 'content-type': 'application/json' };

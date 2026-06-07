@@ -62,6 +62,13 @@ node /Users/slizm/Desktop/脚本/codex-api-pool/src/server.mjs
 curl -s http://127.0.0.1:8787/pool/status
 ```
 
+如果启用了 `admin_auth_token_env`，需要带上管理 token：
+
+```bash
+curl -s http://127.0.0.1:8787/pool/status \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
+```
+
 ## Codex 配置
 
 把 `~/.codex/config.toml` 顶部改成：
@@ -100,7 +107,7 @@ npm run smoke
 看到下面输出说明失败切换正常：
 
 ```text
-smoke ok: auth guard, fallback, runtime add, config-preserving edit, model discovery, anthropic model probe, model override, 400/522 site fallback, recent requests, and immediate health probe all passed
+smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, billing accounting, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, model discovery, anthropic model probe, model override, 400/522 site fallback, recent requests, and immediate health probe all passed
 ```
 
 ## 主动添加新站点
@@ -129,6 +136,7 @@ npm run add -- mysite https://example.com/v1 2 MY_SITE_API_KEY --site-url https:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/pool/upstreams \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "mysite",
@@ -165,14 +173,27 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams \
 查看完整状态：
 
 ```bash
-curl -s http://127.0.0.1:8787/pool/status
+curl -s http://127.0.0.1:8787/pool/status \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
 立即探测某个站点：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
+
+临时停用某个站点：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+```
+
+重新启用时把 `enabled` 改成 `true`。停用后的站点仍会出现在状态接口和检测网站中，但不会参与请求调度，也不会被“重新探测全部”命中。
 
 ## 站点数量
 
@@ -224,11 +245,18 @@ http://127.0.0.1:8787/pool/dashboard
 - 延迟
 - 模型数量
 - 冷却时间
+- 今日 token 消耗量
+- 站点累计 token 消耗量
+- 最近 14 天每日 token 消耗量
 - key 环境变量是否配置
 - 失败次数
 
 也可以直接在页面底部表单添加新站点，添加后会立即探测并写入 `config.local.json`。
 每张站点卡片也有单独的“测试”按钮，只会探测该站点；顶部“重新探测全部”会探测所有站点。
+每张站点卡片也有单独的“余额”按钮，只会刷新该站点的余额/已消费金额；顶部“刷新余额”会刷新所有启用站点。
+页面只在每个站点卡片里展示具体金额，长金额会用 K/M/B/T 单位缩短并保留完整金额悬浮提示；`/pool/status` 仍保留顶层 billing 汇总，方便程序读取。
+每张站点卡片都有“停用/启用”按钮。停用后卡片仍保留在页面中，方便重新开启，但代理不会把 Codex 请求调度到该站点。
+如果启用了管理接口鉴权，在页面右上角的 `Admin token` 输入框填入对应 token 后，页面会把 token 保存在浏览器本地存储中用于后续请求。
 
 ## 手动检测模式
 
@@ -248,18 +276,20 @@ http://127.0.0.1:8787/pool/dashboard
 检测全部站点：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/pool/probe
+curl -s -X POST http://127.0.0.1:8787/pool/probe \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
 检测单个站点：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
 检测网站里的“重新探测全部”按钮也是调用 `POST /pool/probe`。
 
-## 调用次数与剩余额度统计
+## 调用、额度与 token 统计
 
 状态接口和检测网站会显示每个站点的统计信息：
 
@@ -268,7 +298,72 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe
 - `stats.successes`: HTTP 2xx/3xx 次数。
 - `stats.failures`: HTTP 4xx/5xx 或失败响应次数。
 - `stats.retries`: 因失败而被代理重试/切换的次数。
+- `usage.today_tokens`: 该站点今天的 token 消耗量。
+- `usage.total_tokens`: 该站点累计 token 消耗量。
+- `usage.by_day`: 该站点按日期聚合的 token 消耗量。
+- `billing.balance_amount`: 该站点余额。
+- `billing.used_amount`: 该站点已消费金额，默认是本月截至今天的账单区间。
+- `billing.limit_amount`: 该站点账单上限/授信额度。
+- `billing.currency`: 金额币种。
 - `quota`: 从上游响应头解析到的剩余额度信息。
+
+`/pool/status` 顶层还会返回所有站点汇总后的：
+
+- `usage.total_tokens`: 全部站点累计 token 消耗量。
+- `usage.today_tokens`: 全部站点今天的 token 消耗量。
+- `usage.by_day`: 全部站点按日期聚合后的 token 消耗量。
+
+token 统计来自上游响应里的 `usage.total_tokens`、`input_tokens + output_tokens`、`prompt_tokens + completion_tokens`，或常见 token usage 响应头。未压缩的 JSON 响应和 SSE 流式响应里最终事件携带的 usage 都会被统计；压缩响应或未返回 usage 的站点会显示为 `0`/未知，不会估算。
+
+余额/已消费金额来自独立的 billing 探测，不会跟随页面自动刷新反复请求上游；只有点击“余额”“刷新余额”或调用下面接口时才会刷新：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/billing \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
+
+curl -s -X POST http://127.0.0.1:8787/pool/billing \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
+```
+
+默认会在站点 origin 和 `base_url` 两个位置尝试 OpenAI-compatible 常见账单接口：
+
+```text
+/dashboard/billing/subscription
+/dashboard/billing/usage?start_date={start_date}&end_date={end_date}
+```
+
+例如 `base_url` 是 `https://example.com/v1` 时，会先尝试 `https://example.com/dashboard/billing/...`，如果该路径失败，也会尝试 `https://example.com/v1/dashboard/billing/...`。any 这类把 billing 挂在 `/v1` 下的站点需要后者。
+
+其中 `total_usage` 默认按 cents 处理，例如 `1234` 显示为 `USD12.34`；`hard_limit_usd`、`balance`、`spent_amount` 等明确金额字段按原金额处理。
+
+很多中转站会把 `hard_limit_usd` / `system_hard_limit_usd` 固定返回为 `100000000`，用于表示不限额或内部占位。代理默认会把自动推断到的超大 limit 当作占位值忽略，不会显示为 `USD 100M`，也不会用它推导余额；仍会保留可信的 `used_amount`。
+
+如果某个站点公开了独立的 credits/wallet API，也可以用 `credits_base_url` 和 `credits_path` 显式配置；没有公开 API 时，代理不会使用浏览器登录态或 cookie 去抓网页余额。
+
+如果某个站点使用自定义接口，可以在对应 upstream 里配置：
+
+```json
+"billing": {
+  "enabled": true,
+  "base_url": "https://example.com",
+  "subscription_path": "/api/billing",
+  "credits_base_url": "https://example.com",
+  "credits_path": "/api/credits",
+  "credits_key_env": "EXAMPLE_MANAGEMENT_API_KEY",
+  "usage_path": "",
+  "currency": "USD",
+  "balance_field": "data.balance",
+  "used_field": "data.used_amount",
+  "limit_field": "data.limit",
+  "amount_unit": "usd",
+  "large_limit_threshold": 10000000,
+  "trust_large_limits": false
+}
+```
+
+如果站点只返回自己的点数、quota 单位或必须登录网页 cookie 才能查余额，代理不会把它猜成金额。需要该站点提供 API-key 可访问的 billing JSON，或者在 `billing` 中显式配置字段和单位。
+
+如果账单路径返回的是 HTML 登录页、Cloudflare challenge 或其他浏览器防护页面，billing 状态会显示为 `blocked`。这种情况下模型接口可能仍然可用，但代理无法只凭 API key 读取具体余额。
 
 quota 依赖上游是否返回响应头。代理会识别常见字段：
 
@@ -285,7 +380,7 @@ x-api-quota-remaining
 retry-after
 ```
 
-如果上游不返回这些 header，剩余额度会显示为空/未知，不会编造数值。
+如果上游不返回这些 header，剩余额度会保持未知，不会编造数值。dashboard 会隐藏空的 request/token header quota，避免把它误看成余额字段。
 
 ## 可重试错误码
 

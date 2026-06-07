@@ -1,5 +1,111 @@
 # 更新日志
 
+## 2026-06-07 18:26 CST
+
+本次更新修复“只能看到 quota/token，无法查看具体余额和已消费金额”的问题，新增独立 billing 探测能力。
+
+### Billing
+
+- 每个站点新增 `billing` 运行态，包含 `balance_amount`、`used_amount`、`limit_amount`、`currency`、`period_start`、`period_end` 和探测状态。
+- `/pool/status` 顶层新增 `billing` 汇总，支持按币种聚合全部站点余额、已消费金额和额度上限。
+- `/pool/status.upstreams[].billing` 新增单站点余额/已消费金额详情。
+- 新增 `POST /pool/billing`，用于刷新所有启用站点的 billing 信息。
+- 新增 `POST /pool/upstreams/:name/billing`，用于只刷新单个站点的 billing 信息。
+- 默认兼容 OpenAI-style `/dashboard/billing/subscription` 和 `/dashboard/billing/usage?start_date={start_date}&end_date={end_date}`。
+- 默认会同时兼容 origin 下的 billing 路径和保留 `base_url` 前缀的 billing 路径，例如 any 的 `/v1/dashboard/billing/...`。
+- 支持通过 upstream 的 `billing` 配置自定义 base URL、路径、鉴权方式、请求头、金额字段、币种字段和金额单位。
+- billing 探测不会跟随 dashboard 自动刷新反复触发；只有点击“余额”“刷新余额”或调用接口时才会请求上游账单接口。
+- billing 探测如果遇到 HTML 登录页或 Cloudflare/browser challenge，会标记为 `blocked`，避免误判成普通鉴权错误。
+- 自动推断到的超大 `hard_limit_usd` / `system_hard_limit_usd` 会按占位上限处理，不再显示成 `USD 100M`，也不再用于推导假余额；可信的 `used_amount` 仍会保留。
+- 支持 AnyRouter Credits API（`/api/v1/credits`）读取真实 `balance` / `used`；any 站点默认优先使用 `ANY_MANAGEMENT_API_KEY`，缺少管理 key 时页面会提示 `需管理Key`。
+
+### Dashboard
+
+- 顶部概览新增 `Balance` 和 `Spent`。
+- 每张站点卡片新增 `Billing`、`Balance`、`Spent`、`Limit`。
+- 每张站点卡片新增“余额”按钮，只刷新该站点账单数据。
+- 空的 `Req Left` / `Tok Left` 不再显示在卡片上；只有上游响应头真的返回 request/token 剩余额度时，才展示为 `Rate Req` / `Rate Tok`。
+- 顶部概览不再显示总余额/总消费金额；金额只在每个站点卡片中展示，并使用 K/M/B/T 短单位和自适应字号避免长数字被截断。
+- 顶部工具栏新增“刷新余额”按钮，用于刷新所有启用站点账单数据。
+
+### 文档与测试
+
+- README 增加 billing 与 quota/token 的区别、默认 endpoint、API 调用示例和自定义字段配置说明。
+- `config.example.json` 增加全局 billing 并发/超时示例和单站点 billing 配置示例。
+- smoke 测试新增 billing accounting 覆盖，验证 OpenAI-style limit/usage 解析、AnyRouter-style credits 余额、超大占位上限过滤、单站点状态、全局汇总和 HTML-protected billing endpoint 的 `blocked` 分类。
+
+## 2026-06-07 17:55 CST
+
+本次更新新增站点级 token 消耗统计，并把结果接入状态接口、dashboard 和 smoke 测试。
+
+### Token 统计
+
+- 成功响应会记录上游明确返回的 token 数，并按站点累计到 `stats.tokenUsage.totalTokens`。
+- 每个站点会按本地日期写入 `stats.tokenUsage.byDay`，用于查看每日 token 消耗量。
+- `/pool/status` 顶层新增 `usage` 汇总，包含全部站点的 `total_tokens`、`today_tokens` 和 `by_day`。
+- `/pool/status.upstreams[].usage` 新增单站点 `total_tokens`、`today_tokens` 和 `by_day`。
+- 最近请求记录新增 `tokens` 字段，dashboard 中会显示本次请求的 token 消耗。
+- token 提取兼容未压缩 JSON 响应和 SSE 流式响应最终事件里的 usage；没有明确 usage 时不会估算。
+
+### Dashboard
+
+- 顶部概览新增全部站点累计 token 消耗量。
+- 每张站点卡片新增 `Today Tok` 和 `Total Tok`。
+- 每张站点卡片新增最近 14 天每日 token 消耗 chip，便于按天查看单站点用量。
+
+### 文档与测试
+
+- README 增加 token 统计字段、统计来源和边界说明。
+- smoke 测试新增 token usage accounting 覆盖，验证 JSON/SSE token 提取、单站点每日/累计统计、全局汇总和最近请求 token 记录。
+
+## 2026-06-07 17:04 CST
+
+本次更新继续处理上一轮复查中发现的剩余高收益优化，并对 dashboard 做了一轮更偏运维工作台的视觉整理。
+
+### 管理接口与安全
+
+- `/health` 改为公开的最小健康响应，只返回服务可用性和 upstream 数量，不再暴露完整站点详情。
+- `/pool/status` 和 `/pool/upstreams` 现在走 admin 鉴权，避免启用外部监听时泄露站点、key env 名、统计和模型列表。
+- dashboard 增加 `Admin token` 输入框。启用管理接口鉴权时，可在页面输入 token，浏览器会保存到本地存储并用于后续管理请求。
+- 启动日志的鉴权提示拆分为 `auth=disabled`、`auth=<ENV>:missing-deny` 和带脱敏值的已启用状态，避免 env 缺失时误判为关闭鉴权。
+
+### Dashboard
+
+- 顶部“重新探测全部”按钮改为直接调用 `POST /pool/probe`，使用后端统一探测逻辑和并发控制。
+- 单站点“测试”按钮继续只探测当前站点。
+- 每张站点卡片新增“停用/启用”开关。停用后站点仍显示在 dashboard，方便随时重新启用，但不会参与请求调度和“重新探测全部”。
+- 视觉风格调整为更清爽、密集的运维工作台：降低装饰感，收紧圆角和阴影，优化卡片信息密度、指标网格、最近请求列表和移动端布局。
+- 底部提示拆分为操作反馈和“最后刷新”状态，自动刷新不再覆盖刚完成的测试、保存、切换模型结果。
+- 卡片里的 key 状态会随单站点探测同步更新，并按健康状态着色。
+- 站点卡片补充键盘焦点样式与 Enter/Space 编辑入口，点击编辑功能在键盘下也可用。
+- 卡片仍按权重从高到低展示，并保留点击卡片编辑、模型 chip 切换、签到链接等已有功能。
+
+### CLI
+
+- 修复 `scripts/add-upstream.mjs --replace` 未显式传 `--site-url` 时清空已有签到页的问题。
+- `--replace` 默认不再重置旧 key；只有显式传 key env 时才覆盖 keys。
+- `--replace` 默认不再重置旧权重；只有显式传 weight 时才覆盖 weight。
+
+### 文档与测试
+
+- README 增加 admin token 的 curl 示例，以及 dashboard `Admin token` 输入框说明。
+- smoke 测试新增覆盖：
+  - `/health` 公开且不泄露完整 upstream 列表。
+  - `/pool/status` 在缺失管理/代理 token 时返回 401。
+  - `/pool/upstreams/:name/enabled` 可停用/启用站点；停用站点仍在状态列表中，但不会被调度。
+  - 受保护状态接口带 token 后仍能正常用于模型、站点和最近请求断言。
+
+### 验证
+
+已通过：
+
+```bash
+node --check src/server.mjs
+node --check test/smoke-test.mjs
+node --check scripts/add-upstream.mjs
+npm run smoke
+```
+
 ## 2026-06-07 15:55 CST
 
 本次更新围绕 API 池的安全性、错误切站点策略、运行态保留、探测性能、CLI 能力和测试隔离做了一轮集中优化。

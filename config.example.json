@@ -25,7 +25,19 @@
         {
           "env": "RAWCHAT_API_KEY"
         }
-      ]
+      ],
+      "billing": {
+        "enabled": true,
+        "base_url": "https://new.sharedchat.cc",
+        "subscription_path": "/dashboard/billing/subscription",
+        "credits_base_url": "",
+        "credits_path": "",
+        "credits_key_env": "",
+        "usage_path": "/dashboard/billing/usage?start_date={start_date}&end_date={end_date}",
+        "currency": "USD",
+        "large_limit_threshold": 10000000,
+        "trust_large_limits": false
+      }
     },
     {
       "name": "sub2codex",
@@ -54,6 +66,10 @@
     "timeout_ms": 10000,
     "concurrency": 4,
     "path": "/models"
+  },
+  "billing": {
+    "timeout_ms": 10000,
+    "concurrency": 3
   },
   "stats": {
     "path": "stats.local.json"

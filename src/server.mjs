@@ -3814,7 +3814,7 @@ function dashboardHtml() {
       <label class="toggle-field">可签到<input name="signin_available" type="checkbox" /></label>
       <label>密钥模式<select name="key_mode"><option value="env">环境变量</option><option value="value">明文 Key</option></select></label>
       <label>Key Env<input name="key_env" placeholder="MYSITE_API_KEY" /></label>
-      <label>明文 Key<input name="key_value" type="password" placeholder="sk-..." autocomplete="off" /></label>
+      <label>明文 Key<input name="key_value" type="password" placeholder="sk-..." autocomplete="off" disabled /></label>
       <button class="ghost" id="checkClaude" type="button" data-icon="radar">检测 Claude</button>
       <button id="submitUpstream" type="submit" data-icon="plus">添加站点</button>
       <button class="ghost" id="cancelEdit" type="button" hidden data-icon="x">取消</button>
@@ -4562,8 +4562,23 @@ function dashboardHtml() {
       upstreamForm.elements.name.readOnly = false;
       renderClaudeCheckResult(null);
       if (clearValues) upstreamForm.reset();
+      updateKeyModeFormState();
       updateSigninFormState();
       document.querySelectorAll('.card.editing').forEach((card) => card.classList.remove('editing'));
+    }
+    function updateKeyModeFormState() {
+      const keyMode = upstreamForm.elements.key_mode?.value || 'env';
+      const envInput = upstreamForm.elements.key_env;
+      const valueInput = upstreamForm.elements.key_value;
+      if (envInput) envInput.disabled = keyMode === 'value';
+      if (valueInput) {
+        valueInput.disabled = keyMode !== 'value';
+        valueInput.placeholder = editingName && keyMode === 'value' ? '留空保留原 key' : 'sk-...';
+      }
+      return keyMode;
+    }
+    function formRequiresPlaintextKey() {
+      return !editingName && upstreamForm.elements.key_mode?.value === 'value' && !upstreamForm.elements.key_value?.value.trim();
     }
     function updateSigninFormState() {
       return upstreamForm.elements.signin_available.checked;
@@ -4581,8 +4596,13 @@ function dashboardHtml() {
       upstreamForm.elements.site_url.value = upstream.site_url || '';
       upstreamForm.elements.weight.value = upstream.weight || 1;
       upstreamForm.elements.signin_available.checked = canSignin(upstream);
+      const firstKey = upstream.keys?.[0] || {};
+      const keySource = firstKey.source || 'env';
+      upstreamForm.elements.key_mode.value = keySource === 'value' ? 'value' : 'env';
+      upstreamForm.elements.key_env.value = keySource === 'env' ? firstKey.label || '' : '';
+      upstreamForm.elements.key_value.value = '';
+      updateKeyModeFormState();
       updateSigninFormState();
-      upstreamForm.elements.key_env.value = upstream.keys?.[0]?.label || '';
       formMode.textContent = \`编辑站点：\${upstream.name}\`;
       setButtonLabel(submitUpstream, 'edit', '保存修改');
       cancelEdit.hidden = false;
@@ -4727,6 +4747,10 @@ function dashboardHtml() {
       const payload = formClaudePayload();
       if (!payload.name || !payload.base_url) {
         setToast('请先填写名称和 Base URL。');
+        return;
+      }
+      if (formRequiresPlaintextKey()) {
+        setToast('选择明文 Key 时，请填写 API key。');
         return;
       }
       checkClaude.disabled = true;
@@ -5029,6 +5053,7 @@ function dashboardHtml() {
       startEdit(upstream);
     });
       cancelEdit.addEventListener('click', () => resetEdit());
+    upstreamForm.elements.key_mode.addEventListener('change', updateKeyModeFormState);
     upstreamForm.elements.signin_available.addEventListener('change', updateSigninFormState);
     upstreamForm.addEventListener('input', (event) => {
       if (event.target.closest('#checkClaude, #submitUpstream, #cancelEdit')) return;
@@ -5036,6 +5061,10 @@ function dashboardHtml() {
     });
     upstreamForm.addEventListener('submit', async (event) => {
       event.preventDefault();
+      if (formRequiresPlaintextKey()) {
+        setToast('选择明文 Key 时，请填写 API key。');
+        return;
+      }
       const payload = applyClaudeSuggestion(formClaudePayload());
       const response = await fetch('/pool/upstreams', {
         method: 'POST',
@@ -5559,6 +5588,21 @@ function validateUpstreamPayload(payload, config) {
       if (typeof entry === 'string') return { env: entry };
       if (entry && typeof entry === 'object' && entry.env) return { env: String(entry.env) };
       if (entry && typeof entry === 'object' && entry.value) return { value: String(entry.value), label: entry.label ? String(entry.label) : undefined };
+      const entryValue = entry && typeof entry === 'object'
+        ? firstString(
+            entry.key_value,
+            entry.keyValue,
+            entry.api_key,
+            entry.apiKey,
+            entry.key,
+            entry.token,
+            entry.experimental_bearer_token,
+            entry.experimentalBearerToken,
+            entry.bearer_token,
+            entry.bearerToken
+          )
+        : '';
+      if (entryValue) return { value: entryValue, label: entry.label ? String(entry.label) : undefined };
       const error = new Error('each key must be an env name, {"env":"NAME"}, or {"value":"secret"}');
       error.statusCode = 400;
       throw error;

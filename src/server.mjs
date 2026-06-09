@@ -4218,25 +4218,27 @@ function dashboardHtml() {
       const fallbackNumber = Number(fallback);
       return Number.isFinite(fallbackNumber) ? fallbackNumber : 0;
     }
-    function sortBucket(upstream, activeModel) {
+    function enabledBucket(upstream) {
+      return upstream.enabled ? 0 : 1;
+    }
+    function usabilityBucket(upstream, activeModel) {
+      if (!upstream.enabled) return 3;
       if (upstream.available && upstreamSupportsModel(upstream, activeModel)) return 0;
       if (upstream.available) return 1;
-      if (upstream.enabled && numeric(upstream.cooldown_ms) > 0) return 2;
-      if (upstream.enabled) return 3;
-      return 4;
-    }
-    function signinSortBucket(upstream) {
-      const status = signinStatusValue(upstream);
-      if (status === 'pending') return 0;
-      if (status === 'completed') return 1;
       return 2;
     }
+    function availabilitySortValue(upstream) {
+      const multiplier = numeric(upstream.availability?.multiplier, 1);
+      const rate = upstream.availability?.rate;
+      return multiplier * 1000 + (Number.isFinite(rate) ? rate : 0.9);
+    }
     const sortedUpstreams = (items, activeModel = '') => [...items].sort((a, b) => (
-      signinSortBucket(a) - signinSortBucket(b) ||
-      sortBucket(a, activeModel) - sortBucket(b, activeModel) ||
+      enabledBucket(a) - enabledBucket(b) ||
+      usabilityBucket(a, activeModel) - usabilityBucket(b, activeModel) ||
+      availabilitySortValue(b) - availabilitySortValue(a) ||
+      numeric(b.availability?.samples) - numeric(a.availability?.samples) ||
       numeric(b.selection_score, numeric(b.selection_weight, b.weight)) - numeric(a.selection_score, numeric(a.selection_weight, a.weight)) ||
       numeric(b.selection_weight, b.weight) - numeric(a.selection_weight, a.weight) ||
-      numeric(b.availability?.rate, -1) - numeric(a.availability?.rate, -1) ||
       numeric(a.failures) - numeric(b.failures) ||
       numeric(a.ewma_latency_ms, Number.MAX_SAFE_INTEGER) - numeric(b.ewma_latency_ms, Number.MAX_SAFE_INTEGER) ||
       String(a.name).localeCompare(String(b.name))

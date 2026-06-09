@@ -7,7 +7,8 @@
 ### Selection 排序
 
 - `/pool/status.upstreams[]` 新增 `selection_score`：可用站点按 `selection_weight` 继续叠加 in-flight、延迟、Health State 和连续失败惩罚；不可用站点分数为 `0`。
-- Dashboard 列表先按“可用且匹配当前 Model Override / 可用但不匹配 / 冷却 / 其他启用不可用 / 停用”分组，再按 `selection_score`、`selection_weight`、Availability、失败次数和延迟排序。
+- Dashboard 列表先按启用状态硬分组：所有启用站点在上方，未启用站点全部沉底；启用组内再按可用性、`selection_score`、`selection_weight`、失败次数和延迟排序。
+- 签到状态不参与站点排序，只用于筛选、状态展示和签到操作。
 - 站点卡片的 Selection 行增加 `Score`，用于解释为什么某个站点虽然基础权重高，但会因为冷却、并发、延迟或失败记录下沉。
 
 ### 测试

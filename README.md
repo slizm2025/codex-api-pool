@@ -16,7 +16,7 @@
 ## 文件
 
 - `src/server.mjs`: 本地代理服务。
-- `config.local.json`: 你的本地池配置，不包含明文 key，只引用环境变量。
+- `config.local.json`: 你的本地池配置；默认只引用环境变量，也支持按需保存明文 key。
 - `config.example.json`: 示例配置。
 - `test/smoke-test.mjs`: 本地失败切换烟测。
 
@@ -42,6 +42,14 @@ export BLACK_API_KEY="black 的 key"
 export MYSITE_API_KEY="mysite 的 key"
 npm run add -- mysite https://example.com/v1 2 MYSITE_API_KEY
 ```
+
+如果你明确希望把上游 key 直接写入本地配置，也可以使用明文模式：
+
+```bash
+npm run add -- mysite https://example.com/v1 2 --key sk-xxxx
+```
+
+明文 key 会写入 `config.local.json`，只适合你确认这台机器和该文件权限都安全的场景。
 
 ## 启动
 
@@ -86,6 +94,32 @@ env_key = "CODEX_POOL_API_KEY"
 ```
 
 原来的 `[model_providers.custom]`、`[model_providers.sub2codex]`、`[model_providers.blackandwhilt]` 可以先保留，方便手动回退；只要 `model_provider = "api_pool"`，Codex 就会走本地池。
+
+如果某个 Codex provider 不是走本地池，而是直接连单个中转站，也可以二选一配置 key。推荐环境变量：
+
+```toml
+[model_providers.xxx]
+name = "xxx"
+base_url = "https://xxxx.cn"
+wire_api = "responses"
+env_key = "XXX_API_KEY"
+requires_openai_auth = true
+web_search = "live"
+supports_websockets = false
+```
+
+或者直接写入明文：
+
+```toml
+[model_providers.xxx]
+name = "xxx"
+base_url = "https://xxxx.cn"
+wire_api = "responses"
+experimental_bearer_token = "sk-xxxx"
+requires_openai_auth = true
+web_search = "live"
+supports_websockets = false
+```
 
 ## 手动切换模型
 
@@ -150,7 +184,8 @@ npm run add -- mysite https://example.com/v1 2 MY_SITE_API_KEY --site-url https:
 - `mysite`: 站点名称，只能包含字母、数字、点、下划线、短横线。
 - `https://example.com/v1`: 上游 base URL。
 - `2`: 权重，越高越优先。
-- `MY_SITE_API_KEY`: 存放该站点 key 的环境变量名。
+- `MY_SITE_API_KEY`: 存放该站点 key 的环境变量名；也可以用 `--key-env MY_SITE_API_KEY` 显式传入。
+- `--key`: 可选，直接把明文 API key 写入 `config.local.json`。
 - `--site-url`: 可选，站点签到页。
 - `--api`: 可选，`openai`、`anthropic` 或 `both`；同时支持 Codex/GPT 和 Claude Messages 的上游应标记为 `both`。
 - `--replace`: 可选，替换同名站点。
@@ -171,6 +206,16 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams \
     "weight": 2,
     "keys": [{ "env": "MY_SITE_API_KEY" }]
   }'
+```
+
+如果要通过 HTTP 管理接口保存明文 key，可以用任意一种等价写法：
+
+```json
+{ "keys": [{ "value": "sk-xxxx" }] }
+```
+
+```json
+{ "experimental_bearer_token": "sk-xxxx" }
 ```
 
 添加 Claude/Anthropic Messages 上游时，建议显式标记协议，避免 Claude 模型误打普通 OpenAI-compatible 上游：
@@ -208,7 +253,7 @@ npm run add -- runanytime https://runanytime.hxi.me/v1 1 RUNANYTIME_API_KEY --ap
 - OpenAI-compatible 探测失败，Anthropic 探测成功且发现 `claude-*` 模型：写入 `api: "anthropic"`、`probe_auth: "anthropic"` 和默认 `health_path: "/v1/models"`。
 - OpenAI-compatible `/models` 里列出了 Claude 模型，但 Anthropic 探测失败：保持 `api: "openai"`，避免后续误打 `/v1/messages`。
 
-不推荐在接口里传 `{ "value": "sk-..." }`，因为这会把 key 明文写入 `config.local.json`。更安全的方式是传 `{ "env": "MY_SITE_API_KEY" }`。
+不推荐在共享机器或会同步/备份的目录里传 `{ "value": "sk-..." }`，因为这会把 key 明文写入 `config.local.json`。更安全的方式是传 `{ "env": "MY_SITE_API_KEY" }`。
 
 ## 从 JSON 批量导入 Upstream
 
@@ -216,7 +261,7 @@ npm run add -- runanytime https://runanytime.hxi.me/v1 1 RUNANYTIME_API_KEY --ap
 
 - 名称：`name`、`id`、`title`、`label`、`remark`、`provider`
 - Base URL：`base_url`、`baseUrl`、`api_url`、`apiUrl`、`endpoint`、`url`
-- Key：`key_env`、`keyEnv`、`env`，或 `api_key`、`apiKey`、`key`、`token`
+- Key：`key_env`、`keyEnv`、`env`，或 `api_key`、`apiKey`、`key`、`token`、`experimental_bearer_token`
 
 如果 sub2api 导出的 JSON 是账号格式，例如顶层包含 `proxies: []` 和 `accounts: [{ "platform": "openai", "type": "oauth", "credentials": { "access_token": "..." } }]`，导入器会把每个 OpenAI OAuth account 转成 `codex_oauth` Upstream：请求会按 sub2api 的方式转发到 `https://chatgpt.com/backend-api/codex/responses`，并使用 `credentials.access_token` 作为 Bearer token。导入器也会从 JWT 里记录 `oauth_client_id`，用于区分 Codex OAuth token 和 ChatGPT Web session token。
 
@@ -426,7 +471,7 @@ token 统计来自上游响应里的 `usage.total_tokens`、`input_tokens + outp
 < 50%: 0.08
 ```
 
-检测网站的站点排序会先把当前可参与 Selection 且匹配 Model Override 的站点放在前面，再按 `selection_score`、`selection_weight`、Availability、失败次数和延迟排序；冷却、缺 key、停用等站点会自然下沉。
+检测网站的站点排序会先按启用状态硬分组：所有启用站点都在上方，未启用站点全部在最下方。启用组内优先展示当前可参与 Selection 且匹配 Model Override 的站点，然后按 Availability、`selection_score`、`selection_weight`、失败次数和延迟排序；签到状态只影响筛选和卡片展示，不参与排序。
 
 可以在配置中调整窗口和阈值：
 

@@ -546,6 +546,12 @@ try {
   if (!dashboard.text.includes('availability-dot is-empty') || !dashboard.text.includes('is-success') || !dashboard.text.includes('is-failure')) {
     throw new Error('expected availability visualization to use scoped sample classes');
   }
+  if (dashboard.text.includes('signinSortBucket')) {
+    throw new Error('expected sign-in status to stay out of upstream sorting');
+  }
+  if (!dashboard.text.includes('enabledBucket(a) - enabledBucket(b)') || !dashboard.text.includes('usabilityBucket(a, activeModel) - usabilityBucket(b, activeModel)')) {
+    throw new Error('expected upstream sorting to group enabled sites first, then usable enabled sites');
+  }
   const availabilityHistorySourceIndex = dashboard.text.indexOf('...history.map((ok) =>');
   const availabilityEmptySourceIndex = dashboard.text.indexOf('...Array.from({ length: emptyCount }');
   if (availabilityHistorySourceIndex === -1 || availabilityEmptySourceIndex === -1 || availabilityHistorySourceIndex > availabilityEmptySourceIndex) {
@@ -1369,6 +1375,44 @@ try {
   const deleteStaleSignin = await deleteJson(`${poolInfo.url}/pool/upstreams/stale-signin-site`, 'pool-secret');
   if (deleteStaleSignin.response.status !== 200) {
     throw new Error(`expected stale sign-in upstream delete 200: ${deleteStaleSignin.text}`);
+  }
+
+  const plaintextAddResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
+    name: 'plaintext-site',
+    base_url: `${addedInfo.url}/v1`,
+    weight: 1,
+    keys: [{ value: 'plaintext-runtime-key' }]
+  });
+  if (plaintextAddResult.response.status !== 201 || !plaintextAddResult.json.plaintext_key_warning) {
+    throw new Error(`expected plaintext upstream add to warn about saved key: ${plaintextAddResult.text}`);
+  }
+  const bearerTokenAddResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
+    name: 'bearer-token-site',
+    base_url: `${addedInfo.url}/v1`,
+    weight: 1,
+    experimental_bearer_token: 'plaintext-bearer-token'
+  });
+  if (bearerTokenAddResult.response.status !== 201 || !bearerTokenAddResult.json.plaintext_key_warning) {
+    throw new Error(`expected experimental_bearer_token add to warn about saved key: ${bearerTokenAddResult.text}`);
+  }
+  const statusAfterPlaintextAdd = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
+  const plaintextStatus = statusAfterPlaintextAdd.upstreams.find((upstream) => upstream.name === 'plaintext-site');
+  const bearerTokenStatus = statusAfterPlaintextAdd.upstreams.find((upstream) => upstream.name === 'bearer-token-site');
+  if (
+    plaintextStatus?.keys?.[0]?.source !== 'value' ||
+    plaintextStatus?.keys?.[0]?.configured !== true ||
+    String(plaintextStatus?.keys?.[0]?.label || '').includes('plaintext-runtime-key') ||
+    bearerTokenStatus?.keys?.[0]?.source !== 'value' ||
+    bearerTokenStatus?.keys?.[0]?.configured !== true ||
+    String(bearerTokenStatus?.keys?.[0]?.label || '').includes('plaintext-bearer-token')
+  ) {
+    throw new Error(`expected plaintext keys to be configured, typed, and masked: ${JSON.stringify({ plaintextStatus, bearerTokenStatus })}`);
+  }
+  for (const name of ['plaintext-site', 'bearer-token-site']) {
+    const deleted = await deleteJson(`${poolInfo.url}/pool/upstreams/${name}`, 'pool-secret');
+    if (deleted.response.status !== 200) {
+      throw new Error(`expected plaintext test upstream delete 200 for ${name}: ${deleted.text}`);
+    }
   }
 
   const importResult = await postJson(`${poolInfo.url}/pool/import/upstreams?secret_mode=env`, 'pool-secret', {

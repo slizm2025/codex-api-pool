@@ -4,7 +4,8 @@ function parseArgs(argv) {
     poolUrl: process.env.CODEX_POOL_URL || 'http://127.0.0.1:8787',
     tokenEnv: process.env.CODEX_POOL_ADMIN_TOKEN_ENV || 'CODEX_POOL_API_KEY',
     siteUrl: '',
-    hasSiteUrl: false
+    hasSiteUrl: false,
+    api: ''
   };
   const positional = [];
 
@@ -27,6 +28,10 @@ function parseArgs(argv) {
       flags.tokenEnv = argv[++index] || flags.tokenEnv;
       continue;
     }
+    if (arg === '--api') {
+      flags.api = argv[++index] || '';
+      continue;
+    }
     positional.push(arg);
   }
 
@@ -39,8 +44,8 @@ const defaultKeyEnv = name ? `${name.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_
 const keyEnv = keyEnvArg || (!flags.replace ? defaultKeyEnv : '');
 
 if (!name || !baseUrl) {
-  console.error('usage: node scripts/add-upstream.mjs <name> <base_url> [weight] [key_env] [--site-url URL] [--replace] [--pool-url URL] [--token-env ENV]');
-  console.error('example: node scripts/add-upstream.mjs mysite https://example.com/v1 2 MY_SITE_API_KEY --site-url https://example.com --replace');
+  console.error('usage: node scripts/add-upstream.mjs <name> <base_url> [weight] [key_env] [--site-url URL] [--api openai|anthropic|both] [--replace] [--pool-url URL] [--token-env ENV]');
+  console.error('example: node scripts/add-upstream.mjs mysite https://example.com/v1 2 MY_SITE_API_KEY --site-url https://example.com --api openai --replace');
   process.exit(2);
 }
 
@@ -50,6 +55,7 @@ const payload = {
   replace: flags.replace
 };
 if (flags.hasSiteUrl) payload.site_url = flags.siteUrl;
+if (flags.api) payload.api = flags.api;
 if (weightArg !== undefined || !flags.replace) payload.weight = Number(weightArg || 1);
 if (keyEnv) payload.keys = [{ env: keyEnv }];
 

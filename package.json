@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "smoke": "node test/smoke-test.mjs",
-    "add": "node scripts/add-upstream.mjs"
+    "add": "node scripts/add-upstream.mjs",
+    "model": "node scripts/set-model.mjs"
   },
   "engines": {
     "node": ">=18"

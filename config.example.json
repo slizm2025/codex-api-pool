@@ -16,9 +16,18 @@
     "key_cooldown_ms": 60000,
     "retryable_statuses": [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524]
   },
+  "availability": {
+    "window_size": 50,
+    "min_samples": 10,
+    "boost_threshold": 0.95,
+    "healthy_threshold": 0.9,
+    "degraded_threshold": 0.75,
+    "poor_threshold": 0.5
+  },
   "upstreams": [
     {
       "name": "rawchat",
+      "api": "openai",
       "base_url": "https://new.sharedchat.cc/codex",
       "weight": 3,
       "keys": [
@@ -30,9 +39,6 @@
         "enabled": true,
         "base_url": "https://new.sharedchat.cc",
         "subscription_path": "/dashboard/billing/subscription",
-        "credits_base_url": "",
-        "credits_path": "",
-        "credits_key_env": "",
         "usage_path": "/dashboard/billing/usage?start_date={start_date}&end_date={end_date}",
         "currency": "USD",
         "large_limit_threshold": 10000000,
@@ -41,6 +47,7 @@
     },
     {
       "name": "sub2codex",
+      "api": "openai",
       "base_url": "https://muyuan.do/v1",
       "weight": 2,
       "keys": [
@@ -51,11 +58,25 @@
     },
     {
       "name": "blackandwhilt",
+      "api": "openai",
       "base_url": "https://api.42w.shop/v1",
       "weight": 1,
       "keys": [
         {
           "env": "BLACK_API_KEY"
+        }
+      ]
+    },
+    {
+      "name": "runanytime_claude",
+      "api": "anthropic",
+      "base_url": "https://runanytime.example",
+      "health_path": "/v1/models",
+      "probe_auth": "anthropic",
+      "weight": 1,
+      "keys": [
+        {
+          "env": "RUN_CLAUDE_API_KEY"
         }
       ]
     }

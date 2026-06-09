@@ -32,8 +32,12 @@ _Avoid_: cooldown, failed, unavailable
 The API Pool's latest classification of an Upstream's observed availability, such as `ok`, `missing_key`, `rate_limited`, `server_error`, `network_error`, or `timeout`.
 _Avoid_: status, state, result
 
+**Availability**:
+The recent success rate of real model request attempts for an Upstream, calculated over a bounded rolling window and used as a Selection weight multiplier. Health Probes do not count toward Availability.
+_Avoid_: health, uptime, cumulative success rate
+
 **Selection**:
-The process of choosing an available Upstream and Upstream Key for a request. Selection considers weight, cooldown, health, in-flight requests, failure history, and model support.
+The process of choosing an available Upstream and Upstream Key for a request. Selection considers weight, Availability, cooldown, health, in-flight requests, failure history, and model support.
 _Avoid_: routing, dispatch, load balancing
 
 **Retry**:

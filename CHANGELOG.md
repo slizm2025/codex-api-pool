@@ -1,11 +1,205 @@
 # 更新日志
 
+## 2026-06-09 CST
+
+本次更新优化检测网站的站点排序规则，让页面顺序更贴近真实 Selection 状态。
+
+### Selection 排序
+
+- `/pool/status.upstreams[]` 新增 `selection_score`：可用站点按 `selection_weight` 继续叠加 in-flight、延迟、Health State 和连续失败惩罚；不可用站点分数为 `0`。
+- Dashboard 列表先按“可用且匹配当前 Model Override / 可用但不匹配 / 冷却 / 其他启用不可用 / 停用”分组，再按 `selection_score`、`selection_weight`、Availability、失败次数和延迟排序。
+- 站点卡片的 Selection 行增加 `Score`，用于解释为什么某个站点虽然基础权重高，但会因为冷却、并发、延迟或失败记录下沉。
+
+### 测试
+
+- smoke 测试补充动态分数断言，覆盖稳定低权重站点排在低可用高权重站点前、冷却站点 `selection_score` 归零。
+
+## 2026-06-08 17:31 CST
+
+本次更新补齐 Codex API Pool 的手动模型切换能力，并把 Claude/Anthropic 上游从“单一类型”改为“协议能力”模型，支持同一个上游同时服务 GPT/Codex 和 Claude。
+
+### 模型切换
+
+- 新增 `scripts/set-model.mjs`，通过现有 Management API `POST /pool/model` 切换代理级 `model_override`。
+- `package.json` 新增 `npm run model`，支持快捷别名：
+  - `gpt` -> `gpt-5.5`
+  - `claude` -> `claude-opus-4-8`
+  - `off` -> 清空 `model_override`
+- 切换后脚本会读取 `/pool/status`，输出当前 override、可用上游数量和匹配当前模型的上游数量。
+- 脚本默认读取 `CODEX_POOL_API_KEY` 作为管理 token；如果本地 Management API 未启用鉴权，也允许无 token 调用。
+
+### Claude / Anthropic 能力
+
+- Upstream 新增协议能力语义：
+  - `api: "openai"`：参与 GPT/Codex/OpenAI-compatible Selection。
+  - `api: "anthropic"`：参与 Claude `/v1/messages` Selection。
+  - `api: "both"`：同时参与 GPT/Codex 和 Claude Selection。
+- 选择 `claude-*` 模型时，只允许具备 Anthropic 能力的上游参与，避免 Claude 请求误打普通 OpenAI-compatible 上游。
+- 选择非 Claude 模型时，不再跳过 `api: "both"` 上游；只跳过 Anthropic-only 上游。
+- 保留旧配置兼容：`probe_auth: "anthropic"` 会被视为具备 Anthropic 能力。
+- 当前本地 `runanytime_claude` 已补充 `api: "anthropic"` 标记。
+
+### 自动检测
+
+- 新增上游时，如果未显式传 `api` 或 `probe_auth`，代理会在常规 OpenAI-compatible 健康探测后，额外尝试 Anthropic `/v1/models` 探测。
+- OpenAI-compatible 探测成功且 Anthropic 探测也成功并发现 `claude-*` 模型时，自动持久化为 `api: "both"`。
+- OpenAI-compatible 探测失败但 Anthropic 探测成功并发现 `claude-*` 模型时，自动持久化为 `api: "anthropic"`，并补 `probe_auth: "anthropic"` 与默认 `health_path: "/v1/models"`。
+- 只有 OpenAI-compatible `/models` 列出 Claude 模型，但 Anthropic 探测失败时，不自动标记 Anthropic，避免后续误打 `/v1/messages`。
+
+### 文档与测试
+
+- `README.md` 增加 `npm run model` 用法、`api: "both"` 示例和自动协议检测规则。
+- `scripts/add-upstream.mjs` 增加 `--api openai|anthropic|both` 参数说明与透传。
+- `config.example.json` 增加 Anthropic 上游示例。
+- smoke 测试新增覆盖：
+  - 模型切换脚本别名解析和匹配上游统计。
+  - Claude Selection 跳过未标记 OpenAI-only 上游。
+  - 非 Claude Selection 允许 `api: "both"`，但跳过 Anthropic-only 上游。
+  - 新增上游自动检测 `api: "anthropic"` 和 `api: "both"`。
+
+### 验证
+
+已通过：
+
+```bash
+node --check src/server.mjs
+node --check scripts/set-model.mjs
+node -e "for (const f of ['config.example.json','config.local.json']) { JSON.parse(require('fs').readFileSync(f,'utf8')); console.log(f + ' ok'); }"
+npm run smoke
+```
+
+## 2026-06-08 16:43 CST
+
+本次更新新增 Upstream Availability 能力：根据每个上游最近 50 次真实模型请求尝试统计可用率，并把该可用率接入 Selection 优先级。
+
+### Availability
+
+- 每个 Upstream 和 Upstream Key 新增滚动可用率窗口，默认保存最近 50 次真实模型请求尝试结果。
+- `2xx/3xx` 响应计为成功；其他 HTTP 状态、网络错误、超时和上游流式中断计为失败。
+- Health Probe 不计入 Availability，避免探测结果稀释真实 Codex 调用表现。
+- Availability 样本写入 `stats.local.json`，服务重启后继续参与优先级判断。
+- 客户端主动取消请求时不惩罚 Upstream，避免人为中断污染可用率。
+
+### Selection
+
+- Selection 保留原有硬过滤：Disabled、Cooldown、missing key、模型不匹配和缺少 base URL 的 Upstream 仍不会参与选择。
+- 在通过硬过滤的候选之间，按 `availability.multiplier` 调整原始权重，近期可用率越高越优先。
+- 默认分段策略：
+  - 样本少于 10 次：`1.00`
+  - `>= 95%`：`1.20`
+  - `>= 90%`：`1.00`
+  - `>= 75%`：`0.65`
+  - `>= 50%`：`0.30`
+  - `< 50%`：`0.08`
+- `/pool/status.upstreams[]` 新增 `availability` 和 `selection_weight`，便于解释当前调度优先级。
+
+### Dashboard
+
+- Upstream Workbench 的 Selection 列新增 Availability 百分比、样本数、水平进度条和最近 50 次调用小色块历史。
+- Dashboard 列表按 `selection_weight` 排序，使页面展示顺序更贴近实际调度优先级。
+- 可视化保留原有运维工作台风格，避免把 Health State、Cooldown、Usage 和 Billing 信息挤出主视图。
+
+### 配置与文档
+
+- `config.example.json` 新增 `availability` 配置，可调整窗口大小、最小样本数和分段阈值。
+- `README.md` 增加 Availability 字段说明、默认 multiplier 规则、配置示例和 dashboard 展示说明。
+- `CONTEXT.md` 增加 `Availability` 领域术语，并更新 Selection 定义。
+
+### 测试
+
+- smoke 测试新增 Availability scoring 覆盖：验证低可用率高权重上游会被压低，稳定低权重上游会优先。
+- smoke 测试新增 Availability 持久化覆盖：验证重启后仍会读取最近窗口并继续参与 Selection。
+- smoke 测试新增上游流式中断覆盖：验证 `200` 后断流会记录 Availability 失败、进入冷却并在后续请求中被跳过。
+
+### 验证
+
+已通过：
+
+```bash
+node --check src/server.mjs
+node --check test/smoke-test.mjs
+npm run smoke
+```
+
+## 2026-06-08 16:41 CST
+
+本次更新收敛余额查询实现，并补齐 Claude/Anthropic 调用与上游流异常处理，目标是让 billing 功能保持附加能力，不影响主 `/v1` 调用链。
+
+### Billing 回退
+
+- 余额查询恢复为默认 OpenAI-style subscription/usage 逻辑：`/dashboard/billing/subscription` + `/dashboard/billing/usage?start_date={start_date}&end_date={end_date}`。
+- 不再获取用户钱包余额，不再调用 AnyRouter/New API 用户钱包接口，也不再依赖网页登录态 cookie、`New-API-User`、本地 secret store 或代理配置。
+- 当站点 token 生成时设置了具体总金额时，会继续通过 `hard_limit_usd` / `total_usage` 推导余额；如果站点返回超大占位额度，仍按“不限/占位”处理并保留可信的已用金额。
+- billing 探测失败、缺少可用账单接口、返回 HTML 登录页或 Cloudflare challenge 时，只隐藏余额或标记 `blocked/unavailable`，不影响模型请求主链路。
+- 移除 dashboard 中 AnyRouter Session 相关面板、`/pool/secrets` 接口、wallet/cookie/proxy 类 billing 配置字段和示例文档。
+
+### Claude 调用
+
+- 对所有最终模型名以 `claude` 开头的请求，统一走 Anthropic 官方 Messages 调用形式，并将结果适配回 OpenAI Responses 兼容输出。
+- 当 `model_override` 被切到 Claude 时，只选择标记为 `api: "anthropic"` 或 `probe_auth: "anthropic"` 的上游；非 Claude 模型不会误选 Anthropic-only 上游。
+- 明确保留“请求本身已经是 Claude 模型时不被非 Claude override 改写”的行为，避免网页端或 Codex 端切换模型后打错上游协议。
+
+### 主链路稳定性
+
+- 修复上游流式响应提前 `error/aborted/close` 时没有完整记账和冷却的问题；现在会记录为 `stream_error`、状态 `502`，并冷却失败上游。
+- 流式响应统计改为在上游完整 `end` 后记录成功，避免“上游显示有输入输出，但 Codex 没收到完整输出”时仍被记为成功。
+- 对网络级 `statusCode === 0`、Cloudflare 52x、400/5xx 等 retryable 错误继续执行站点冷却和后续候选切换，保障下一次请求优先避开故障站点。
+
+### 文档与测试
+
+- README 更新余额说明：billing 只读取 API key 可访问的账单端点，不再抓取网页登录态、用户钱包或 cookie 保护页面。
+- `config.example.json` 移除 wallet/credits/proxy/cookie 类配置字段，并补充 Claude/Anthropic 上游标记示例。
+- smoke 测试覆盖 billing 主链路隔离、超大占位额度、HTML-protected billing blocked、Claude Anthropic adapter、Claude/非 Claude 上游选择、流式异常冷却和每日 token 导出。
+
+### 验证
+
+已通过：
+
+```bash
+node --check src/server.mjs
+node --check test/smoke-test.mjs
+node -e "const fs=require('fs'); for (const f of ['config.local.json','config.example.json']) { JSON.parse(fs.readFileSync(f,'utf8')); console.log(f+': ok') }"
+npm run smoke
+```
+
+## 2026-06-08 12:55 CST
+
+本次更新新增“每日 token 历史”能力，在原有站点累计 token 统计基础上，补齐按天持久化、dashboard 展示和下载导出。
+
+### Token 历史
+
+- 每次成功响应记录 token 时，除累计 `totalTokens` 外，新增写入 `stats.tokenUsage.daily[YYYY-MM-DD]`。
+- 每日记录按本机时区日期切分，字段包含 `totalTokens`、`inputTokens` 和 `outputTokens`，到本地 0 点后自动进入新日期。
+- 保留旧的 `stats.tokenUsage.byDay` 总量字段，兼容已有 `stats.local.json` 历史数据。
+- `/pool/status.usage` 新增 `daily`、`today_input_tokens`、`today_output_tokens`。
+- `/pool/status.upstreams[].usage` 新增单站点 `daily`、`today_input_tokens`、`today_output_tokens`。
+
+### 下载导出
+
+- 新增 `GET /pool/usage/daily.json`，导出完整每日 token 历史，包含 `summary` 和按 `date + upstream` 展开的 `rows`。
+- 新增 `GET /pool/usage/daily.csv`，导出表格格式：`date, upstream, input_tokens, output_tokens, total_tokens`。
+- 导出接口复用管理接口鉴权，避免启用外部监听时泄露使用量历史。
+
+### Dashboard
+
+- 新增 `Daily Token Usage` 面板，默认展示最近 14 天每日 token 总量、input、output 和参与站点数量。
+- 每天记录支持展开查看站点明细，便于定位某一天 token 主要消耗在哪些上游。
+- 新增“下载 CSV”和“下载 JSON”按钮，直接从 dashboard 下载完整历史数据。
+
+### 测试
+
+- smoke 测试新增每日 token 明细断言，覆盖站点级 `daily`、全局 `daily`、JSON 导出和 CSV 导出。
+
 ## 2026-06-07 18:26 CST
 
 本次更新修复“只能看到 quota/token，无法查看具体余额和已消费金额”的问题，新增独立 billing 探测能力。
 
 ### Billing
 
+- 新增本地 `secrets.local.json` secret store，dashboard 可以写入 `ANY_SESSION_COOKIE`、`ANY_NEW_API_USER` 和 `ANY_BILLING_PROXY`，运行中立即生效，无需重启服务。
+- 新增 `billing.proxy_env` / `billing.proxy`，余额探测可通过本地 HTTP 代理访问上游网页登录接口，适配 AnyRouter 这类命令行直连 TLS 不稳定但浏览器代理可访问的站点。
+- 修复 AnyRouter / New API 用户接口返回 gzip/br/deflate 压缩 JSON 时被误判为 `no_amount` 的问题。
+- 优化请求失败后的路由冷却：`400/5xx/Cloudflare 52x` 等 retryable 错误会立即冷却失败站点，连续失败会逐步拉长冷却时间；当明确支持当前模型的站点都在冷却时，会保持同一模型尝试其他可用站点。
 - 每个站点新增 `billing` 运行态，包含 `balance_amount`、`used_amount`、`limit_amount`、`currency`、`period_start`、`period_end` 和探测状态。
 - `/pool/status` 顶层新增 `billing` 汇总，支持按币种聚合全部站点余额、已消费金额和额度上限。
 - `/pool/status.upstreams[].billing` 新增单站点余额/已消费金额详情。
@@ -17,7 +211,7 @@
 - billing 探测不会跟随 dashboard 自动刷新反复触发；只有点击“余额”“刷新余额”或调用接口时才会请求上游账单接口。
 - billing 探测如果遇到 HTML 登录页或 Cloudflare/browser challenge，会标记为 `blocked`，避免误判成普通鉴权错误。
 - 自动推断到的超大 `hard_limit_usd` / `system_hard_limit_usd` 会按占位上限处理，不再显示成 `USD 100M`，也不再用于推导假余额；可信的 `used_amount` 仍会保留。
-- 支持 AnyRouter Credits API（`/api/v1/credits`）读取真实 `balance` / `used`；any 站点默认优先使用 `ANY_MANAGEMENT_API_KEY`，缺少管理 key 时页面会提示 `需管理Key`。
+- 支持 New API/AnyRouter quota 余额读取：可通过 `headers_env` 从环境变量注入网页登录态 cookie 和 `New-API-User`，再用 `data.quota / quota_per_unit` 展示真实余额。
 
 ### Dashboard
 
@@ -27,12 +221,13 @@
 - 空的 `Req Left` / `Tok Left` 不再显示在卡片上；只有上游响应头真的返回 request/token 剩余额度时，才展示为 `Rate Req` / `Rate Tok`。
 - 顶部概览不再显示总余额/总消费金额；金额只在每个站点卡片中展示，并使用 K/M/B/T 短单位和自适应字号避免长数字被截断。
 - 顶部工具栏新增“刷新余额”按钮，用于刷新所有启用站点账单数据。
+- Dashboard 新增 `AnyRouter Session` 面板，用于半自动维护登录态 cookie、New-API-User 和本地代理地址。
 
 ### 文档与测试
 
 - README 增加 billing 与 quota/token 的区别、默认 endpoint、API 调用示例和自定义字段配置说明。
 - `config.example.json` 增加全局 billing 并发/超时示例和单站点 billing 配置示例。
-- smoke 测试新增 billing accounting 覆盖，验证 OpenAI-style limit/usage 解析、AnyRouter-style credits 余额、超大占位上限过滤、单站点状态、全局汇总和 HTML-protected billing endpoint 的 `blocked` 分类。
+- smoke 测试新增 billing accounting 覆盖，验证 OpenAI-style limit/usage 解析、New API quota 余额、超大占位上限过滤、单站点状态、全局汇总和 HTML-protected billing endpoint 的 `blocked` 分类。
 
 ## 2026-06-07 17:55 CST
 

@@ -5,7 +5,9 @@ function parseArgs(argv) {
     tokenEnv: process.env.CODEX_POOL_ADMIN_TOKEN_ENV || 'CODEX_POOL_API_KEY',
     siteUrl: '',
     hasSiteUrl: false,
-    api: ''
+    api: '',
+    key: '',
+    keyEnv: ''
   };
   const positional = [];
 
@@ -28,6 +30,14 @@ function parseArgs(argv) {
       flags.tokenEnv = argv[++index] || flags.tokenEnv;
       continue;
     }
+    if (arg === '--key') {
+      flags.key = argv[++index] || '';
+      continue;
+    }
+    if (arg === '--key-env') {
+      flags.keyEnv = argv[++index] || '';
+      continue;
+    }
     if (arg === '--api') {
       flags.api = argv[++index] || '';
       continue;
@@ -41,11 +51,12 @@ function parseArgs(argv) {
 const { flags, positional } = parseArgs(process.argv.slice(2));
 const [name, baseUrl, weightArg, keyEnvArg] = positional;
 const defaultKeyEnv = name ? `${name.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY` : '';
-const keyEnv = keyEnvArg || (!flags.replace ? defaultKeyEnv : '');
+const keyEnv = flags.keyEnv || keyEnvArg || (!flags.key && !flags.replace ? defaultKeyEnv : '');
 
 if (!name || !baseUrl) {
-  console.error('usage: node scripts/add-upstream.mjs <name> <base_url> [weight] [key_env] [--site-url URL] [--api openai|anthropic|both] [--replace] [--pool-url URL] [--token-env ENV]');
-  console.error('example: node scripts/add-upstream.mjs mysite https://example.com/v1 2 MY_SITE_API_KEY --site-url https://example.com --api openai --replace');
+  console.error('usage: node scripts/add-upstream.mjs <name> <base_url> [weight] [key_env] [--key-env ENV] [--key sk-...] [--site-url URL] [--api openai|anthropic|both] [--replace] [--pool-url URL] [--token-env ENV]');
+  console.error('example: node scripts/add-upstream.mjs mysite https://example.com/v1 2 --key-env MY_SITE_API_KEY --site-url https://example.com --api openai --replace');
+  console.error('example: node scripts/add-upstream.mjs mysite https://example.com/v1 2 --key sk-plaintext');
   process.exit(2);
 }
 
@@ -57,7 +68,8 @@ const payload = {
 if (flags.hasSiteUrl) payload.site_url = flags.siteUrl;
 if (flags.api) payload.api = flags.api;
 if (weightArg !== undefined || !flags.replace) payload.weight = Number(weightArg || 1);
-if (keyEnv) payload.keys = [{ env: keyEnv }];
+if (flags.key) payload.keys = [{ value: flags.key }];
+else if (keyEnv) payload.keys = [{ env: keyEnv }];
 
 const token = flags.tokenEnv ? process.env[flags.tokenEnv] || '' : '';
 const headers = { 'content-type': 'application/json' };

@@ -974,11 +974,11 @@ function outputTextDoneEvent(text, context = {}) {
 }
 
 function resolveKey(entry) {
-  if (!entry) return { value: '', label: 'no-auth' };
-  if (typeof entry === 'string') return { value: entry, label: maskSecret(entry) };
-  if (entry.value) return { value: entry.value, label: entry.label || maskSecret(entry.value) };
-  if (entry.env) return { value: process.env[entry.env] || '', label: entry.env };
-  return { value: '', label: 'empty-key' };
+  if (!entry) return { value: '', label: 'no-auth', source: 'none' };
+  if (typeof entry === 'string') return { value: entry, label: maskSecret(entry), source: 'value' };
+  if (entry.value) return { value: entry.value, label: entry.label || maskSecret(entry.value), source: 'value' };
+  if (entry.env) return { value: process.env[entry.env] || '', label: entry.env, source: 'env' };
+  return { value: '', label: 'empty-key', source: 'none' };
 }
 
 function emptyBillingState(state = 'unknown', error = '') {
@@ -1046,6 +1046,7 @@ function createUpstreamState(upstream, index) {
     return {
       index: keyIndex,
       label: resolved.label,
+      source: resolved.source,
       value: resolved.value,
       failures: 0,
       cooldownUntil: 0,
@@ -3631,7 +3632,7 @@ function dashboardHtml() {
     .key.warn { color: var(--warn); background: rgba(183,121,8,.08); }
     .key.bad { color: var(--bad); background: rgba(180,59,50,.08); }
     .key.cold { color: var(--cold); background: rgba(49,95,125,.08); }
-    form { margin-top: 18px; padding: 18px; display: grid; grid-template-columns: 1fr 1.5fr 1.5fr .6fr .72fr 1fr auto auto; gap: 10px; align-items: end; }
+    form { margin-top: 18px; padding: 18px; display: grid; grid-template-columns: 1fr 1.4fr 1.4fr .55fr .62fr .78fr 1fr 1fr auto auto; gap: 10px; align-items: end; }
     form .section-head { grid-column: 1 / -1; }
     .form-mode { grid-column: 1 / -1; color: var(--muted); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
     .claude-result { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.48); padding: 10px 12px; color: var(--muted); font-size: 13px; line-height: 1.45; }
@@ -3811,7 +3812,9 @@ function dashboardHtml() {
       <label>签到页<input name="site_url" placeholder="https://example.com" /></label>
       <label>权重<input name="weight" type="number" min="0.1" step="0.1" value="1" /></label>
       <label class="toggle-field">可签到<input name="signin_available" type="checkbox" /></label>
+      <label>密钥模式<select name="key_mode"><option value="env">环境变量</option><option value="value">明文 Key</option></select></label>
       <label>Key Env<input name="key_env" placeholder="MYSITE_API_KEY" /></label>
+      <label>明文 Key<input name="key_value" type="password" placeholder="sk-..." autocomplete="off" /></label>
       <button class="ghost" id="checkClaude" type="button" data-icon="radar">检测 Claude</button>
       <button id="submitUpstream" type="submit" data-icon="plus">添加站点</button>
       <button class="ghost" id="cancelEdit" type="button" hidden data-icon="x">取消</button>
@@ -3970,15 +3973,23 @@ function dashboardHtml() {
     function formClaudePayload() {
       const form = new FormData(upstreamForm);
       const upstreamName = editingName || String(form.get('name') || '').trim();
-      return {
+      const payload = {
         name: upstreamName,
         base_url: form.get('base_url'),
         site_url: form.get('site_url'),
         weight: Number(form.get('weight') || 1),
         signin_available: Boolean(form.get('signin_available')),
-        keys: [{ env: form.get('key_env') || String(upstreamName).toUpperCase().replace(/[^A-Z0-9]+/g, '_') + '_API_KEY' }],
         replace: Boolean(editingName)
       };
+      const keyMode = String(form.get('key_mode') || 'env');
+      const keyValue = String(form.get('key_value') || '').trim();
+      const keyEnv = String(form.get('key_env') || '').trim();
+      if (keyMode === 'value') {
+        if (keyValue) payload.keys = [{ value: keyValue }];
+      } else {
+        payload.keys = [{ env: keyEnv || String(upstreamName).toUpperCase().replace(/[^A-Z0-9]+/g, '_') + '_API_KEY' }];
+      }
+      return payload;
     }
     function applyClaudeSuggestion(payload) {
       if (!formClaudeCheck?.supports_claude || !formClaudeCheck.suggested_api) return payload;
@@ -5133,6 +5144,7 @@ function createStatusPayload(config, state) {
         },
         keys: upstream.keys.map((key) => ({
           label: key.label,
+          source: key.source,
           configured: Boolean(key.value),
           cooldown_ms: Math.max(0, key.cooldownUntil - at),
           failures: key.failures,
@@ -5313,6 +5325,10 @@ function keyEntriesFromImportItem(item, name, secretMode) {
     item.authToken,
     item.access_token,
     item.accessToken,
+    item.experimental_bearer_token,
+    item.experimentalBearerToken,
+    item.bearer_token,
+    item.bearerToken,
     item.value
   );
   if (!value) return [{ env: envNameForUpstream(name) }];
@@ -5501,11 +5517,42 @@ function validateUpstreamPayload(payload, config) {
     throw error;
   }
 
+  const explicitKeyEnv = firstString(
+    payload.key_env,
+    payload.keyEnv,
+    payload.api_key_env,
+    payload.apiKeyEnv,
+    payload.token_env,
+    payload.tokenEnv
+  );
+  const explicitKeyValue = firstString(
+    payload.key_value,
+    payload.keyValue,
+    payload.api_key,
+    payload.apiKey,
+    payload.key,
+    payload.token,
+    payload.api_token,
+    payload.apiToken,
+    payload.auth_token,
+    payload.authToken,
+    payload.access_token,
+    payload.accessToken,
+    payload.experimental_bearer_token,
+    payload.experimentalBearerToken,
+    payload.bearer_token,
+    payload.bearerToken
+  );
+
   const keyInput = Array.isArray(payload.keys) && payload.keys.length > 0
     ? payload.keys
-    : payload.replace && Array.isArray(existing?.keys) && existing.keys.length > 0
-      ? existing.keys
-      : null;
+    : explicitKeyValue
+      ? [{ value: explicitKeyValue, label: firstString(payload.key_label, payload.keyLabel) || undefined }]
+      : explicitKeyEnv
+        ? [{ env: explicitKeyEnv }]
+        : payload.replace && Array.isArray(existing?.keys) && existing.keys.length > 0
+          ? existing.keys
+          : null;
 
   const keys = keyInput
     ? keyInput.map((entry) => {

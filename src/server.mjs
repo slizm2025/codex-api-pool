@@ -35,6 +35,7 @@ import {
 
 const DEFAULT_CONFIG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config.local.json');
 const DEFAULT_RETRYABLE_STATUS = [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524];
+const NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS = new Set([404, 405, 501]);
 const STREAM_ERROR_STATUS = 502;
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -46,10 +47,19 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade'
 ]);
+const CLIENT_AUTH_HEADERS = new Set([
+  'x-api-key',
+  'api-key',
+  'anthropic-version',
+  'anthropic-beta',
+  'openai-organization',
+  'openai-project'
+]);
 const MAX_USAGE_CAPTURE_BYTES = 50 * 1024 * 1024;
 const DEFAULT_BILLING_LARGE_LIMIT_THRESHOLD = 10_000_000;
 const DEFAULT_AVAILABILITY_WINDOW_SIZE = 50;
 const DEFAULT_AVAILABILITY_MIN_SAMPLES = 10;
+const DEFAULT_GRACEFUL_SHUTDOWN_MS = 15000;
 function now() {
   return Date.now();
 }
@@ -147,6 +157,7 @@ function sanitizeRequestHeaders(headers, upstreamKey, targetUrl) {
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (CLIENT_AUTH_HEADERS.has(lower)) continue;
     if (lower === 'host') continue;
     if (lower === 'authorization') continue;
     out[name] = value;
@@ -154,6 +165,27 @@ function sanitizeRequestHeaders(headers, upstreamKey, targetUrl) {
   out.host = target.host;
   if (upstreamKey) out.authorization = `Bearer ${upstreamKey}`;
   return out;
+}
+
+function captureIncomingRequestHeaders(config, headers = {}) {
+  if (config.debug?.capture_request_headers !== true) return undefined;
+  const sensitive = /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key|api-key)$/i;
+  const sensitiveFragment = /(token|secret|password|credential|api[-_]?key)/i;
+  const captured = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    const lower = name.toLowerCase();
+    if (sensitive.test(lower) || sensitiveFragment.test(lower)) continue;
+    captured[lower] = Array.isArray(value) ? value.join(', ') : String(value);
+  }
+  return captured;
+}
+
+function requestDebugFields(incomingHeaders) {
+  return incomingHeaders ? { incomingHeaders } : {};
+}
+
+function stripRequestDebugFields(requests = []) {
+  return requests.map(({ incomingHeaders, ...request }) => request);
 }
 
 function isCodexCliUserAgent(value) {
@@ -233,6 +265,21 @@ function codexOAuthTargetUrl(baseUrl, incomingUrl, publicPrefix) {
   return joinTargetUrl(base, incomingUrl || '/', publicPrefix);
 }
 
+function ignoreLateSocketError() {}
+
+function guardLateSocketErrors(socket) {
+  try {
+    if (!socket?.on || !socket.listeners) return socket;
+    if (!socket.listeners('error').includes(ignoreLateSocketError)) {
+      socket.on('error', ignoreLateSocketError);
+    }
+  } catch {
+    // Some Node wrappers restrict direct socket inspection; caller-level error
+    // handlers still receive normal request/session failures.
+  }
+  return socket;
+}
+
 function openHttpProxyTunnel(proxyUrl, targetHostInput, targetPortInput, timeoutMs) {
   return new Promise((resolve, reject) => {
     const proxy = new URL(proxyUrl);
@@ -294,11 +341,26 @@ function openHttpProxyTunnel(proxyUrl, targetHostInput, targetPortInput, timeout
         servername: targetHost,
         ALPNProtocols: ['h2', 'http/1.1']
       });
-      tlsSocket.once('secureConnect', () => resolve(tlsSocket));
-      tlsSocket.once('error', reject);
+      guardLateSocketErrors(tlsSocket);
+      let tlsSettled = false;
+      tlsSocket.once('secureConnect', () => {
+        if (tlsSettled) return;
+        tlsSettled = true;
+        resolve(tlsSocket);
+      });
+      tlsSocket.on('error', (error) => {
+        if (tlsSettled) return;
+        tlsSettled = true;
+        reject(error);
+      });
     });
 
   });
+}
+
+function guardHttp2SessionSocket(session) {
+  guardLateSocketErrors(session?.socket);
+  return session;
 }
 
 function createHttpProxyTunnel(proxyUrl, timeoutMs) {
@@ -308,7 +370,11 @@ function createHttpProxyTunnel(proxyUrl, timeoutMs) {
       connectOptions.hostname || connectOptions.host,
       connectOptions.port || 443,
       timeoutMs
-    ).then((socket) => callback(null, socket), callback);
+    ).then((socket) => {
+      guardLateSocketErrors(socket);
+      callback(null, socket);
+      setImmediate(() => guardLateSocketErrors(socket));
+    }, callback);
     return undefined;
   };
 }
@@ -357,12 +423,12 @@ async function openHttp2Session(target, proxyUrl, timeoutMs) {
   const normalizedProxy = normalizeProxyUrl(proxyUrl);
   const origin = target.origin;
   if (!normalizedProxy) {
-    return http2.connect(origin);
+    return guardHttp2SessionSocket(http2.connect(origin));
   }
   const socket = await openHttpProxyTunnel(normalizedProxy, target.hostname, target.port || 443, timeoutMs);
-  return http2.connect(origin, {
+  return guardHttp2SessionSocket(http2.connect(origin, {
     createConnection: () => socket
-  });
+  }));
 }
 
 function http2HeadersForTarget(target, method, headers = {}) {
@@ -602,6 +668,38 @@ async function readBody(req, maxBytes) {
   return Buffer.concat(chunks);
 }
 
+function requestHasJsonContentType(req) {
+  const contentType = String(req.headers?.['content-type'] || '').toLowerCase();
+  return contentType.includes('application/json') || /application\/[^;\s]+\+json\b/.test(contentType);
+}
+
+function bodyLooksJsonLike(body) {
+  if (!body || body.length === 0) return false;
+  const text = body.toString('utf8').trimStart();
+  return text.startsWith('{') || text.startsWith('[');
+}
+
+function jsonObjectFromRequestBody(req, body, options = {}) {
+  if (!body || body.length === 0) return null;
+  const inferJsonLike = options.inferJsonLike === true;
+  if (!requestHasJsonContentType(req) && !(inferJsonLike && bodyLooksJsonLike(body))) return null;
+  try {
+    const payload = JSON.parse(body.toString('utf8'));
+    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildJsonRequestHeaders(targetUrl, keyValue, incomingHeaders = {}) {
+  const headers = sanitizeRequestHeaders(incomingHeaders, keyValue, targetUrl);
+  for (const name of Object.keys(headers)) {
+    if (name.toLowerCase() === 'content-type') delete headers[name];
+  }
+  headers['content-type'] = 'application/json';
+  return headers;
+}
+
 async function readJsonBody(req, maxBytes) {
   const body = await readBody(req, maxBytes);
   if (body.length === 0) return {};
@@ -614,31 +712,18 @@ async function readJsonBody(req, maxBytes) {
   }
 }
 
-function rewriteModelInBody(req, body, model) {
+function rewriteModelInBody(req, body, model, options = {}) {
   if (!model || body.length === 0) return body;
-  const contentType = String(req.headers['content-type'] || '').toLowerCase();
-  if (!contentType.includes('application/json')) return body;
-  try {
-    const payload = JSON.parse(body.toString('utf8'));
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return body;
-    payload.model = model;
-    return Buffer.from(JSON.stringify(payload));
-  } catch {
-    return body;
-  }
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  if (!payload) return body;
+  payload.model = model;
+  return Buffer.from(JSON.stringify(payload));
 }
 
-function modelFromBody(req, body) {
+function modelFromBody(req, body, options = {}) {
   if (body.length === 0) return '';
-  const contentType = String(req.headers['content-type'] || '').toLowerCase();
-  if (!contentType.includes('application/json')) return '';
-  try {
-    const payload = JSON.parse(body.toString('utf8'));
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '';
-    return typeof payload.model === 'string' ? payload.model : '';
-  } catch {
-    return '';
-  }
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  return typeof payload?.model === 'string' ? payload.model : '';
 }
 
 function isClaudeModel(model) {
@@ -666,6 +751,16 @@ function isCodexOAuthModel(model) {
 
 function isCodexOAuthConfig(input) {
   return input?.codex_oauth === true || String(input?.request_mode || '').trim().toLowerCase() === 'codex_oauth';
+}
+
+function normalizeRequestMode(value, codexOAuth = false) {
+  if (codexOAuth) return 'codex_oauth';
+  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_');
+  if (!normalized || normalized === 'auto') return 'auto';
+  if (normalized === 'responses' || normalized === 'response') return 'responses';
+  if (normalized === 'chat' || normalized === 'chat_completion' || normalized === 'chat_completions') return 'chat_completions';
+  if (normalized === 'codex_oauth') return 'codex_oauth';
+  return normalized;
 }
 
 function codexOAuthExpired(upstream, at = Date.now()) {
@@ -765,6 +860,101 @@ function shouldUseAnthropicResponsesAdapter(pathname, model) {
   return pathname === '/v1/responses' && isClaudeModel(model);
 }
 
+function canUseChatCompletionsAdapter(pathname, upstream, model) {
+  return pathname === '/v1/responses'
+    && !isClaudeModel(model)
+    && !upstream?.codexOAuth
+    && isOpenAiUpstream(upstream);
+}
+
+function isChatCompletionsOnlyMode(upstream) {
+  return upstream?.requestMode === 'chat_completions';
+}
+
+function canAttemptNativeResponses(pathname, upstream, model) {
+  if (pathname !== '/v1/responses') return true;
+  if (shouldUseAnthropicResponsesAdapter(pathname, model)) return false;
+  if (!canUseChatCompletionsAdapter(pathname, upstream, model)) return true;
+  return !isChatCompletionsOnlyMode(upstream);
+}
+
+function requestRouteTrace({
+  pathname,
+  useAnthropicAdapter = false,
+  useChatCompletionsAdapter = false,
+  useCodexOAuth = false,
+  requiresNativeResponses = false,
+  unsupportedToolTypes = [],
+  unsupportedOutputFormatTypes = [],
+  unsupportedInputTypes = []
+} = {}) {
+  const nativeOnly = {};
+  if (unsupportedToolTypes.length > 0) nativeOnly.tool_types = unsupportedToolTypes;
+  if (unsupportedOutputFormatTypes.length > 0) nativeOnly.output_format_types = unsupportedOutputFormatTypes;
+  if (unsupportedInputTypes.length > 0) nativeOnly.input_types = unsupportedInputTypes;
+  if (pathname === '/v1/responses' && useAnthropicAdapter) {
+    return {
+      input_api: 'responses',
+      upstream_api: 'anthropic_messages',
+      adapter: 'responses_to_anthropic_messages',
+      native_required: requiresNativeResponses,
+      native_only: nativeOnly,
+      transform: [
+        'input_to_anthropic_messages',
+        'function_tools_to_anthropic_tools',
+        'tool_choice_to_anthropic_tool_choice',
+        'anthropic_response_to_responses'
+      ]
+    };
+  }
+  if (pathname === '/v1/responses' && useChatCompletionsAdapter) {
+    return {
+      input_api: 'responses',
+      upstream_api: 'chat_completions',
+      adapter: 'responses_to_chat_completions',
+      native_required: requiresNativeResponses,
+      native_only: nativeOnly,
+      transform: [
+        'input_to_chat_messages',
+        'function_tools_to_chat_tools',
+        'tool_choice_to_chat_tool_choice',
+        'text_format_to_response_format',
+        'chat_response_to_responses'
+      ]
+    };
+  }
+  if (pathname === '/v1/responses') {
+    return {
+      input_api: 'responses',
+      upstream_api: useCodexOAuth ? 'codex_oauth_responses' : 'responses',
+      adapter: 'native_responses_passthrough',
+      native_required: requiresNativeResponses,
+      native_only: nativeOnly,
+      transform: useCodexOAuth ? ['codex_oauth_forward'] : ['passthrough']
+    };
+  }
+  return {
+    input_api: pathname || 'unknown',
+    upstream_api: 'passthrough',
+    adapter: 'passthrough',
+    native_required: false,
+    native_only: nativeOnly,
+    transform: ['passthrough']
+  };
+}
+
+function addRouteTraceHeaders(headers, routeTrace) {
+  if (!routeTrace) return;
+  headers['x-codex-api-pool-route'] = `${routeTrace.input_api}->${routeTrace.upstream_api}`;
+  headers['x-codex-api-pool-adapter'] = routeTrace.adapter;
+  headers['x-codex-api-pool-transform'] = routeTrace.transform.join(',');
+}
+
+function chatFallbackProbeTimeoutMs(config, timeoutMs) {
+  const value = Number(config.retry?.chat_fallback_probe_timeout_ms || config.retry?.responses_fallback_timeout_ms || 15000);
+  return Number.isFinite(value) && value > 0 ? Math.min(timeoutMs, value) : timeoutMs;
+}
+
 function anthropicModelsPathForBaseUrl(baseUrl) {
   try {
     const pathname = new URL(baseUrl).pathname.replace(/\/$/, '');
@@ -780,6 +970,15 @@ function anthropicMessagesPathForBaseUrl(baseUrl) {
     return pathname.endsWith('/v1') ? '/messages' : '/v1/messages';
   } catch {
     return '/v1/messages';
+  }
+}
+
+function chatCompletionsPathForBaseUrl(baseUrl) {
+  try {
+    const pathname = new URL(baseUrl).pathname.replace(/\/$/, '');
+    return pathname.endsWith('/v1') ? '/chat/completions' : '/v1/chat/completions';
+  } catch {
+    return '/v1/chat/completions';
   }
 }
 
@@ -802,6 +1001,285 @@ function textFromResponsesContent(content) {
     }
   }
   return parts.join('\n');
+}
+
+function stringFromToolOutput(value) {
+  return typeof value === 'string' ? value : JSON.stringify(value ?? '');
+}
+
+function objectFromToolArguments(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : { value: parsed };
+  } catch {
+    return { arguments: value };
+  }
+}
+
+function responseFunctionToolParts(tool) {
+  if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return null;
+  if (tool.type && tool.type !== 'function' && !tool.function) return null;
+  const source = tool.function && typeof tool.function === 'object' && !Array.isArray(tool.function)
+    ? tool.function
+    : tool;
+  const name = typeof source.name === 'string' && source.name.trim()
+    ? source.name.trim()
+    : typeof tool.name === 'string' && tool.name.trim()
+      ? tool.name.trim()
+      : '';
+  if (!name) return null;
+  return {
+    name,
+    description: firstDefined(source.description, tool.description),
+    parameters: firstDefined(source.parameters, tool.parameters, source.input_schema, tool.input_schema),
+    strict: firstDefined(source.strict, tool.strict)
+  };
+}
+
+function responsesToolTypeLabel(tool) {
+  if (tool && typeof tool === 'object' && !Array.isArray(tool)) {
+    if (typeof tool.type === 'string' && tool.type.trim()) return tool.type.trim();
+    if (tool.function) return 'function';
+  }
+  return 'unknown';
+}
+
+function unsupportedResponsesToolTypesFromTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  const types = new Set();
+  for (const tool of tools) {
+    if (!responseFunctionToolParts(tool)) types.add(responsesToolTypeLabel(tool));
+  }
+  return [...types];
+}
+
+const CHAT_COMPLETIONS_TOOL_CHOICE_STRINGS = new Set(['auto', 'none', 'required']);
+
+function isSimpleToolChoiceObject(choice, type) {
+  return choice && typeof choice === 'object' && !Array.isArray(choice)
+    && choice.type === type
+    && Object.keys(choice).every((key) => key === 'type');
+}
+
+function unsupportedResponsesToolChoiceTypesFromChoice(choice) {
+  if (choice === undefined) return [];
+  if (typeof choice === 'string') {
+    const value = choice.trim();
+    return CHAT_COMPLETIONS_TOOL_CHOICE_STRINGS.has(value) ? [] : [value || 'unknown'];
+  }
+  if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return ['unknown'];
+  const type = String(choice.type || '').trim();
+  const name = choice.function?.name || choice.name;
+  if (type === 'function' && typeof name === 'string' && name.trim()) return [];
+  if (CHAT_COMPLETIONS_TOOL_CHOICE_STRINGS.has(type) && isSimpleToolChoiceObject(choice, type)) return [];
+  return [type || 'unknown'];
+}
+
+function unsupportedResponsesToolTypesFromPayload(payload) {
+  const types = new Set(unsupportedResponsesToolTypesFromTools(payload?.tools));
+  for (const type of unsupportedResponsesToolChoiceTypesFromChoice(payload?.tool_choice)) types.add(type);
+  return [...types];
+}
+
+function unsupportedResponsesToolTypesFromBody(req, body, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  return payload ? unsupportedResponsesToolTypesFromPayload(payload) : [];
+}
+
+const CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES = new Set(['message', 'function_call', 'function_call_output']);
+const CONVERTIBLE_RESPONSES_CONTENT_TYPES = new Set(['text', 'input_text', 'output_text']);
+
+function unsupportedResponsesInputTypesFromContent(content) {
+  if (content === undefined || content === null || typeof content === 'string') return [];
+  if (!Array.isArray(content)) return ['content:unknown'];
+  const types = new Set();
+  for (const block of content) {
+    if (typeof block === 'string') continue;
+    if (!block || typeof block !== 'object' || Array.isArray(block)) {
+      types.add('content:unknown');
+      continue;
+    }
+    const type = typeof block.type === 'string' && block.type.trim() ? block.type.trim() : '';
+    if (type && !CONVERTIBLE_RESPONSES_CONTENT_TYPES.has(type)) types.add(`content:${type}`);
+  }
+  return [...types];
+}
+
+function unsupportedResponsesInputTypesFromInput(input) {
+  if (input === undefined || input === null || typeof input === 'string') return [];
+  if (!Array.isArray(input)) return ['unknown'];
+  const types = new Set();
+  for (const item of input) {
+    if (typeof item === 'string') continue;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      types.add('unknown');
+      continue;
+    }
+    const type = typeof item.type === 'string' && item.type.trim() ? item.type.trim() : '';
+    if (type && !CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES.has(type)) types.add(type);
+    const contentTypes = unsupportedResponsesInputTypesFromContent(item.content ?? item.text ?? item.message);
+    for (const contentType of contentTypes) types.add(contentType);
+  }
+  return [...types];
+}
+
+function unsupportedResponsesInputTypesFromPayload(payload) {
+  return unsupportedResponsesInputTypesFromInput(payload?.input);
+}
+
+function unsupportedResponsesInputTypesFromBody(req, body, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  return payload ? unsupportedResponsesInputTypesFromPayload(payload) : [];
+}
+
+function unsupportedToolConversionMessage(types, adapterName) {
+  const list = types.length ? types.join(', ') : 'unknown';
+  return `unsupported Responses tool types for ${adapterName}: ${list}; route this request to a native /v1/responses upstream or use function tools`;
+}
+
+function unsupportedToolConversionError(types, adapterName) {
+  const err = new Error(unsupportedToolConversionMessage(types, adapterName));
+  err.statusCode = 422;
+  err.unsupportedToolTypes = types;
+  return err;
+}
+
+function assertResponsesToolsConvertible(tools, adapterName) {
+  const unsupportedTypes = unsupportedResponsesToolTypesFromTools(tools);
+  if (unsupportedTypes.length > 0) throw unsupportedToolConversionError(unsupportedTypes, adapterName);
+}
+
+function chatToolFromResponsesTool(tool) {
+  const parts = responseFunctionToolParts(tool);
+  if (!parts) return null;
+  const fn = {
+    name: parts.name,
+    parameters: parts.parameters && typeof parts.parameters === 'object'
+      ? parts.parameters
+      : { type: 'object', properties: {} }
+  };
+  if (parts.description !== undefined) fn.description = String(parts.description);
+  if (parts.strict !== undefined) fn.strict = parts.strict;
+  return { type: 'function', function: fn };
+}
+
+function chatToolsFromResponsesTools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const converted = tools.map(chatToolFromResponsesTool).filter(Boolean);
+  return converted.length > 0 ? converted : undefined;
+}
+
+function anthropicToolFromResponsesTool(tool) {
+  const parts = responseFunctionToolParts(tool);
+  if (!parts) return null;
+  const anthropicTool = {
+    name: parts.name,
+    input_schema: parts.parameters && typeof parts.parameters === 'object'
+      ? parts.parameters
+      : { type: 'object', properties: {} }
+  };
+  if (parts.description !== undefined) anthropicTool.description = String(parts.description);
+  return anthropicTool;
+}
+
+function anthropicToolsFromResponsesTools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const converted = tools.map(anthropicToolFromResponsesTool).filter(Boolean);
+  return converted.length > 0 ? converted : undefined;
+}
+
+function chatToolChoiceFromResponsesToolChoice(choice) {
+  if (choice === undefined) return undefined;
+  if (typeof choice === 'string') {
+    const value = choice.trim();
+    if (CHAT_COMPLETIONS_TOOL_CHOICE_STRINGS.has(value)) return value;
+    throw unsupportedToolConversionError([value || 'unknown'], 'Chat Completions adapter');
+  }
+  if (!choice || typeof choice !== 'object' || Array.isArray(choice)) {
+    throw unsupportedToolConversionError(['unknown'], 'Chat Completions adapter');
+  }
+  const name = choice.function?.name || choice.name;
+  if (choice.type === 'function' && typeof name === 'string' && name.trim()) {
+    return { type: 'function', function: { name: name.trim() } };
+  }
+  const type = String(choice.type || '').trim();
+  if (CHAT_COMPLETIONS_TOOL_CHOICE_STRINGS.has(type) && isSimpleToolChoiceObject(choice, type)) return type;
+  throw unsupportedToolConversionError([type || 'unknown'], 'Chat Completions adapter');
+}
+
+function anthropicToolChoiceFromResponsesToolChoice(choice) {
+  if (choice === undefined) return undefined;
+  if (typeof choice === 'string') {
+    if (choice === 'required') return { type: 'any' };
+    if (choice === 'auto' || choice === 'none') return { type: choice };
+    throw unsupportedToolConversionError([choice || 'unknown'], 'Anthropic Messages adapter');
+  }
+  if (!choice || typeof choice !== 'object' || Array.isArray(choice)) {
+    throw unsupportedToolConversionError(['unknown'], 'Anthropic Messages adapter');
+  }
+  const type = String(choice.type || '').trim();
+  const name = choice.function?.name || choice.name;
+  if ((type === 'function' || type === 'tool') && typeof name === 'string' && name.trim()) {
+    return { type: 'tool', name: name.trim() };
+  }
+  if (type === 'required') return { type: 'any' };
+  if (type === 'any' || type === 'auto' || type === 'none') return { type };
+  throw unsupportedToolConversionError([type || 'unknown'], 'Anthropic Messages adapter');
+}
+
+function responsesInputToChatMessages(input) {
+  if (typeof input === 'string') return [{ role: 'user', content: input }];
+  if (!Array.isArray(input)) return [];
+  const messages = [];
+  for (const item of input) {
+    if (typeof item === 'string') {
+      messages.push({ role: 'user', content: item });
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+
+    // Handle function_call items → assistant message with tool_calls
+    if (item.type === 'function_call') {
+      const toolCall = {
+        id: item.call_id || item.id || `call_${now().toString(36)}`,
+        type: 'function',
+        function: {
+          name: item.name || '',
+          arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {})
+        }
+      };
+      // Merge consecutive function_calls into the same assistant message
+      const previous = messages[messages.length - 1];
+      if (previous && previous.role === 'assistant' && Array.isArray(previous.tool_calls)) {
+        previous.tool_calls.push(toolCall);
+      } else {
+        messages.push({ role: 'assistant', content: null, tool_calls: [toolCall] });
+      }
+      continue;
+    }
+
+    // Handle function_call_output items → tool role message
+    if (item.type === 'function_call_output') {
+      messages.push({
+        role: 'tool',
+        tool_call_id: item.call_id || '',
+        content: stringFromToolOutput(item.output)
+      });
+      continue;
+    }
+
+    const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user';
+    const content = textFromResponsesContent(item.content ?? item.text ?? item.message);
+    if (!content) continue;
+    const previous = messages[messages.length - 1];
+    if (previous && previous.role === role && !previous.tool_calls) previous.content += `\n${content}`;
+    else messages.push({ role, content });
+  }
+  return messages;
 }
 
 function anthropicTextBlocksFromResponsesContent(content) {
@@ -842,6 +1320,29 @@ function responsesInputToAnthropicMessages(input) {
       continue;
     }
     if (!item || typeof item !== 'object') continue;
+    if (item.type === 'function_call') {
+      messages.push({
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: item.call_id || item.id || `toolu_pool_${now().toString(36)}`,
+          name: item.name || '',
+          input: objectFromToolArguments(item.arguments)
+        }]
+      });
+      continue;
+    }
+    if (item.type === 'function_call_output') {
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: item.call_id || '',
+          content: stringFromToolOutput(item.output)
+        }]
+      });
+      continue;
+    }
     const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user';
     const content = anthropicTextBlocksFromResponsesContent(item.content ?? item.text ?? item.message);
     if (role === 'system') {
@@ -866,6 +1367,191 @@ function normalizeMaxTokens(value) {
   return Math.max(1, Math.floor(number));
 }
 
+const CHAT_COMPLETIONS_PASSTHROUGH_FIELDS = [
+  'frequency_penalty',
+  'presence_penalty',
+  'logit_bias',
+  'logprobs',
+  'top_logprobs',
+  'n',
+  'response_format',
+  'seed',
+  'user',
+  'service_tier',
+  'stream_options',
+  'parallel_tool_calls'
+];
+
+const CHAT_COMPLETIONS_RESPONSES_TEXT_FORMAT_TYPES = new Set(['text', 'json_object', 'json_schema']);
+const ANTHROPIC_RESPONSES_TEXT_FORMAT_TYPES = new Set(['text']);
+
+function copyPayloadFields(target, source, fields) {
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(source, field) && source[field] !== undefined) {
+      target[field] = source[field];
+    }
+  }
+}
+
+function objectRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function responsesTextFormatFromPayload(payload) {
+  if (!objectRecord(payload) || !objectRecord(payload.text) || !objectRecord(payload.text.format)) return undefined;
+  return payload.text.format;
+}
+
+function responsesTextFormatTypeLabel(format) {
+  if (objectRecord(format) && typeof format.type === 'string' && format.type.trim()) return format.type.trim();
+  return 'unknown';
+}
+
+function unsupportedResponsesOutputFormatTypesFromPayload(payload, supportedTypes) {
+  const format = responsesTextFormatFromPayload(payload);
+  if (!format) return [];
+  const type = responsesTextFormatTypeLabel(format);
+  return supportedTypes.has(type) ? [] : [type];
+}
+
+function unsupportedResponsesOutputFormatTypesFromBody(req, body, supportedTypes, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  return payload ? unsupportedResponsesOutputFormatTypesFromPayload(payload, supportedTypes) : [];
+}
+
+function unsupportedOutputFormatConversionMessage(types, adapterName) {
+  const list = types.length ? types.join(', ') : 'unknown';
+  return `unsupported Responses text.format types for ${adapterName}: ${list}; route this request to a native /v1/responses upstream or use a convertible output format`;
+}
+
+function unsupportedOutputFormatConversionError(types, adapterName) {
+  const err = new Error(unsupportedOutputFormatConversionMessage(types, adapterName));
+  err.statusCode = 422;
+  err.unsupportedOutputFormatTypes = types;
+  return err;
+}
+
+function assertResponsesOutputFormatConvertible(payload, supportedTypes, adapterName) {
+  const unsupportedTypes = unsupportedResponsesOutputFormatTypesFromPayload(payload, supportedTypes);
+  if (unsupportedTypes.length > 0) throw unsupportedOutputFormatConversionError(unsupportedTypes, adapterName);
+}
+
+function unconvertibleChatOutputFormatTypesFromBody(req, body, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  if (!payload) return [];
+  try {
+    const format = responsesTextFormatFromPayload(payload);
+    if (!format) return [];
+    chatResponseFormatFromResponsesTextFormat(format);
+    return [];
+  } catch (error) {
+    if (Array.isArray(error.unsupportedOutputFormatTypes)) return error.unsupportedOutputFormatTypes;
+    return [];
+  }
+}
+
+function unsupportedInputConversionMessage(types, adapterName) {
+  const list = types.length ? types.join(', ') : 'unknown';
+  return `unsupported Responses input item/content types for ${adapterName}: ${list}; route this request to a native /v1/responses upstream or use text/function-call inputs`;
+}
+
+function unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes) {
+  const parts = [];
+  if (toolTypes.length > 0) parts.push('tool types');
+  if (outputFormatTypes.length > 0) parts.push('text.format types');
+  if (inputTypes.length > 0) parts.push('input item/content types');
+  return parts.length ? parts.join('/') : 'tools/output formats/inputs';
+}
+
+function unsupportedChatAdapterConversionMessage(toolTypes, outputFormatTypes, inputTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return unsupportedToolConversionMessage(toolTypes, 'Chat Completions adapter');
+  }
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+    return unsupportedOutputFormatConversionMessage(outputFormatTypes, 'Chat Completions adapter');
+  }
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+    return unsupportedInputConversionMessage(inputTypes, 'Chat Completions adapter');
+  }
+  const toolList = toolTypes.length ? toolTypes.join(', ') : 'none';
+  const outputList = outputFormatTypes.length ? outputFormatTypes.join(', ') : 'none';
+  const inputList = inputTypes.length ? inputTypes.join(', ') : 'none';
+  return `unsupported Responses features for Chat Completions adapter: tool types=${toolList}; text.format types=${outputList}; input item/content types=${inputList}; route this request to a native /v1/responses upstream or use convertible function tools/output formats/inputs`;
+}
+
+function unavailableNativeResponsesConversionMessage(toolTypes, outputFormatTypes, inputTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses tool types cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use function tools';
+  }
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses text.format types cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use a convertible output format';
+  }
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+    return 'unsupported Responses input item/content types cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use text/function-call inputs';
+  }
+  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes);
+  return `unsupported Responses ${summary} cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use convertible function tools/output formats/inputs`;
+}
+
+function nativeResponsesRequiredFailureMessage(toolTypes, outputFormatTypes, inputTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses tool types cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
+  }
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses text.format types cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
+  }
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+    return 'unsupported Responses input item/content types cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
+  }
+  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes);
+  return `unsupported Responses ${summary} cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled`;
+}
+
+function noNativeResponsesCandidateMessage(toolTypes, outputFormatTypes, inputTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses tool types require a native /v1/responses upstream; no compatible upstream candidate is currently available';
+  }
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses text.format types require a native /v1/responses upstream; no compatible upstream candidate is currently available';
+  }
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+    return 'unsupported Responses input item/content types require a native /v1/responses upstream; no compatible upstream candidate is currently available';
+  }
+  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes);
+  return `unsupported Responses ${summary} require a native /v1/responses upstream; no compatible upstream candidate is currently available`;
+}
+
+function retryableStatusWithNativeResponsesUnsupported(baseRetryableStatus) {
+  const retryableStatus = new Set(baseRetryableStatus);
+  for (const status of NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS) retryableStatus.add(status);
+  return retryableStatus;
+}
+
+function chatResponseFormatFromResponsesTextFormat(format) {
+  if (!format) return undefined;
+  const type = responsesTextFormatTypeLabel(format);
+  if (type === 'text') return undefined;
+  if (type === 'json_object') return { type: 'json_object' };
+  if (type !== 'json_schema') throw unsupportedOutputFormatConversionError([type], 'Chat Completions adapter');
+
+  if (objectRecord(format.json_schema)) {
+    return { type: 'json_schema', json_schema: { ...format.json_schema } };
+  }
+
+  const name = typeof format.name === 'string' && format.name.trim() ? format.name.trim() : '';
+  if (!name || !objectRecord(format.schema)) {
+    throw unsupportedOutputFormatConversionError(['json_schema'], 'Chat Completions adapter');
+  }
+
+  const jsonSchema = {
+    name,
+    schema: format.schema
+  };
+  if (typeof format.description === 'string') jsonSchema.description = format.description;
+  if (format.strict !== undefined) jsonSchema.strict = format.strict;
+  return { type: 'json_schema', json_schema: jsonSchema };
+}
+
 function buildAnthropicMessagesPayload(body, model) {
   let payload;
   try {
@@ -875,6 +1561,9 @@ function buildAnthropicMessagesPayload(body, model) {
     err.statusCode = 400;
     throw err;
   }
+
+  assertResponsesOutputFormatConvertible(payload, ANTHROPIC_RESPONSES_TEXT_FORMAT_TYPES, 'Anthropic Messages adapter');
+  assertResponsesToolsConvertible(payload.tools, 'Anthropic Messages adapter');
 
   const { messages, system } = responsesInputToAnthropicMessages(payload.input);
   const finalMessages = messages.length > 0
@@ -891,6 +1580,22 @@ function buildAnthropicMessagesPayload(body, model) {
     .filter((value) => typeof value === 'string' && value.trim())
     .join('\n\n');
   if (systemText) anthropic.system = systemText;
+  const anthropicTools = anthropicToolsFromResponsesTools(payload.tools);
+  if (anthropicTools) anthropic.tools = anthropicTools;
+  else delete anthropic.tools;
+  const anthropicToolChoice = anthropicToolChoiceFromResponsesToolChoice(payload.tool_choice);
+  if (anthropicToolChoice && !anthropicTools && !['auto', 'none'].includes(anthropicToolChoice.type)) {
+    const choiceType = typeof payload.tool_choice === 'string'
+      ? payload.tool_choice
+      : String(payload.tool_choice?.type || 'unknown');
+    throw unsupportedToolConversionError([choiceType], 'Anthropic Messages adapter');
+  }
+  if (anthropicToolChoice && anthropicTools) {
+    if (payload.parallel_tool_calls === false) anthropicToolChoice.disable_parallel_tool_use = true;
+    anthropic.tool_choice = anthropicToolChoice;
+  } else {
+    delete anthropic.tool_choice;
+  }
 
   const temperature = numberOption(payload.temperature);
   if (temperature !== undefined) anthropic.temperature = temperature;
@@ -898,8 +1603,58 @@ function buildAnthropicMessagesPayload(body, model) {
   if (topP !== undefined) anthropic.top_p = topP;
   if (Array.isArray(payload.stop)) anthropic.stop_sequences = payload.stop.map(String);
   else if (typeof payload.stop === 'string') anthropic.stop_sequences = [payload.stop];
+  delete anthropic.stop;
 
   return Buffer.from(JSON.stringify(anthropic));
+}
+
+function buildChatCompletionsPayload(body, model) {
+  let payload;
+  try {
+    payload = JSON.parse(body.toString('utf8') || '{}');
+  } catch (error) {
+    const err = new Error(`invalid JSON body: ${error.message}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const messages = responsesInputToChatMessages(payload.input);
+  const systemText = typeof payload.instructions === 'string' && payload.instructions.trim()
+    ? payload.instructions.trim()
+    : '';
+  const finalMessages = [
+    ...(systemText ? [{ role: 'system', content: systemText }] : []),
+    ...(messages.length > 0 ? messages : [{ role: 'user', content: '' }])
+  ];
+  const chat = {
+    model: model || payload.model,
+    messages: finalMessages,
+    stream: Boolean(payload.stream)
+  };
+  copyPayloadFields(chat, payload, CHAT_COMPLETIONS_PASSTHROUGH_FIELDS);
+  if (chat.response_format === undefined) {
+    const responseFormat = chatResponseFormatFromResponsesTextFormat(responsesTextFormatFromPayload(payload));
+    if (responseFormat) chat.response_format = responseFormat;
+  }
+
+  if (chat.stream && !chat.stream_options) {
+    chat.stream_options = { include_usage: true };
+  }
+  const chatTools = chatToolsFromResponsesTools(payload.tools);
+  if (chatTools) chat.tools = chatTools;
+  const chatToolChoice = chatToolChoiceFromResponsesToolChoice(payload.tool_choice);
+  if (chatToolChoice !== undefined) chat.tool_choice = chatToolChoice;
+
+  const maxTokenInput = firstDefined(payload.max_output_tokens, payload.max_tokens, payload.max_completion_tokens);
+  if (maxTokenInput !== undefined) chat.max_tokens = normalizeMaxTokens(maxTokenInput);
+  const temperature = numberOption(payload.temperature);
+  if (temperature !== undefined) chat.temperature = temperature;
+  const topP = numberOption(payload.top_p);
+  if (topP !== undefined) chat.top_p = topP;
+  if (Array.isArray(payload.stop)) chat.stop = payload.stop.map(String);
+  else if (typeof payload.stop === 'string') chat.stop = payload.stop;
+
+  return Buffer.from(JSON.stringify(chat));
 }
 
 function responsesCompletedPayload(model, response = {}) {
@@ -1070,6 +1825,8 @@ function createUpstreamState(upstream, index) {
     };
   });
   const siteUrl = deriveSiteUrl(upstream.base_url, upstream.site_url);
+  const codexOAuth = isCodexOAuthConfig(upstream);
+  const requestMode = normalizeRequestMode(upstream.request_mode, codexOAuth);
 
   return {
     index,
@@ -1080,7 +1837,9 @@ function createUpstreamState(upstream, index) {
     signinAvailable: booleanOption(signinAvailableValue(upstream), Boolean(siteUrl)),
     signinCompletedDate: signinCompletionDate(upstream),
     proxyUrl: normalizeProxyUrl(upstream.proxy_url || upstream.proxyUrl),
-    codexOAuth: isCodexOAuthConfig(upstream),
+    requestMode,
+    resolvedRequestMode: requestMode === 'chat_completions' || requestMode === 'responses' ? requestMode : '',
+    codexOAuth,
     oauthExpiresAt: typeof upstream.oauth_expires_at === 'string' ? upstream.oauth_expires_at : '',
     oauthClientId: typeof upstream.oauth_client_id === 'string' ? upstream.oauth_client_id : '',
     oauthPlanType: typeof upstream.oauth_plan_type === 'string' ? upstream.oauth_plan_type : '',
@@ -1157,6 +1916,9 @@ function buildState(config) {
     availability,
     upstreams,
     probing: false,
+    probingPromise: null,
+    probingLive: false,
+    pendingLiveProbePromise: null,
     billingProbing: false,
     modelOverride: typeof config.model_override === 'string' ? config.model_override : '',
     recentRequests: [],
@@ -1168,7 +1930,7 @@ function buildState(config) {
 function statsSnapshot(state) {
   return {
     updatedAt: new Date().toISOString(),
-    recentRequests: state.recentRequests,
+    recentRequests: stripRequestDebugFields(state.recentRequests),
     upstreams: Object.fromEntries(state.upstreams.map((upstream) => [upstream.name, {
       stats: upstream.stats,
       quota: upstream.quota,
@@ -1179,6 +1941,9 @@ function statsSnapshot(state) {
         latencyMs: upstream.health.latencyMs,
         httpStatus: upstream.health.httpStatus,
         error: upstream.health.error,
+        warning: upstream.health.warning || '',
+        diagnostics: upstream.health.diagnostics || undefined,
+        probeModel: upstream.health.probeModel || '',
         models: upstream.health.models || [],
         modelsCount: upstream.health.modelsCount,
         keyLabel: upstream.health.keyLabel
@@ -1256,6 +2021,67 @@ function selectionLatencyPenalty(upstream) {
 
 function selectionHealthPenalty(upstream) {
   return ['server_error', 'network_error', 'timeout', 'rate_limited'].includes(upstream.health.state) ? 2 : 0;
+}
+
+function healthAllowsSelection(upstream, expectedModel = undefined) {
+  const state = healthProbeEffectiveState(upstream.health, expectedModel);
+  return state === 'ok'
+    || state === 'unknown'
+    || state === 'oauth_ready'
+    || state === 'stale_model_override'
+    || state === 'advanced_curl_required'
+    || state === 'codex_forward_only';
+}
+
+function normalizeProbeModel(value) {
+  return String(value || '').trim();
+}
+
+function healthMatchesProbeModel(health, expectedModel) {
+  const expected = normalizeProbeModel(expectedModel);
+  if (!expected) return true;
+  return normalizeProbeModel(health?.probeModel) === expected;
+}
+
+function invalidateHealthForModelChange(state, model) {
+  const nextModel = normalizeProbeModel(model);
+  const checkedAt = new Date().toISOString();
+  const staleableStates = new Set(['ok', 'unknown', 'oauth_ready', 'stale_model_override', 'missing_model_override']);
+  for (const upstream of state.upstreams) {
+    const currentState = upstream.health?.state || 'unknown';
+    if (!upstream.enabled || currentState === 'disabled') continue;
+    if (!staleableStates.has(currentState)) continue;
+    if (!upstream.health?.checkedAt && currentState !== 'ok') continue;
+    upstream.health = {
+      ...upstream.health,
+      state: nextModel ? 'stale_model_override' : 'missing_model_override',
+      checkedAt,
+      latencyMs: 0,
+      httpStatus: 0,
+      error: nextModel
+        ? `Health Probe must be rerun for current model_override ${nextModel}`
+        : 'Health Probe requires model_override so it can test the exact active model',
+      probeModel: upstream.health?.probeModel || ''
+    };
+    for (const key of upstream.keys) {
+      key.health = {
+        ...key.health,
+        state: upstream.health.state,
+        checkedAt,
+        latencyMs: 0,
+        httpStatus: 0,
+        error: upstream.health.error,
+        probeModel: upstream.health.probeModel
+      };
+    }
+  }
+}
+
+function probeResultPayload(health, expectedModel) {
+  return {
+    probe_ok: healthProbeOk(health, expectedModel),
+    probe_status: healthProbeStatus(health, expectedModel)
+  };
 }
 
 function upstreamSelectionWeight(upstream, availability) {
@@ -1431,8 +2257,13 @@ function keyAvailable(keyState, at) {
   return Boolean(keyState.value) && keyState.cooldownUntil <= at;
 }
 
-function upstreamAvailable(upstream, at) {
-  return upstream.enabled && upstream.baseUrl && !codexOAuthExpired(upstream, at) && upstream.cooldownUntil <= at && upstream.keys.some((key) => keyAvailable(key, at));
+function upstreamAvailable(upstream, at, expectedModel = undefined) {
+  return upstream.enabled
+    && upstream.baseUrl
+    && healthAllowsSelection(upstream, expectedModel)
+    && !codexOAuthExpired(upstream, at)
+    && upstream.cooldownUntil <= at
+    && upstream.keys.some((key) => keyAvailable(key, at));
 }
 
 function upstreamSupportsModel(upstream, model) {
@@ -1444,24 +2275,30 @@ function upstreamSupportsModel(upstream, model) {
   return models.length === 0 || models.includes(model);
 }
 
+function upstreamHasKnownModel(upstream, model) {
+  if (!model) return false;
+  const models = upstream.health?.models || [];
+  return models.length > 0 && models.includes(model);
+}
+
 function chooseCandidate(state, tried, options = {}) {
   const at = now();
   const preferredModel = options.preferredModel || state.modelOverride;
+  const allowUnknownModelFallback = options.allowUnknownModelFallback === true;
+  const candidateFilter = typeof options.candidateFilter === 'function' ? options.candidateFilter : null;
   let candidates = state.upstreams.filter((upstream) => {
     if (!upstreamAvailable(upstream, at)) return false;
+    if (candidateFilter && !candidateFilter(upstream)) return false;
     return upstream.keys.some((key) => keyAvailable(key, at) && !tried.has(`${upstream.name}:${key.index}`));
   });
 
   if (preferredModel) {
     const modelCandidates = candidates.filter((upstream) => upstreamSupportsModel(upstream, preferredModel));
-    const unavailableModelCandidateExists = state.upstreams.some((upstream) => (
-      upstream.enabled &&
-      upstream.baseUrl &&
-      upstreamSupportsModel(upstream, preferredModel) &&
-      !upstreamAvailable(upstream, at)
-    ));
-    if (modelCandidates.length > 0 || (!options.allowUnknownModelFallback && !unavailableModelCandidateExists)) {
-      candidates = modelCandidates;
+    if (modelCandidates.length > 0) {
+      const knownModelCandidates = modelCandidates.filter((upstream) => upstreamHasKnownModel(upstream, preferredModel));
+      candidates = knownModelCandidates.length > 0 && !allowUnknownModelFallback
+        ? knownModelCandidates
+        : modelCandidates;
     }
   }
 
@@ -1491,6 +2328,31 @@ function chooseCandidate(state, tried, options = {}) {
 
   if (keys.length === 0) return null;
   return { upstream: selected, key: keys[0] };
+}
+
+function nativeResponsesCandidateDiagnostics(state, pathname, model, tried = new Set()) {
+  if (pathname !== '/v1/responses') return [];
+  const at = now();
+  return state.upstreams.map((upstream) => {
+    let reason = '';
+    if (!upstream.enabled) reason = 'upstream is disabled';
+    else if (!upstream.baseUrl) reason = 'upstream has no base_url';
+    else if (codexOAuthExpired(upstream, at)) reason = 'Codex OAuth token is expired';
+    else if (!healthAllowsSelection(upstream, model)) reason = 'health state does not allow selection for requested model';
+    else if (!upstreamSupportsModel(upstream, model)) reason = 'upstream does not support the requested model/API family';
+    else if (!upstream.keys.some((key) => keyAvailable(key, at))) reason = 'no upstream key is currently available';
+    else if (!canAttemptNativeResponses(pathname, upstream, model)) {
+      reason = 'configured request_mode=chat_completions cannot carry native Responses-only features';
+    } else if (!upstream.keys.some((key) => keyAvailable(key, at) && !tried.has(`${upstream.name}:${key.index}`))) {
+      reason = 'all available keys have already been attempted';
+    }
+    return {
+      upstream: upstream.name,
+      request_mode: upstream.requestMode || 'auto',
+      resolved_request_mode: upstream.resolvedRequestMode || '',
+      reason: reason || 'eligible'
+    };
+  }).filter((item) => item.reason !== 'eligible');
 }
 
 
@@ -1557,6 +2419,29 @@ function hasTokenUsage(value) {
   return usage.totalTokens > 0 || usage.inputTokens > 0 || usage.outputTokens > 0;
 }
 
+function hasConcreteOutputFromJson(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((item) => hasConcreteOutputFromJson(item));
+
+  if (typeof value.output_text === 'string' && value.output_text.trim()) return true;
+  if (typeof value.outputText === 'string' && value.outputText.trim()) return true;
+  if (typeof value.text === 'string' && value.text.trim()) return true;
+  if (typeof value.content === 'string' && value.content.trim()) return true;
+  if (typeof value.delta === 'string' && value.delta.trim()) return true;
+  if (typeof value.partial_json === 'string' && value.partial_json.trim()) return true;
+
+  if (value.type === 'function_call' && (String(value.name || '').trim() || String(value.arguments || '').trim())) return true;
+  if (value.type === 'function' && value.function && typeof value.function === 'object') {
+    if (String(value.function.name || '').trim() || String(value.function.arguments || '').trim()) return true;
+  }
+  if (value.type === 'tool_use' && String(value.name || '').trim()) return true;
+
+  for (const key of ['output', 'content', 'choices', 'message', 'delta', 'content_block', 'tool_calls', 'function', 'response', 'data', 'result']) {
+    if (hasConcreteOutputFromJson(value[key])) return true;
+  }
+  return false;
+}
+
 function tokenUsageFromParts({ totalTokens = 0, inputTokens = 0, outputTokens = 0 } = {}) {
   const normalized = {
     totalTokens: numberFromUnknown(totalTokens),
@@ -1610,7 +2495,7 @@ function extractTokenUsageFromJson(value) {
     const tokens = tokenUsageFromParts({ inputTokens, outputTokens });
     if (hasTokenUsage(tokens)) return tokens;
   }
-  for (const key of ['response', 'data', 'result']) {
+  for (const key of ['response', 'data', 'result', 'message']) {
     const nested = extractTokenUsageFromJson(value[key]);
     if (hasTokenUsage(nested)) return nested;
   }
@@ -1640,6 +2525,68 @@ function extractTokenUsageFromHeaders(headers = {}) {
   return tokenUsageFromParts({ totalTokens, inputTokens, outputTokens });
 }
 
+function hasExplicitZeroOutputTokensInJson(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((item) => hasExplicitZeroOutputTokensInJson(item));
+
+  const usage = value.usage && typeof value.usage === 'object'
+    ? value.usage
+    : value.usage_metadata && typeof value.usage_metadata === 'object'
+      ? value.usage_metadata
+      : value.usageMetadata && typeof value.usageMetadata === 'object'
+        ? value.usageMetadata
+        : null;
+  if (usage) {
+    for (const key of ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens', 'candidatesTokenCount']) {
+      if (Object.hasOwn(usage, key) && Number(usage[key]) === 0) return true;
+    }
+  }
+
+  for (const key of ['response', 'data', 'result', 'message', 'choices']) {
+    if (hasExplicitZeroOutputTokensInJson(value[key])) return true;
+  }
+  return false;
+}
+
+function hasExplicitZeroOutputTokensInSse(text) {
+  for (const event of String(text).split(/\r?\n\r?\n/)) {
+    const payload = event
+      .split(/\r?\n/)
+      .map((line) => line.trimStart())
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n')
+      .trim();
+    if (!payload || payload === '[DONE]') continue;
+    try {
+      if (hasExplicitZeroOutputTokensInJson(JSON.parse(payload))) return true;
+    } catch {
+      // Non-JSON SSE payloads cannot declare usage.
+    }
+  }
+  return false;
+}
+
+function hasExplicitZeroOutputTokensInBody(body) {
+  if (!body || body.length === 0) return false;
+  const text = body.toString('utf8');
+  try {
+    return hasExplicitZeroOutputTokensInJson(JSON.parse(text));
+  } catch {
+    return hasExplicitZeroOutputTokensInSse(text);
+  }
+}
+
+function hasExplicitZeroOutputTokensInHeaders(headers = {}) {
+  const output = firstHeader(headers, [
+    'x-usage-output-tokens',
+    'x-output-tokens',
+    'x-openai-completion-tokens',
+    'x-completion-tokens'
+  ]);
+  return output !== undefined && output !== null && output !== '' && Number(output) === 0;
+}
+
 function extractTokenUsageFromBody(body) {
   if (!body || body.length === 0) return emptyTokenUsage();
   const text = body.toString('utf8');
@@ -1647,6 +2594,16 @@ function extractTokenUsageFromBody(body) {
     return extractTokenUsageFromJson(JSON.parse(text));
   } catch {
     return extractTokenUsageFromSse(text);
+  }
+}
+
+function hasConcreteOutputFromBody(body) {
+  if (!body || body.length === 0) return false;
+  const text = body.toString('utf8');
+  try {
+    return hasConcreteOutputFromJson(JSON.parse(text));
+  } catch {
+    return hasConcreteOutputFromSse(text);
   }
 }
 
@@ -1671,6 +2628,25 @@ function extractTokenUsageFromSse(text) {
   return lastUsage;
 }
 
+function hasConcreteOutputFromSse(text) {
+  for (const event of String(text).split(/\r?\n\r?\n/)) {
+    const payload = event
+      .split(/\r?\n/)
+      .map((line) => line.trimStart())
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n')
+      .trim();
+    if (!payload || payload === '[DONE]') continue;
+    try {
+      if (hasConcreteOutputFromJson(JSON.parse(payload))) return true;
+    } catch {
+      if (payload.trim()) return true;
+    }
+  }
+  return false;
+}
+
 function shouldCaptureUsageBody(headers = {}) {
   const contentType = String(firstHeader(headers, ['content-type']) || '').toLowerCase();
   const contentEncoding = String(firstHeader(headers, ['content-encoding']) || '').toLowerCase();
@@ -1683,6 +2659,26 @@ function createUsageCapture(headers = {}) {
   let size = 0;
   let tooLarge = false;
   const captureBody = shouldCaptureUsageBody(headers);
+  let captured = null;
+  function result() {
+    if (captured) return captured;
+    if (!captureBody || tooLarge || chunks.length === 0) {
+      captured = {
+        tokens: extractTokenUsageFromHeaders(headers),
+        hasOutput: false,
+        hasExplicitZeroOutputTokens: hasExplicitZeroOutputTokensInHeaders(headers)
+      };
+      return captured;
+    }
+    const body = Buffer.concat(chunks, size);
+    const bodyUsage = extractTokenUsageFromBody(body);
+    captured = {
+      tokens: hasTokenUsage(bodyUsage) ? bodyUsage : extractTokenUsageFromHeaders(headers),
+      hasOutput: hasConcreteOutputFromBody(body),
+      hasExplicitZeroOutputTokens: hasExplicitZeroOutputTokensInHeaders(headers) || hasExplicitZeroOutputTokensInBody(body)
+    };
+    return captured;
+  }
   return {
     push(chunk) {
       if (!captureBody || tooLarge) return;
@@ -1694,10 +2690,9 @@ function createUsageCapture(headers = {}) {
       }
       chunks.push(chunk);
     },
+    result,
     tokenCount() {
-      if (!captureBody || tooLarge || chunks.length === 0) return extractTokenUsageFromHeaders(headers);
-      const bodyUsage = extractTokenUsageFromBody(Buffer.concat(chunks, size));
-      return hasTokenUsage(bodyUsage) ? bodyUsage : extractTokenUsageFromHeaders(headers);
+      return result().tokens;
     }
   };
 }
@@ -1845,6 +2840,306 @@ function anthropicUsageToResponsesUsage(usage = {}) {
   };
 }
 
+function anthropicToolUseToResponsesFunctionCall(block, responseId, index = 0, status = 'completed', argumentsOverride = undefined) {
+  const args = argumentsOverride !== undefined
+    ? argumentsOverride
+    : JSON.stringify(block?.input && typeof block.input === 'object' ? block.input : {});
+  return {
+    id: `fc_${responseId || now().toString(36)}_${index}`,
+    type: 'function_call',
+    status,
+    name: block?.name || '',
+    call_id: block?.id || `toolu_pool_${now().toString(36)}_${index}`,
+    arguments: typeof args === 'string' ? args : JSON.stringify(args || {})
+  };
+}
+
+function chatUsageToResponsesUsage(usage = {}) {
+  const inputTokens = numberFromUnknown(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? usage.inputTokens);
+  const outputTokens = numberFromUnknown(usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens ?? usage.outputTokens);
+  const totalTokens = numberFromUnknown(usage.total_tokens ?? usage.totalTokens) || inputTokens + outputTokens;
+  if (!inputTokens && !outputTokens && !totalTokens) return null;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens
+  };
+}
+
+function createChatResponsesStreamAdapter(res, model) {
+  let buffer = '';
+  let completed = false;
+  let started = false;
+  let contentStarted = false;
+  let textDone = false;
+  let responseId = '';
+  let itemId = '';
+  let responseModel = model || '';
+  let outputText = '';
+  let usage = null;
+  const createdAt = Math.floor(now() / 1000);
+  const messageOutputIndex = 0;
+  const contentIndex = 0;
+
+  // Tool call tracking: keyed by Chat Completions tool_calls index
+  const toolCalls = new Map();
+  let nextToolOutputIndex = 1; // output_index 0 is the message item
+  let textItemEmitted = false;
+
+  function ensureIds() {
+    if (!responseId) responseId = `resp_pool_${now().toString(36)}`;
+    if (!itemId) itemId = responseId;
+  }
+
+  function mergeUsage(nextUsage) {
+    const normalized = chatUsageToResponsesUsage(nextUsage);
+    if (!normalized) return;
+    usage = {
+      input_tokens: normalized.input_tokens || usage?.input_tokens || 0,
+      output_tokens: normalized.output_tokens || usage?.output_tokens || 0,
+      total_tokens: normalized.total_tokens || (normalized.input_tokens || usage?.input_tokens || 0) + (normalized.output_tokens || usage?.output_tokens || 0)
+    };
+  }
+
+  function responsePayload(status = 'in_progress', output = []) {
+    ensureIds();
+    return {
+      id: responseId,
+      object: 'response',
+      created_at: createdAt,
+      status,
+      model: responseModel || model || '',
+      output,
+      usage: status === 'completed' ? usage : null
+    };
+  }
+
+  function messageItem(status = 'in_progress') {
+    ensureIds();
+    return {
+      id: itemId,
+      type: 'message',
+      status,
+      role: 'assistant',
+      content: status === 'completed' && outputText
+        ? [{ type: 'output_text', text: outputText, annotations: [] }]
+        : []
+    };
+  }
+
+  function functionCallItem(tc, status = 'in_progress') {
+    return {
+      id: tc.itemId,
+      type: 'function_call',
+      status,
+      name: tc.name,
+      call_id: tc.callId,
+      arguments: tc.arguments
+    };
+  }
+
+  function ensureStarted() {
+    if (started) return;
+    started = true;
+    res.write(responseLifecycleEvent('response.created', responsePayload('in_progress')));
+    res.write(responseLifecycleEvent('response.in_progress', responsePayload('in_progress')));
+  }
+
+  function ensureTextItemStarted() {
+    ensureStarted();
+    if (textItemEmitted) return;
+    textItemEmitted = true;
+    res.write(responseOutputItemEvent('response.output_item.added', messageItem('in_progress'), messageOutputIndex));
+  }
+
+  function ensureContentStarted() {
+    ensureTextItemStarted();
+    if (contentStarted) return;
+    contentStarted = true;
+    res.write(responseContentPartEvent(
+      'response.content_part.added',
+      itemId || responseId,
+      { type: 'output_text', text: '', annotations: [] },
+      messageOutputIndex,
+      contentIndex
+    ));
+  }
+
+  function writeTextDone() {
+    if (textDone || !contentStarted) return;
+    textDone = true;
+    res.write(outputTextDoneEvent(outputText, { itemId: itemId || responseId, outputIndex: messageOutputIndex, contentIndex }));
+    res.write(responseContentPartEvent(
+      'response.content_part.done',
+      itemId || responseId,
+      { type: 'output_text', text: outputText, annotations: [] },
+      messageOutputIndex,
+      contentIndex
+    ));
+  }
+
+  function finishTextItem() {
+    if (!textItemEmitted) return;
+    writeTextDone();
+    const finalItem = messageItem('completed');
+    res.write(responseOutputItemEvent('response.output_item.done', finalItem, messageOutputIndex));
+  }
+
+  function finishToolCalls() {
+    for (const tc of toolCalls.values()) {
+      if (tc.finished) continue;
+      tc.finished = true;
+      // Emit arguments.done
+      res.write(sseEvent('response.function_call_arguments.done', {
+        type: 'response.function_call_arguments.done',
+        item_id: tc.itemId,
+        output_index: tc.outputIndex,
+        call_id: tc.callId,
+        name: tc.name,
+        arguments: tc.arguments
+      }));
+      // Emit output_item.done
+      res.write(responseOutputItemEvent('response.output_item.done', functionCallItem(tc, 'completed'), tc.outputIndex));
+    }
+  }
+
+  function buildFinalOutput() {
+    const output = [];
+    if (textItemEmitted && outputText) {
+      output.push(messageItem('completed'));
+    }
+    for (const tc of toolCalls.values()) {
+      output.push(functionCallItem(tc, 'completed'));
+    }
+    return output;
+  }
+
+  function writeCompleted() {
+    if (completed) return;
+    completed = true;
+    ensureStarted();
+    // Finish text item if it was started
+    if (textItemEmitted) finishTextItem();
+    // Finish all tool calls
+    finishToolCalls();
+    // Emit response.completed with all output items
+    const output = buildFinalOutput();
+    res.write(completedResponsesEvent(model, {
+      id: responseId,
+      model: responseModel,
+      output,
+      usage
+    }));
+    res.write('data: [DONE]\n\n');
+  }
+
+  function handleToolCallDelta(tcDelta) {
+    ensureStarted();
+    const index = typeof tcDelta.index === 'number' ? tcDelta.index : 0;
+
+    if (!toolCalls.has(index)) {
+      // First chunk for this tool call: contains id, function.name, and possibly first argument fragment
+      const callId = tcDelta.id || `call_pool_${now().toString(36)}_${index}`;
+      const name = tcDelta.function?.name || '';
+      const outputIndex = nextToolOutputIndex++;
+      const tcItemId = `fc_${responseId || now().toString(36)}_${index}`;
+      const tc = {
+        callId,
+        name,
+        arguments: '',
+        outputIndex,
+        itemId: tcItemId,
+        finished: false
+      };
+      toolCalls.set(index, tc);
+
+      // Emit response.output_item.added for the function_call
+      res.write(responseOutputItemEvent('response.output_item.added', functionCallItem(tc, 'in_progress'), outputIndex));
+    }
+
+    const tc = toolCalls.get(index);
+
+    // Update name if it appears in a later chunk (some providers split it)
+    if (tcDelta.function?.name && !tc.name) {
+      tc.name = tcDelta.function.name;
+    }
+
+    // Accumulate argument fragments
+    const argDelta = tcDelta.function?.arguments || '';
+    if (argDelta) {
+      tc.arguments += argDelta;
+      // Emit response.function_call_arguments.delta
+      res.write(sseEvent('response.function_call_arguments.delta', {
+        type: 'response.function_call_arguments.delta',
+        item_id: tc.itemId,
+        output_index: tc.outputIndex,
+        call_id: tc.callId,
+        delta: argDelta
+      }));
+    }
+  }
+
+  function handleEvent(eventText) {
+    const { payload } = parseSseEvent(eventText);
+    if (!payload || payload === '[DONE]') {
+      if (payload === '[DONE]') writeCompleted();
+      return;
+    }
+    let event;
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    responseId = event.id || responseId;
+    responseModel = event.model || responseModel;
+    if (event.usage) mergeUsage(event.usage);
+    const choice = Array.isArray(event.choices) ? event.choices[0] : null;
+    if (!choice) return;
+
+    // Handle text content delta
+    const textDelta = choice.delta?.content ?? choice.message?.content ?? '';
+    if (typeof textDelta === 'string' && textDelta) {
+      ensureIds();
+      ensureContentStarted();
+      outputText += textDelta;
+      res.write(outputTextDeltaEvent(textDelta, { itemId: itemId || responseId, outputIndex: messageOutputIndex, contentIndex }));
+    }
+
+    // Handle tool_calls deltas
+    const deltaToolCalls = choice.delta?.tool_calls || choice.message?.tool_calls;
+    if (Array.isArray(deltaToolCalls)) {
+      ensureIds();
+      for (const tcDelta of deltaToolCalls) {
+        handleToolCallDelta(tcDelta);
+      }
+    }
+
+    if (choice.finish_reason) writeCompleted();
+  }
+
+  return {
+    write(chunk) {
+      buffer += chunk.toString('utf8');
+      for (;;) {
+        const boundary = findSseBoundary(buffer);
+        if (!boundary) break;
+        const eventText = buffer.slice(0, boundary.index + boundary.length);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        handleEvent(eventText);
+      }
+    },
+    end() {
+      if (buffer) {
+        handleEvent(buffer);
+        buffer = '';
+      }
+      writeCompleted();
+      res.end();
+    }
+  };
+}
+
 function createAnthropicResponsesStreamAdapter(res, model) {
   let buffer = '';
   let completed = false;
@@ -1859,6 +3154,8 @@ function createAnthropicResponsesStreamAdapter(res, model) {
   const createdAt = Math.floor(now() / 1000);
   const outputIndex = 0;
   const contentIndex = 0;
+  const toolUses = new Map();
+  let nextToolOutputIndex = 1;
 
   function ensureIds() {
     if (!responseId) responseId = `resp_pool_${now().toString(36)}`;
@@ -1905,6 +3202,16 @@ function createAnthropicResponsesStreamAdapter(res, model) {
     return { type: 'output_text', text, annotations: [] };
   }
 
+  function functionCallItem(toolUse, status = 'in_progress') {
+    return anthropicToolUseToResponsesFunctionCall(
+      { id: toolUse.callId, name: toolUse.name },
+      responseId,
+      toolUse.index,
+      status,
+      toolUse.arguments
+    );
+  }
+
   function ensureStarted() {
     if (started) return;
     started = true;
@@ -1926,6 +3233,60 @@ function createAnthropicResponsesStreamAdapter(res, model) {
     ));
   }
 
+  function handleToolUseStart(index, block = {}) {
+    ensureStarted();
+    if (toolUses.has(index)) return;
+    const outputIndexForTool = nextToolOutputIndex++;
+    const input = block.input && typeof block.input === 'object' && !Array.isArray(block.input)
+      ? JSON.stringify(block.input)
+      : '';
+    const toolUse = {
+      index,
+      callId: block.id || `toolu_pool_${now().toString(36)}_${index}`,
+      name: block.name || '',
+      arguments: input,
+      outputIndex: outputIndexForTool,
+      finished: false
+    };
+    toolUses.set(index, toolUse);
+    res.write(responseOutputItemEvent('response.output_item.added', functionCallItem(toolUse, 'in_progress'), outputIndexForTool));
+  }
+
+  function handleToolUseDelta(index, partialJson) {
+    ensureStarted();
+    if (!toolUses.has(index)) handleToolUseStart(index, {});
+    const toolUse = toolUses.get(index);
+    const delta = String(partialJson || '');
+    if (!delta) return;
+    toolUse.arguments += delta;
+    res.write(sseEvent('response.function_call_arguments.delta', {
+      type: 'response.function_call_arguments.delta',
+      item_id: `fc_${responseId || now().toString(36)}_${toolUse.index}`,
+      output_index: toolUse.outputIndex,
+      call_id: toolUse.callId,
+      delta
+    }));
+  }
+
+  function finishToolUse(index) {
+    const toolUse = toolUses.get(index);
+    if (!toolUse || toolUse.finished) return;
+    toolUse.finished = true;
+    res.write(sseEvent('response.function_call_arguments.done', {
+      type: 'response.function_call_arguments.done',
+      item_id: `fc_${responseId || now().toString(36)}_${toolUse.index}`,
+      output_index: toolUse.outputIndex,
+      call_id: toolUse.callId,
+      name: toolUse.name,
+      arguments: toolUse.arguments
+    }));
+    res.write(responseOutputItemEvent('response.output_item.done', functionCallItem(toolUse, 'completed'), toolUse.outputIndex));
+  }
+
+  function finishToolUses() {
+    for (const index of toolUses.keys()) finishToolUse(index);
+  }
+
   function writeTextDone() {
     if (textDone || !contentStarted) return;
     textDone = true;
@@ -1944,12 +3305,18 @@ function createAnthropicResponsesStreamAdapter(res, model) {
     completed = true;
     ensureStarted();
     writeTextDone();
+    finishToolUses();
     const finalItem = messageItem('completed');
     res.write(responseOutputItemEvent('response.output_item.done', finalItem, outputIndex));
+    const output = [];
+    if (outputText) output.push(finalItem);
+    for (const toolUse of toolUses.values()) {
+      output.push(functionCallItem(toolUse, 'completed'));
+    }
     res.write(completedResponsesEvent(model, {
       id: responseId,
       model: responseModel,
-      output: outputText ? [finalItem] : [],
+      output,
       usage
     }));
     res.write('data: [DONE]\n\n');
@@ -1971,6 +3338,21 @@ function createAnthropicResponsesStreamAdapter(res, model) {
       responseModel = event.message.model || responseModel;
       mergeUsage(event.message.usage);
       ensureStarted();
+      return;
+    }
+
+    if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+      handleToolUseStart(typeof event.index === 'number' ? event.index : 0, event.content_block);
+      return;
+    }
+
+    if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta') {
+      handleToolUseDelta(typeof event.index === 'number' ? event.index : 0, event.delta.partial_json);
+      return;
+    }
+
+    if (event.type === 'content_block_stop') {
+      finishToolUse(typeof event.index === 'number' ? event.index : 0);
       return;
     }
 
@@ -2028,17 +3410,83 @@ function anthropicMessageToResponsesJson(body, model) {
         .map((block) => block.text)
         .join('')
     : '';
+  const responseId = message.id || `resp_pool_${now().toString(36)}`;
+  const output = [];
+  if (text) {
+    output.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
+  }
+  if (Array.isArray(message.content)) {
+    message.content.forEach((block, index) => {
+      if (block?.type === 'tool_use') {
+        output.push(anthropicToolUseToResponsesFunctionCall(block, responseId, index));
+      }
+    });
+  }
   return Buffer.from(JSON.stringify({
-    id: message.id || `resp_pool_${now().toString(36)}`,
+    id: responseId,
     object: 'response',
     created_at: Math.floor(now() / 1000),
     status: 'completed',
     model: message.model || model || '',
-    output: text
-      ? [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }]
-      : [],
+    output,
     output_text: text,
     usage: anthropicUsageToResponsesUsage(message.usage)
+  }));
+}
+
+function chatCompletionToResponsesJson(body, model) {
+  let completion;
+  try {
+    completion = JSON.parse(body.toString('utf8') || '{}');
+  } catch {
+    return body;
+  }
+  const choice = Array.isArray(completion.choices) ? completion.choices[0] : null;
+  const text = typeof choice?.message?.content === 'string'
+    ? choice.message.content
+    : typeof choice?.delta?.content === 'string'
+      ? choice.delta.content
+      : '';
+  const responseId = completion.id || `resp_pool_${now().toString(36)}`;
+  const output = [];
+
+  // Add message item if there is text content
+  if (text) {
+    output.push({
+      id: responseId,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text, annotations: [] }]
+    });
+  }
+
+  // Add function_call items for each tool_call
+  const toolCalls = choice?.message?.tool_calls || choice?.delta?.tool_calls;
+  if (Array.isArray(toolCalls)) {
+    for (const tc of toolCalls) {
+      output.push({
+        id: `fc_${responseId}_${tc.index ?? output.length}`,
+        type: 'function_call',
+        status: 'completed',
+        name: tc.function?.name || '',
+        call_id: tc.id || `call_pool_${now().toString(36)}`,
+        arguments: typeof tc.function?.arguments === 'string'
+          ? tc.function.arguments
+          : JSON.stringify(tc.function?.arguments || {})
+      });
+    }
+  }
+
+  return Buffer.from(JSON.stringify({
+    id: responseId,
+    object: 'response',
+    created_at: completion.created || Math.floor(now() / 1000),
+    status: 'completed',
+    model: completion.model || model || '',
+    output,
+    output_text: text,
+    usage: chatUsageToResponsesUsage(completion.usage)
   }));
 }
 
@@ -2527,7 +3975,7 @@ function recordAttempt(upstream, key) {
   key.stats.lastUsedAt = at;
 }
 
-function recordResponseStats(upstream, key, statusCode, retried = false) {
+function recordResponseStats(upstream, key, statusCode, retried = false, succeeded = statusCode >= 200 && statusCode < 400) {
   upstream.stats.responses += 1;
   upstream.stats.lastStatus = statusCode || 0;
   key.stats.responses += 1;
@@ -2535,7 +3983,7 @@ function recordResponseStats(upstream, key, statusCode, retried = false) {
     upstream.stats.retries += 1;
     key.stats.retries += 1;
   }
-  if (statusCode >= 200 && statusCode < 400) {
+  if (succeeded) {
     upstream.stats.successes += 1;
     key.stats.successes += 1;
   } else {
@@ -2544,8 +3992,8 @@ function recordResponseStats(upstream, key, statusCode, retried = false) {
   }
 }
 
-function recordAttemptOutcome(state, upstream, key, statusCode) {
-  recordAvailability(upstream, key, statusCode >= 200 && statusCode < 400, state.availability);
+function recordAttemptOutcome(state, upstream, key, succeeded) {
+  recordAvailability(upstream, key, succeeded, state.availability);
 }
 
 function recordSuccess(upstream, startedAt, statusCode = 200) {
@@ -2576,17 +4024,19 @@ function recordFailure(state, upstream, key, reason, statusCode, retryAfter) {
   }
 }
 
-function finishResponseAttempt({ state, upstream, key, method, pathname, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, statsPath }) {
-  recordAttemptOutcome(state, upstream, key, statusCode);
-  const recordedTokens = statusCode >= 200 && statusCode < 400 ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
-  if (statusCode >= 200 && statusCode < 400) {
+function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, statsPath }) {
+  recordAttemptOutcome(state, upstream, key, succeeded);
+  const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
+  const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
+  if (succeeded) {
     recordSuccess(upstream, startedAt, statusCode);
   } else {
-    recordFailure(state, upstream, key, reason || `HTTP ${statusCode}`, statusCode, retryAfter);
+    recordFailure(state, upstream, key, failureReason, statusCode, retryAfter);
   }
   rememberRequest(state, {
     method,
     path: pathname,
+    ...requestDebugFields(incomingHeaders),
     upstream: upstream.name,
     key: key.label,
     originalModel: originalModel || null,
@@ -2594,8 +4044,9 @@ function finishResponseAttempt({ state, upstream, key, method, pathname, origina
     status: statusCode,
     durationMs: now() - startedAt,
     retried: attempt > 1,
-    outcome: statusCode >= 200 && statusCode < 400 ? 'ok' : 'error',
-    reason: statusCode >= 400 ? reason || `HTTP ${statusCode}` : '',
+    outcome: succeeded ? 'ok' : 'error',
+    reason: succeeded ? '' : failureReason,
+    route: routeTrace,
     tokens: recordedTokens.totalTokens,
     inputTokens: recordedTokens.inputTokens,
     outputTokens: recordedTokens.outputTokens
@@ -2614,6 +4065,194 @@ function classifyHealth(statusCode, error) {
   if (statusCode === 429) return 'rate_limited';
   if (statusCode >= 500) return 'server_error';
   return 'unexpected_status';
+}
+
+function parseJsonBody(body) {
+  try {
+    return JSON.parse(String(body || '').trim() || '{}');
+  } catch {
+    return null;
+  }
+}
+
+function advancedCurlRequiredProbeError(result) {
+  if (![401, 403].includes(Number(result?.statusCode || 0))) return '';
+  const json = parseJsonBody(result?.body);
+  const error = json && typeof json === 'object' ? json.error : null;
+  const code = String(
+    error && typeof error === 'object'
+      ? error.code || ''
+      : json?.code || ''
+  ).trim();
+  const message = String(
+    error && typeof error === 'object'
+      ? error.message || ''
+      : typeof error === 'string'
+        ? error
+        : json?.message || result?.body || ''
+  ).trim();
+  const body = `${code} ${message}`.toLowerCase();
+  if (code === 'codex_access_restricted' || /codex_access_restricted|请使用最新版的codex客户端或codex cli调用|use latest codex client|please use .*codex.*(?:client|cli)/i.test(body)) {
+    return '该上游要求比标准 Curl 更完整的请求形态（例如真实 Codex 客户端上下文、签名或额外头），当前测试请求无法单独验证；请使用匹配上游要求的高级 Curl profile 或真实 Codex 请求转发验证。';
+  }
+  return '';
+}
+
+function responseErrorParts(result) {
+  const json = parseJsonBody(result?.body);
+  const error = json && typeof json === 'object' ? json.error : null;
+  const code = String(
+    error && typeof error === 'object'
+      ? error.code || error.type || ''
+      : json?.code || json?.type || ''
+  ).trim();
+  const message = String(
+    error && typeof error === 'object'
+      ? error.message || ''
+      : typeof error === 'string'
+        ? error
+        : json?.message || result?.body || ''
+  ).trim();
+  return { code, message };
+}
+
+function responseLooksLikeBrowserChallenge(result) {
+  const contentType = String(firstHeader(result?.headers || {}, ['content-type']) || '').toLowerCase();
+  const body = String(result?.body || '').slice(0, 12000);
+  return contentType.includes('text/html') || /<html|<!doctype html|cloudflare|cf-ray|cdn-cgi|challenge-platform|just a moment|attention required/i.test(body);
+}
+
+function providerAuthError(result) {
+  const { code, message } = responseErrorParts(result);
+  const value = `${code} ${message}`.toLowerCase();
+  return /invalid[_ -]?api[_ -]?key|authentication_error|unauthorized|permission_denied|permission denied|invalid auth|invalid token|missing api key|incorrect api key/.test(value);
+}
+
+function hasResponsesOutput(json) {
+  return Boolean(json && typeof json === 'object' && (
+    typeof json.output_text === 'string' ||
+    (Array.isArray(json.output) && json.output.length > 0)
+  ));
+}
+
+function hasChatCompletionsOutput(json) {
+  return Boolean(json && typeof json === 'object' && Array.isArray(json.choices) && json.choices.length > 0);
+}
+
+function hasAnthropicMessageOutput(json) {
+  return Boolean(json && typeof json === 'object' && Array.isArray(json.content) && json.content.length > 0);
+}
+
+function hasResponsesSseOutput(body) {
+  return /response\.output|\"output_text\"\s*:|\"output\"\s*:\s*\[/.test(String(body || ''));
+}
+
+function modelProbeValidationError(result, protocol) {
+  const httpState = classifyHealth(result.statusCode, result.error);
+  if (httpState !== 'ok') return '';
+
+  const body = String(result.body || '').trim();
+  if (!body) return `${protocol} probe returned HTTP ${result.statusCode} without a response body`;
+
+  if (protocol === 'responses' || protocol === 'codex_oauth') {
+    if (hasResponsesSseOutput(body)) return '';
+    if (hasResponsesOutput(parseJsonBody(body))) return '';
+    return `${protocol} probe returned HTTP ${result.statusCode} without Responses output/output_text`;
+  }
+
+  const json = parseJsonBody(body);
+  if (protocol === 'chat_completions') {
+    return hasChatCompletionsOutput(json)
+      ? ''
+      : `chat_completions probe returned HTTP ${result.statusCode} without choices`;
+  }
+  if (protocol === 'anthropic') {
+    return hasAnthropicMessageOutput(json)
+      ? ''
+      : `anthropic messages probe returned HTTP ${result.statusCode} without content`;
+  }
+  return '';
+}
+
+function classifyModelProbe(result, protocol) {
+  const advancedCurlRequiredError = advancedCurlRequiredProbeError(result);
+  if (advancedCurlRequiredError) return { state: 'advanced_curl_required', error: advancedCurlRequiredError };
+  const state = classifyHealth(result.statusCode, result.error);
+  if (state !== 'ok') return { state, error: result.error || '' };
+  const validationError = modelProbeValidationError(result, protocol);
+  return validationError
+    ? { state: 'unexpected_status', error: validationError }
+    : { state: 'ok', error: '' };
+}
+
+function healthProbeEffectiveState(health, expectedModel) {
+  const state = health?.state || 'unknown';
+  if (state !== 'ok' || expectedModel === undefined) return state;
+  const expected = normalizeProbeModel(expectedModel);
+  if (!expected) return 'missing_model_override';
+  return healthMatchesProbeModel(health, expected) ? 'ok' : 'stale_model_override';
+}
+
+function healthProbeEffectiveError(health, expectedModel) {
+  const state = healthProbeEffectiveState(health, expectedModel);
+  if (state === 'stale_model_override') {
+    const previous = normalizeProbeModel(health?.probeModel) || 'unknown';
+    const current = normalizeProbeModel(expectedModel) || 'missing';
+    return `Health Probe was last run for model_override ${previous}; current model_override is ${current}`;
+  }
+  if (state === 'missing_model_override' && !normalizeProbeModel(expectedModel)) {
+    return health?.error || 'Health Probe requires model_override so it can test the exact active model';
+  }
+  return health?.error || '';
+}
+
+function healthProbeOk(health, expectedModel = undefined) {
+  return healthProbeEffectiveState(health, expectedModel) === 'ok';
+}
+
+function healthProbeStatus(health, expectedModel = undefined) {
+  const state = healthProbeEffectiveState(health, expectedModel);
+  if (healthProbeOk(health, expectedModel)) return 'ok';
+  if (state === 'unknown' || state === 'disabled' || state === 'oauth_ready' || state === 'stale_model_override' || state === 'advanced_curl_required' || state === 'codex_forward_only') return 'skipped';
+  return 'failed';
+}
+
+function healthProbeSummary(upstreams = [], expectedModel = undefined) {
+  const enabled = upstreams.filter((upstream) => upstream.enabled);
+  const stateCounts = {};
+  let okCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
+  for (const upstream of upstreams) {
+    const state = healthProbeEffectiveState(upstream.health, expectedModel);
+    const status = healthProbeStatus(upstream.health, expectedModel);
+    stateCounts[state] = (stateCounts[state] || 0) + 1;
+    if (!upstream.enabled) {
+      skippedCount += 1;
+      continue;
+    }
+    if (status === 'ok') okCount += 1;
+    else if (status === 'skipped') skippedCount += 1;
+    else failedCount += 1;
+  }
+  const probeStatus = enabled.length === 0
+    ? 'skipped'
+    : failedCount > 0
+      ? 'failed'
+      : okCount === enabled.length
+        ? 'ok'
+        : 'skipped';
+  return {
+    probe_ok: probeStatus === 'ok',
+    probe_status: probeStatus,
+    total_count: upstreams.length,
+    enabled_count: enabled.length,
+    disabled_count: upstreams.length - enabled.length,
+    ok_count: okCount,
+    failed_count: failedCount,
+    skipped_count: skippedCount,
+    states: stateCounts
+  };
 }
 
 function requestUpstream({ req, body, targetUrl, upstream, key, timeoutMs, allowRetry, retryableStatus, method, headers }) {
@@ -2679,6 +4318,19 @@ function requestUpstream({ req, body, targetUrl, upstream, key, timeoutMs, allow
   });
 }
 
+async function requestTrackedUpstream(options) {
+  const upstream = options.upstream;
+  upstream.inFlight += 1;
+  try {
+    const result = await requestUpstream(options);
+    if (result.type !== 'response') upstream.inFlight = Math.max(0, upstream.inFlight - 1);
+    return result;
+  } catch (error) {
+    upstream.inFlight = Math.max(0, upstream.inFlight - 1);
+    throw error;
+  }
+}
+
 function probeHttp(targetUrl, keyValue, timeoutMs, options = {}) {
   return new Promise((resolve) => {
     const startedAt = now();
@@ -2733,9 +4385,544 @@ function probeHttp(targetUrl, keyValue, timeoutMs, options = {}) {
   });
 }
 
+function cleanDebugHeaderObject(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const headers = {};
+  for (const [name, value] of Object.entries(input)) {
+    const cleanName = String(name || '').trim();
+    const lower = cleanName.toLowerCase();
+    if (!cleanName || HOP_BY_HOP_HEADERS.has(lower) || lower === 'host' || lower === 'content-length') continue;
+    if (value === undefined || value === null) continue;
+    headers[cleanName] = String(value);
+  }
+  return headers;
+}
+
+function normalizeDebugRequestMethod(value) {
+  const method = String(value || 'GET').trim().toUpperCase();
+  return ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'].includes(method) ? method : 'GET';
+}
+
+function joinDebugRequestUrl(baseUrl, pathSuffix) {
+  const suffix = String(pathSuffix || '/v1/models').trim() || '/v1/models';
+  if (/^https?:\/\//i.test(suffix)) return suffix;
+  try {
+    const basePath = new URL(baseUrl).pathname.replace(/\/+$/, '');
+    if (basePath.endsWith('/v1') && suffix.startsWith('/v1/')) {
+      return joinUrlPath(baseUrl, suffix.slice('/v1'.length));
+    }
+  } catch {
+    // URL validation happens in the caller.
+  }
+  return joinUrlPath(baseUrl, suffix);
+}
+
+function inferCurlProtocol(targetUrl) {
+  try {
+    const pathname = new URL(targetUrl).pathname;
+    if (pathname.endsWith('/responses')) return 'responses';
+    if (pathname.endsWith('/chat/completions')) return 'chat_completions';
+    if (pathname.endsWith('/messages')) return 'anthropic';
+  } catch {
+    // URL validation happens before the request is sent.
+  }
+  return '';
+}
+
+function curlJudgement(result, targetUrl) {
+  const statusCode = Number(result.statusCode || 0);
+  const advancedCurlRequiredError = advancedCurlRequiredProbeError(result);
+  if (advancedCurlRequiredError) {
+    return {
+      status: 'inconclusive',
+      judgement_type: 'wrong_judgement',
+      authoritative: false,
+      representative: false,
+      representative_reason: 'requires_advanced_curl_profile',
+      representative_scope: 'none',
+      reflects_real_request: false,
+      available: null,
+      blocks_dispatch: false,
+      blocks_exact_request: true,
+      blocks_upstream: false,
+      evidence: 'advanced_curl_profile_required',
+      decision: 'no_state_change',
+      effect_scope: 'test_request_only',
+      confidence: 'low',
+      code: 'requires_advanced_curl_profile',
+      scope: 'target_endpoint',
+      message: advancedCurlRequiredError
+    };
+  }
+  if (result.error) {
+    return {
+      status: 'inconclusive',
+      judgement_type: 'unknown_judgement',
+      authoritative: false,
+      representative: null,
+      representative_reason: 'no_http_response',
+      representative_scope: 'unknown',
+      reflects_real_request: false,
+      available: null,
+      blocks_dispatch: false,
+      blocks_exact_request: false,
+      blocks_upstream: false,
+      evidence: /timeout/i.test(result.error) ? 'transport_timeout' : 'transport_error',
+      decision: 'no_state_change',
+      effect_scope: 'unknown',
+      confidence: 'low',
+      code: /timeout/i.test(result.error) ? 'transport_timeout' : 'transport_error',
+      scope: 'target_endpoint',
+      message: result.error
+    };
+  }
+  if (statusCode >= 200 && statusCode < 300) {
+    const protocol = inferCurlProtocol(targetUrl);
+    const validationError = protocol ? modelProbeValidationError(result, protocol) : '';
+    if (validationError) {
+      return {
+        status: 'failed',
+        judgement_type: 'correct_judgement',
+        authoritative: true,
+        representative: true,
+        representative_reason: 'http_response_matches_exact_request_shape',
+        representative_scope: 'exact_request',
+        reflects_real_request: true,
+        available: false,
+        blocks_dispatch: true,
+        blocks_exact_request: true,
+        blocks_upstream: false,
+        evidence: 'invalid_response_shape',
+        decision: 'mark_endpoint_unavailable',
+        effect_scope: 'endpoint',
+        confidence: 'high',
+        code: 'invalid_response_shape',
+        scope: 'target_endpoint',
+        message: validationError
+      };
+    }
+    return {
+      status: 'ok',
+      judgement_type: 'capability',
+      authoritative: true,
+      representative: true,
+      representative_reason: 'valid_protocol_response',
+      representative_scope: 'exact_request',
+      reflects_real_request: true,
+      available: true,
+      blocks_dispatch: false,
+      blocks_exact_request: false,
+      blocks_upstream: false,
+      evidence: 'valid_response_shape',
+      decision: 'mark_available',
+      effect_scope: 'exact_request',
+      confidence: 'high',
+      code: 'ok',
+      scope: 'target_endpoint',
+      message: 'Curl response is a valid result for this exact request shape.'
+    };
+  }
+  if (statusCode === 401 || statusCode === 403) {
+    if (responseLooksLikeBrowserChallenge(result) || !providerAuthError(result)) {
+      return {
+        status: 'inconclusive',
+        judgement_type: 'unknown_judgement',
+        authoritative: false,
+        representative: null,
+        representative_reason: responseLooksLikeBrowserChallenge(result) ? 'browser_or_edge_challenge' : 'unrecognized_auth_error_shape',
+        representative_scope: 'unknown',
+        reflects_real_request: false,
+        available: null,
+        blocks_dispatch: false,
+        blocks_exact_request: false,
+        blocks_upstream: false,
+        evidence: responseLooksLikeBrowserChallenge(result) ? 'browser_or_edge_challenge' : 'unrecognized_auth_error',
+        decision: 'no_state_change',
+        effect_scope: 'unknown',
+        confidence: 'low',
+        code: responseLooksLikeBrowserChallenge(result) ? 'browser_or_edge_challenge' : 'unrecognized_auth_error',
+        scope: 'target_endpoint',
+        message: responseLooksLikeBrowserChallenge(result)
+          ? `HTTP ${statusCode} looks like a browser/edge challenge, not a representative API response.`
+          : `HTTP ${statusCode} did not include a recognized provider auth error shape.`
+      };
+    }
+    return {
+      status: 'failed',
+      judgement_type: 'correct_judgement',
+      authoritative: true,
+      representative: true,
+      representative_reason: 'provider_rejected_same_auth_shape',
+      representative_scope: 'exact_request',
+      reflects_real_request: true,
+      available: false,
+      blocks_dispatch: true,
+      blocks_exact_request: true,
+      blocks_upstream: true,
+      evidence: 'auth_rejected',
+      decision: 'mark_unavailable',
+      effect_scope: 'upstream_auth',
+      confidence: 'high',
+      code: 'auth_error',
+      scope: 'target_endpoint',
+      message: `HTTP ${statusCode} authentication/authorization failure for this exact request shape.`
+    };
+  }
+  if (statusCode === 429) {
+    return {
+      status: 'failed',
+      judgement_type: 'correct_judgement',
+      authoritative: true,
+      representative: true,
+      representative_reason: 'provider_rate_limited_same_request_shape',
+      representative_scope: 'exact_request',
+      reflects_real_request: true,
+      available: false,
+      blocks_dispatch: true,
+      blocks_exact_request: true,
+      blocks_upstream: false,
+      evidence: 'rate_limited',
+      decision: 'temporary_unavailable',
+      effect_scope: 'rate_limit',
+      confidence: 'high',
+      temporary: true,
+      code: 'rate_limited',
+      scope: 'target_endpoint',
+      message: 'The target endpoint is currently rate limited for this request shape.'
+    };
+  }
+  if (statusCode >= 500) {
+    return {
+      status: 'failed',
+      judgement_type: 'correct_judgement',
+      authoritative: true,
+      representative: true,
+      representative_reason: 'provider_server_error_same_request_shape',
+      representative_scope: 'exact_request',
+      reflects_real_request: true,
+      available: false,
+      blocks_dispatch: true,
+      blocks_exact_request: true,
+      blocks_upstream: false,
+      evidence: 'server_error',
+      decision: 'temporary_unavailable',
+      effect_scope: 'upstream_temporary',
+      confidence: 'medium',
+      temporary: true,
+      code: 'server_error',
+      scope: 'target_endpoint',
+      message: `HTTP ${statusCode} server error for this exact request shape.`
+    };
+  }
+  return {
+    status: 'failed',
+    judgement_type: 'correct_judgement',
+    authoritative: true,
+    representative: true,
+    representative_reason: 'http_status_matches_exact_request_shape',
+    representative_scope: 'exact_request',
+    reflects_real_request: true,
+    available: false,
+    blocks_dispatch: true,
+    blocks_exact_request: true,
+    blocks_upstream: statusCode !== 404,
+    evidence: statusCode === 404 ? 'not_found' : 'unexpected_status',
+    decision: statusCode === 404 ? 'mark_endpoint_unavailable' : 'mark_unavailable',
+    effect_scope: statusCode === 404 ? 'endpoint' : 'exact_request',
+    confidence: 'medium',
+    code: statusCode === 404 ? 'not_found' : 'unexpected_status',
+    scope: 'target_endpoint',
+    message: `HTTP ${statusCode} for this exact request shape.`
+  };
+}
+
+function runCurlTest(payload = {}, config = {}) {
+  return new Promise((resolve) => {
+    const startedAt = now();
+    const baseUrl = String(payload.base_url || payload.baseUrl || '').trim();
+    if (!baseUrl) {
+      resolve({ ok: false, error: 'base_url is required', statusCode: 0, latencyMs: 0, headers: {}, body: '' });
+      return;
+    }
+
+    let targetUrl = '';
+    try {
+      targetUrl = joinDebugRequestUrl(baseUrl, payload.path || payload.url_path || '/v1/models');
+      const parsed = new URL(targetUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('URL protocol must be http or https');
+    } catch (error) {
+      resolve({ ok: false, error: `invalid target URL: ${error.message}`, statusCode: 0, latencyMs: now() - startedAt, headers: {}, body: '' });
+      return;
+    }
+
+    const method = normalizeDebugRequestMethod(payload.method);
+    const apiKey = String(payload.api_key || payload.apiKey || '').trim();
+    const authType = String(payload.auth_type || payload.authType || 'bearer').trim().toLowerCase();
+    const bodyText = method === 'GET' || method === 'HEAD'
+      ? ''
+      : typeof payload.body === 'string'
+        ? payload.body
+        : payload.body === undefined || payload.body === null
+          ? ''
+          : JSON.stringify(payload.body);
+    const body = Buffer.from(bodyText);
+    const timeoutMs = Math.max(1000, Math.min(300000, Number(payload.timeout_ms || payload.timeoutMs || config.server?.request_timeout_ms || 180000)));
+    const responseLimitBytes = Math.max(1024, Number(config.server?.max_body_bytes || 50 * 1024 * 1024));
+    const extraHeaders = cleanDebugHeaderObject(payload.headers);
+    const useCodexCliHeaders = authType === 'codex' || authType === 'codex-cli' || authType === 'codex_cli';
+    const headers = useCodexCliHeaders
+      ? buildCodexOAuthRequestHeaders(targetUrl, apiKey, body.length > 0 ? { 'content-type': 'application/json' } : {}, extraHeaders)
+      : {
+          accept: '*/*',
+          'user-agent': 'codex-api-pool-dashboard-curl-test/1.0',
+          ...extraHeaders
+        };
+    if (!useCodexCliHeaders) {
+      if (apiKey && authType === 'bearer' && !headers.authorization && !headers.Authorization) headers.authorization = `Bearer ${apiKey}`;
+      if (apiKey && authType === 'x-api-key' && !headers['x-api-key'] && !headers['X-API-Key']) headers['x-api-key'] = apiKey;
+      if (apiKey && authType === 'anthropic') {
+        if (!headers['x-api-key'] && !headers['X-API-Key']) headers['x-api-key'] = apiKey;
+        if (!headers['anthropic-version'] && !headers['Anthropic-Version']) headers['anthropic-version'] = '2023-06-01';
+      }
+      if (body.length > 0 && !headers['content-type'] && !headers['Content-Type']) headers['content-type'] = 'application/json';
+    }
+    if (body.length > 0) headers['content-length'] = String(body.length);
+
+    const request = requestOptionsForTarget(targetUrl, method, headers, timeoutMs);
+    let settled = false;
+    const chunks = [];
+    let bodySize = 0;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      const payload = {
+        ok: !result.error && result.statusCode >= 200 && result.statusCode < 400,
+        target_url: targetUrl,
+        method,
+        latency_ms: now() - startedAt,
+        status_code: result.statusCode || 0,
+        headers: result.headers || {},
+        body: result.body || '',
+        error: result.error || '',
+        response_too_large: Boolean(result.responseTooLarge)
+      };
+      payload.judgement = curlJudgement({
+        statusCode: payload.status_code,
+        error: payload.error,
+        body: payload.body,
+        headers: payload.headers
+      }, targetUrl);
+      resolve(payload);
+    };
+
+    const debugReq = request.client.request(request.target, request.options, (debugRes) => {
+      debugRes.on('data', (chunk) => {
+        bodySize += chunk.length;
+        if (bodySize <= responseLimitBytes) chunks.push(chunk);
+      });
+      debugRes.on('end', () => {
+        const responseTooLarge = bodySize > responseLimitBytes;
+        const body = responseTooLarge ? '' : decodeHttpBody(chunks, bodySize, debugRes.headers);
+        finish({
+          statusCode: debugRes.statusCode || 0,
+          headers: debugRes.headers,
+          body,
+          responseTooLarge,
+          error: responseTooLarge ? `response body too large: ${bodySize} > ${responseLimitBytes}` : ''
+        });
+      });
+      debugRes.on('error', (error) => finish({
+        statusCode: debugRes.statusCode || 0,
+        headers: debugRes.headers,
+        body: '',
+        error: error.message
+      }));
+    });
+
+    debugReq.on('timeout', () => {
+      debugReq.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    debugReq.on('error', (error) => finish({ statusCode: 0, headers: {}, body: '', error: error.message }));
+    debugReq.end(body);
+  });
+}
+
+function probeChatCompletionsUpstream(upstream, key, config, model) {
+  return new Promise((resolve) => {
+    const timeoutMs = chatFallbackProbeTimeoutMs(config, Number(config.health?.timeout_ms || 10000));
+    const targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
+    const body = buildChatCompletionsPayload(Buffer.from(JSON.stringify({
+      model,
+      input: 'ping',
+      stream: false,
+      max_output_tokens: 8
+    })), model);
+    const headers = buildProbeHeaders(targetUrl, key.value, upstream.probeAuth, upstream.probeHeaders);
+    headers['content-type'] = 'application/json';
+    headers['content-length'] = body.length;
+    const startedAt = now();
+    let settled = false;
+    const chunks = [];
+    let bodySize = 0;
+    let bodyTooLarge = false;
+    const request = requestOptionsForTarget(targetUrl, 'POST', headers, timeoutMs, upstream.proxyUrl);
+
+    const finish = (statusCode, responseHeaders = {}, error = '') => {
+      if (settled) return;
+      settled = true;
+      const responseBody = bodyTooLarge ? '' : decodeHttpBody(chunks, bodySize, responseHeaders);
+      resolve(probeResult(
+        statusCode || 0,
+        now() - startedAt,
+        responseBody,
+        bodyTooLarge ? 'response body too large' : error,
+        responseHeaders['retry-after'],
+        responseHeaders
+      ));
+    };
+
+    const probeReq = request.client.request(request.target, request.options, (probeRes) => {
+      probeRes.on('data', (chunk) => {
+        if (bodyTooLarge) return;
+        bodySize += chunk.length;
+        if (bodySize > 128 * 1024) {
+          bodyTooLarge = true;
+          chunks.length = 0;
+          bodySize = 0;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      probeRes.on('end', () => finish(probeRes.statusCode || 0, probeRes.headers));
+      probeRes.on('error', (error) => finish(probeRes.statusCode || 0, probeRes.headers, error.message));
+    });
+    probeReq.on('timeout', () => {
+      probeReq.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    probeReq.on('error', (error) => finish(0, {}, error.message));
+    probeReq.end(body);
+  });
+}
+
+function probeResponsesUpstream(upstream, key, config, model) {
+  return new Promise((resolve) => {
+    const timeoutMs = Number(config.health?.timeout_ms || 10000);
+    const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
+    const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
+    const body = Buffer.from(JSON.stringify({
+      model,
+      input: 'hi',
+      stream: false,
+      max_output_tokens: 1
+    }));
+    const headers = buildProbeHeaders(targetUrl, key.value, upstream.probeAuth, upstream.probeHeaders);
+    headers['content-type'] = 'application/json';
+    headers['content-length'] = body.length;
+    const startedAt = now();
+    let settled = false;
+    const chunks = [];
+    let bodySize = 0;
+    let bodyTooLarge = false;
+    const request = requestOptionsForTarget(targetUrl, 'POST', headers, timeoutMs, upstream.proxyUrl);
+
+    const finish = (statusCode, responseHeaders = {}, error = '') => {
+      if (settled) return;
+      settled = true;
+      const responseBody = bodyTooLarge ? '' : decodeHttpBody(chunks, bodySize, responseHeaders);
+      resolve(probeResult(
+        statusCode || 0,
+        now() - startedAt,
+        responseBody,
+        bodyTooLarge ? 'response body too large' : error,
+        responseHeaders['retry-after'],
+        responseHeaders
+      ));
+    };
+
+    const probeReq = request.client.request(request.target, request.options, (probeRes) => {
+      probeRes.on('data', (chunk) => {
+        if (bodyTooLarge) return;
+        bodySize += chunk.length;
+        if (bodySize > 128 * 1024) {
+          bodyTooLarge = true;
+          chunks.length = 0;
+          bodySize = 0;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      probeRes.on('end', () => finish(probeRes.statusCode || 0, probeRes.headers));
+      probeRes.on('error', (error) => finish(probeRes.statusCode || 0, probeRes.headers, error.message));
+    });
+    probeReq.on('timeout', () => {
+      probeReq.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    probeReq.on('error', (error) => finish(0, {}, error.message));
+    probeReq.end(body);
+  });
+}
+
+function probeAnthropicUpstream(upstream, key, config, model) {
+  return new Promise((resolve) => {
+    const timeoutMs = Number(config.health?.timeout_ms || 10000);
+    const targetUrl = joinUrlPath(upstream.baseUrl, anthropicMessagesPathForBaseUrl(upstream.baseUrl));
+    const body = Buffer.from(JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      max_tokens: 1,
+      stream: false
+    }));
+    const headers = buildProbeHeaders(targetUrl, key.value, 'anthropic', upstream.probeHeaders);
+    headers['content-type'] = 'application/json';
+    headers['content-length'] = body.length;
+    const startedAt = now();
+    let settled = false;
+    const chunks = [];
+    let bodySize = 0;
+    let bodyTooLarge = false;
+    const request = requestOptionsForTarget(targetUrl, 'POST', headers, timeoutMs, upstream.proxyUrl);
+
+    const finish = (statusCode, responseHeaders = {}, error = '') => {
+      if (settled) return;
+      settled = true;
+      const responseBody = bodyTooLarge ? '' : decodeHttpBody(chunks, bodySize, responseHeaders);
+      resolve(probeResult(
+        statusCode || 0,
+        now() - startedAt,
+        responseBody,
+        bodyTooLarge ? 'response body too large' : error,
+        responseHeaders['retry-after'],
+        responseHeaders
+      ));
+    };
+
+    const probeReq = request.client.request(request.target, request.options, (probeRes) => {
+      probeRes.on('data', (chunk) => {
+        if (bodyTooLarge) return;
+        bodySize += chunk.length;
+        if (bodySize > 128 * 1024) {
+          bodyTooLarge = true;
+          chunks.length = 0;
+          bodySize = 0;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      probeRes.on('end', () => finish(probeRes.statusCode || 0, probeRes.headers));
+      probeRes.on('error', (error) => finish(probeRes.statusCode || 0, probeRes.headers, error.message));
+    });
+    probeReq.on('timeout', () => {
+      probeReq.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    probeReq.on('error', (error) => finish(0, {}, error.message));
+    probeReq.end(body);
+  });
+}
+
 function codexOAuthProbePayload(model) {
   return Buffer.from(JSON.stringify({
-    model: model || 'gpt-5.5',
+    model,
     input: [
       {
         role: 'user',
@@ -2752,8 +4939,7 @@ function codexOAuthProbePayload(model) {
 
 function codexOAuthCompactProbeModel(model) {
   const value = String(model || '').trim();
-  if (value && !value.toLowerCase().includes('codex')) return value;
-  return 'gpt-5.5';
+  return value;
 }
 
 function codexOAuthCompactProbePayload(model) {
@@ -2854,7 +5040,7 @@ function codexOAuthDiagnosticMessage(diagnostics) {
 async function probeCodexOAuthUpstream(upstream, key, config) {
   const timeoutMs = Number(config.health?.timeout_ms || 10000);
   const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
-  const model = config.model_override || 'gpt-5.5';
+  const model = String(config.model_override || '').trim();
   const targetUrl = codexOAuthTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
   const body = codexOAuthProbePayload(model);
   const headers = buildCodexOAuthRequestHeaders(targetUrl, key.value, { 'content-type': 'application/json' }, codexOAuthExtraHeaders(upstream));
@@ -3065,6 +5251,25 @@ async function probeOneBilling(upstream, config) {
   return upstream.billing;
 }
 
+async function fetchSupplementalModels(upstream, config, key, timeoutMs, publicPrefix, pathSuffix) {
+  let models = upstream.health?.models || [];
+  try {
+    const modelsUrl = upstream.healthPath
+      ? joinUrlPath(upstream.baseUrl, pathSuffix)
+      : joinTargetUrl(upstream.baseUrl, `${publicPrefix}${pathSuffix.startsWith('/') ? pathSuffix : `/${pathSuffix}`}`, publicPrefix);
+    const modelsResult = await probeHttp(modelsUrl, key.value, Math.min(timeoutMs, 5000), {
+      authType: upstream.probeAuth,
+      headers: upstream.probeHeaders,
+      proxyUrl: upstream.proxyUrl
+    });
+    const extracted = extractModels(modelsResult.body);
+    if (extracted.length > 0) models = extracted;
+  } catch {
+    // Model list is supplementary; ignore errors.
+  }
+  return models;
+}
+
 async function safeProbeOneBilling(upstream, config, logger = console) {
   try {
     return await probeOneBilling(upstream, config);
@@ -3113,6 +5318,31 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     return upstream.health;
   }
 
+  const probeModel = String(config.model_override || '').trim();
+  if (!probeModel) {
+    const models = await fetchSupplementalModels(upstream, config, key, timeoutMs, publicPrefix, pathSuffix);
+    upstream.health = {
+      state: 'missing_model_override',
+      checkedAt,
+      latencyMs: 0,
+      httpStatus: 0,
+      error: 'Health Probe requires model_override so it can test the exact active model',
+      models,
+      modelsCount: models.length,
+      keyLabel: key.label,
+      probeModel: ''
+    };
+    key.health = {
+      state: 'missing_model_override',
+      checkedAt,
+      latencyMs: 0,
+      httpStatus: 0,
+      error: upstream.health.error,
+      probeModel: ''
+    };
+    return upstream.health;
+  }
+
   if (upstream.codexOAuth) {
     const expired = codexOAuthExpired(upstream);
     let result = null;
@@ -3123,14 +5353,15 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     const stateName = expired
       ? 'auth_error'
       : result
-        ? classifyHealth(result.statusCode, result.error)
+        ? classifyModelProbe(result, 'codex_oauth').state
         : 'oauth_ready';
     const bodyMessage = result?.body ? String(result.body).trim().slice(0, 1000) : '';
     const diagnosticMessage = codexOAuthDiagnosticMessage(result?.diagnostics);
+    const validationMessage = result ? classifyModelProbe(result, 'codex_oauth').error : '';
     const error = expired
       ? `OAuth access token expired at ${upstream.oauthExpiresAt}`
       : result
-        ? diagnosticMessage || result.error || (stateName === 'ok' ? '' : bodyMessage)
+        ? diagnosticMessage || validationMessage || result.error || (stateName === 'ok' ? '' : bodyMessage)
         : 'Codex OAuth upstream does not support /models probing; click Test to send a live probe';
     upstream.health = {
       state: stateName,
@@ -3141,7 +5372,8 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
       diagnostics: result?.diagnostics || undefined,
       models: [],
       modelsCount: 0,
-      keyLabel: key.label
+      keyLabel: key.label,
+      probeModel: result ? probeModel : ''
     };
     key.health = {
       state: stateName,
@@ -3149,7 +5381,8 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
       latencyMs: result?.latencyMs || 0,
       httpStatus: result?.statusCode || 0,
       error,
-      diagnostics: result?.diagnostics || undefined
+      diagnostics: result?.diagnostics || undefined,
+      probeModel: result ? probeModel : ''
     };
     if (result) {
       if (stateName === 'ok') {
@@ -3162,47 +5395,149 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     return upstream.health;
   }
 
-  const targetUrl = upstream.healthPath
-    ? joinUrlPath(upstream.baseUrl, pathSuffix)
-    : joinTargetUrl(upstream.baseUrl, `${publicPrefix}${pathSuffix.startsWith('/') ? pathSuffix : `/${pathSuffix}`}`, publicPrefix);
-  const result = await probeHttp(targetUrl, key.value, timeoutMs, {
-    authType: upstream.probeAuth,
-    headers: upstream.probeHeaders,
-    proxyUrl: upstream.proxyUrl
-  });
-  const stateName = classifyHealth(result.statusCode, result.error);
-  const models = extractModels(result.body);
-  applyQuota(upstream, key, result.headers || {});
+  // ── Real model request as primary health check ──
+  const isAnthropic = isAnthropicUpstream(upstream);
+  const isOpenAi = isOpenAiUpstream(upstream);
+  let healthResult = null;
+  let stateName = '';
+  let healthError = '';
+  let healthWarning = '';
+  let resolvedMode = '';
+
+  // Step 1: Try real model request based on upstream type
+  if (isAnthropic && !isOpenAi) {
+    // Pure Anthropic upstream → probe /v1/messages first
+    const result = await probeAnthropicUpstream(upstream, key, config);
+    applyQuota(upstream, key, result.headers || {});
+    const classified = classifyModelProbe(result, 'anthropic');
+    stateName = classified.state;
+    healthResult = result;
+    healthError = classified.error || result.error;
+  } else if (isOpenAi) {
+    // OpenAI-compatible upstream → try /v1/responses first, then /v1/chat/completions
+    if (upstream.resolvedRequestMode === 'chat_completions' || upstream.requestMode === 'chat_completions') {
+      // Already known to be chat-only, skip responses probe
+      const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
+      applyQuota(upstream, key, chatResult.headers || {});
+      const classified = classifyModelProbe(chatResult, 'chat_completions');
+      stateName = classified.state;
+      healthResult = chatResult;
+      healthError = classified.error || chatResult.error;
+      if (stateName === 'ok') resolvedMode = 'chat_completions';
+    } else {
+      // Try /v1/responses first
+      const responsesResult = await probeResponsesUpstream(upstream, key, config, probeModel);
+      applyQuota(upstream, key, responsesResult.headers || {});
+      const responsesClassification = classifyModelProbe(responsesResult, 'responses');
+      const responsesState = responsesClassification.state;
+
+      if (responsesState === 'ok') {
+        stateName = 'ok';
+        healthResult = responsesResult;
+        healthError = '';
+        resolvedMode = 'responses';
+      } else {
+        // /responses failed → try /v1/chat/completions as fallback
+        const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
+        applyQuota(upstream, key, chatResult.headers || {});
+        const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
+        const chatState = chatClassification.state;
+
+        if (chatState === 'ok') {
+          stateName = 'ok';
+          healthResult = chatResult;
+          healthError = '';
+          healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
+          resolvedMode = 'chat_completions';
+        } else {
+          // Both real probes failed; /models is only supplementary and cannot mark Health ok.
+          if (responsesState === 'advanced_curl_required' || responsesState === 'codex_forward_only') {
+            stateName = responsesState;
+            healthResult = responsesResult;
+            healthError = responsesClassification.error;
+          } else if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only') {
+            stateName = chatState;
+            healthResult = chatResult;
+            healthError = chatClassification.error;
+          } else {
+            stateName = responsesState === 'auth_error' ? responsesState : chatState;
+            healthResult = responsesState === 'auth_error' ? responsesResult : chatResult;
+            healthError = responsesClassification.error || chatClassification.error || responsesResult.error || chatResult.error || `responses probe ${responsesState}; chat probe ${chatState}`;
+          }
+        }
+      }
+    }
+
+    // For "both" API upstreams, also try Anthropic
+    if (isAnthropic && stateName !== 'ok') {
+      const anthropicResult = await probeAnthropicUpstream(upstream, key, config);
+      applyQuota(upstream, key, anthropicResult.headers || {});
+      const anthropicClassification = classifyModelProbe(anthropicResult, 'anthropic');
+      const anthropicState = anthropicClassification.state;
+      if (anthropicState === 'ok') {
+        stateName = 'ok';
+        healthResult = anthropicResult;
+        healthError = '';
+      } else if (!healthError) {
+        healthError = anthropicClassification.error || anthropicResult.error;
+      }
+    }
+  }
+
+  // Fallback: if no real model probe function matched, do not use /models to claim availability.
+  if (!healthResult) {
+    healthResult = probeResult(0, 0, '', 'no real model probe is configured for this upstream');
+    stateName = 'unexpected_status';
+    healthError = healthResult.error;
+  }
+
+  // Step 2: Also grab /models list (supplementary, doesn't affect health state)
+  const models = await fetchSupplementalModels(upstream, config, key, timeoutMs, publicPrefix, pathSuffix);
+
   if (options.includeBilling) await safeProbeOneBilling(upstream, config);
+
+  // Step 3: Apply resolved request mode
+  if (resolvedMode) {
+    upstream.resolvedRequestMode = resolvedMode;
+  }
+  if (stateName === 'ok') {
+    upstream.cooldownUntil = 0;
+    upstream.failures = 0;
+    key.cooldownUntil = 0;
+    key.failures = 0;
+  }
 
   upstream.health = {
     state: stateName,
     checkedAt,
-    latencyMs: result.latencyMs,
-    httpStatus: result.statusCode,
-    error: result.error,
+    latencyMs: healthResult.latencyMs,
+    httpStatus: healthResult.statusCode,
+    error: stateName === 'ok' ? '' : healthError,
+    warning: healthWarning,
     models,
     modelsCount: models.length,
-    keyLabel: key.label
+    keyLabel: key.label,
+    probeModel
   };
 
   key.health = {
     state: stateName,
     checkedAt,
-    latencyMs: result.latencyMs,
-    httpStatus: result.statusCode,
-    error: result.error
+    latencyMs: healthResult.latencyMs,
+    httpStatus: healthResult.statusCode,
+    error: stateName === 'ok' ? '' : healthError,
+    warning: healthWarning,
+    probeModel
   };
 
-  if (stateName === 'ok' || stateName === 'models_unsupported' || stateName === 'unexpected_status') {
+  if (stateName === 'ok' || stateName === 'models_unsupported' || stateName === 'unexpected_status' || stateName === 'advanced_curl_required' || stateName === 'codex_forward_only') {
     upstream.lastError = '';
-    upstream.lastStatus = result.statusCode;
-    if (stateName === 'ok') upstream.cooldownUntil = 0;
+    upstream.lastStatus = healthResult.statusCode;
     return upstream.health;
   }
 
   if (stateName === 'auth_error' || stateName === 'rate_limited' || stateName === 'server_error' || stateName === 'network_error' || stateName === 'timeout') {
-    recordFailure(state, upstream, key, result.error || `health ${stateName}`, result.statusCode, result.retryAfter);
+    recordFailure(state, upstream, key, healthError || `health ${stateName}`, healthResult.statusCode, healthResult.retryAfter);
   }
 
   return upstream.health;
@@ -3280,6 +5615,7 @@ function claudeCheckHealthPayload(health) {
     latency_ms: health?.latencyMs || 0,
     http_status: health?.httpStatus || 0,
     error: health?.error || '',
+    warning: health?.warning || '',
     models: health?.models || [],
     models_count: health?.modelsCount || 0,
     key_label: health?.keyLabel || null
@@ -3343,18 +5679,19 @@ async function maybeAutoDetectApi(config, state, upstreamName, health, options, 
   const upstream = state.upstreams.find((item) => item.name === upstreamName);
   if (!upstream) return { health, detectedApi: null };
 
-  const anthropicHealth = await probeAnthropicModels(upstream, config);
-  if (!anthropicHealth) return { health, detectedApi: null };
+  const [openAiHealth, anthropicHealth] = await Promise.all([
+    probeModelsForProtocol(upstream, config, 'openai'),
+    probeModelsForProtocol(upstream, config, 'anthropic')
+  ]);
 
-  const openAiWorks = health?.state === 'ok';
-  const detectedApi = openAiWorks ? 'both' : 'anthropic';
-  const mergedHealth = openAiWorks
-    ? {
-        ...health,
-        models: mergeModels(health.models || [], anthropicHealth.models || []),
-        modelsCount: mergeModels(health.models || [], anthropicHealth.models || []).length
-      }
-    : anthropicHealth;
+  const openAiWorks = openAiHealth.state === 'ok';
+  const supportsClaude = anthropicHealth.state === 'ok' && hasClaudeModel(anthropicHealth.models);
+  if (!openAiWorks && !supportsClaude) return { health, detectedApi: null };
+
+  const detectedApi = supportsClaude
+    ? openAiWorks ? 'both' : 'anthropic'
+    : 'openai';
+  const detectedModels = mergeModels(openAiHealth.models || [], anthropicHealth.models || [], health?.models || []);
 
   const configIndex = (config.upstreams || []).findIndex((item) => item.name === upstreamName);
   if (configIndex >= 0) {
@@ -3373,14 +5710,22 @@ async function maybeAutoDetectApi(config, state, upstreamName, health, options, 
   }
 
   const detected = state.upstreams.find((item) => item.name === upstreamName);
+  let detectedHealth = health;
   if (detected) {
-    detected.health = mergedHealth;
-    detected.cooldownUntil = 0;
-    detected.lastError = '';
-    detected.lastStatus = mergedHealth.httpStatus || 200;
+    detectedHealth = await probeOneUpstream(state, detected, config);
+    const models = mergeModels(detectedHealth?.models || [], detectedModels);
+    detected.health = {
+      ...detected.health,
+      ...detectedHealth,
+      models,
+      modelsCount: models.length,
+      warning: detectedHealth?.state === 'ok'
+        ? detectedHealth.warning || ''
+        : `api auto-detected from /models as ${detectedApi}; real model probe ${detectedHealth?.state || 'unknown'}`
+    };
   }
   await saveConfig(config, options.configPath);
-  return { health: mergedHealth, detectedApi };
+  return { health: detected?.health || detectedHealth, detectedApi };
 }
 
 async function mapWithConcurrency(items, limit, fn) {
@@ -3395,16 +5740,51 @@ async function mapWithConcurrency(items, limit, fn) {
   await Promise.all(workers);
 }
 
-async function runHealthChecks(state, config, logger = console) {
-  if (state.probing) return;
-  state.probing = true;
-  try {
+async function runHealthChecks(state, config, logger = console, probeOptions = {}) {
+  const live = probeOptions.live === true;
+  if (state.probingPromise) {
+    if (live && !state.probingLive) {
+      if (!state.pendingLiveProbePromise) {
+        const blockingPromise = state.probingPromise;
+        const pendingLiveProbePromise = blockingPromise
+          .catch(() => {})
+          .then(() => {
+            if (state.probingPromise === blockingPromise) {
+              state.probingPromise = null;
+              state.probing = false;
+              state.probingLive = false;
+            }
+            if (state.probingPromise && state.probingLive) return state.probingPromise;
+            return runHealthChecks(state, config, logger, probeOptions);
+          })
+          .finally(() => {
+            if (state.pendingLiveProbePromise === pendingLiveProbePromise) state.pendingLiveProbePromise = null;
+          });
+        state.pendingLiveProbePromise = pendingLiveProbePromise;
+      }
+      await state.pendingLiveProbePromise;
+      return;
+    }
+    await state.probingPromise.catch(() => {});
+    return;
+  }
+  const probingPromise = (async () => {
     const concurrency = Math.max(1, Number(config.health?.concurrency || 4));
-    await mapWithConcurrency(state.upstreams.filter((upstream) => upstream.enabled), concurrency, (upstream) => probeOneUpstream(state, upstream, config));
+    await mapWithConcurrency(state.upstreams.filter((upstream) => upstream.enabled), concurrency, (upstream) => probeOneUpstream(state, upstream, config, probeOptions));
+  })();
+  state.probingPromise = probingPromise;
+  state.probing = true;
+  state.probingLive = live;
+  try {
+    await probingPromise;
   } catch (error) {
     logger.warn?.(`[health] ${error.message}`);
   } finally {
-    state.probing = false;
+    if (state.probingPromise === probingPromise) {
+      state.probingPromise = null;
+      state.probing = false;
+      state.probingLive = false;
+    }
   }
 }
 
@@ -3488,7 +5868,7 @@ function dashboardHtml() {
     .lede { color: var(--muted); font-size: 14px; line-height: 1.6; max-width: 620px; }
     .eyebrow { color: var(--muted); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; margin-bottom: 8px; }
     .toolbar { display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
-    button, input, select { font: inherit; }
+    button, input, select, textarea { font: inherit; }
     a { color: inherit; }
     button {
       min-height: 38px;
@@ -3507,7 +5887,7 @@ function dashboardHtml() {
       white-space: nowrap;
     }
     button:hover { transform: translateY(-1px); box-shadow: 0 12px 22px rgba(23,33,29,.18); }
-    button:focus-visible, input:focus-visible, select:focus-visible, .card:focus-visible, .site-link:focus-visible, .metric[role="button"]:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .card:focus-visible, .site-link:focus-visible, .metric[role="button"]:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     .ghost { color: var(--ink); background: transparent; }
     .ui-icon { width: 16px; height: 16px; flex: 0 0 16px; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; fill: none; opacity: .9; }
     button .ui-icon, .site-link .ui-icon { width: 15px; height: 15px; }
@@ -3553,7 +5933,7 @@ function dashboardHtml() {
     .token-breakdown strong { color: var(--ink); font-size: 12px; line-height: 1.35; }
     .grid { display: grid; gap: 8px; }
     .workbench-list { display: grid; gap: 8px; }
-    .workbench-head, .workbench-row { display: grid; grid-template-columns: minmax(180px, 1.2fr) 112px minmax(180px, .95fr) minmax(135px, .75fr) minmax(140px, .75fr) minmax(165px, .9fr) 238px; gap: 10px; align-items: center; }
+    .workbench-head, .workbench-row { display: grid; grid-template-columns: minmax(180px, 1.15fr) 104px minmax(260px, 1.35fr) minmax(132px, .7fr) minmax(172px, .9fr) minmax(246px, 246px); gap: 12px; align-items: center; }
     .workbench-head { padding: 0 12px 2px; color: var(--muted); font-size: 11px; letter-spacing: .11em; text-transform: uppercase; }
     .card { padding: 12px; min-height: 0; animation: rise .35s ease both; cursor: pointer; transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
     .workbench-list.stable .card { animation: none; }
@@ -3588,8 +5968,10 @@ function dashboardHtml() {
     .availability-dot.is-failure { background: var(--bad); }
     .availability-dot.is-empty { background: rgba(23,33,29,.13); opacity: 1; }
     .billing-error strong { color: var(--warn); }
-    .workbench-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+    .workbench-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; align-self: stretch; align-content: start; }
     .pill { border-radius: 999px; border: 1px solid currentColor; padding: 6px 10px; font-size: 12px; white-space: nowrap; }
+    .workbench-actions button, .workbench-actions .site-link { width: 100%; min-width: 0; min-height: 36px; padding: 7px 8px; font-size: 12px; box-shadow: none; }
+    .workbench-actions .ui-icon { width: 14px; height: 14px; flex-basis: 14px; }
     .site-link { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line-strong); border-radius: 7px; padding: 7px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; background: rgba(255,255,255,.46); min-width: 58px; text-align: center; }
     .site-link:hover { background: var(--ink); color: var(--paper); }
     .signin-action { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.28); }
@@ -3639,14 +6021,48 @@ function dashboardHtml() {
     .claude-result[data-state="supported"] { color: var(--good); border-color: rgba(22,136,90,.34); background: rgba(22,136,90,.07); }
     .claude-result[data-state="only"] { color: var(--cold); border-color: rgba(49,95,125,.34); background: rgba(49,95,125,.08); }
     .claude-result[data-state="unsupported"] { color: var(--warn); border-color: rgba(183,121,8,.34); background: rgba(183,121,8,.08); }
-    .claude-card-result { flex: 1 0 100%; min-width: 0; padding: 7px 9px; text-align: left; overflow-wrap: anywhere; }
+    .claude-card-result { grid-column: 1 / -1; min-width: 0; padding: 7px 9px; text-align: left; overflow-wrap: anywhere; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
-    input, select { width: 100%; min-height: 38px; border: 1px solid var(--line); background: rgba(255,255,255,.62); border-radius: 7px; padding: 9px 11px; color: var(--ink); outline: none; }
-    input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
+    input, select, textarea { width: 100%; min-height: 38px; border: 1px solid var(--line); background: rgba(255,255,255,.62); border-radius: 7px; padding: 9px 11px; color: var(--ink); outline: none; }
+    textarea { min-height: 112px; resize: vertical; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-transform: none; letter-spacing: 0; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     .toggle-field input { width: 38px; justify-self: start; accent-color: var(--accent); }
     .token-input { width: 180px; }
     .model-panel { padding: 14px; display: grid; grid-template-columns: minmax(220px, .8fr) 1.2fr auto; gap: 14px; align-items: end; }
     .model-readout { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .curl-panel { padding: 16px; display: grid; grid-template-columns: minmax(210px, .8fr) minmax(150px, .42fr) minmax(150px, .42fr) minmax(150px, .42fr); gap: 10px; align-items: end; }
+    .curl-panel .section-head, .curl-wide, .curl-result { grid-column: 1 / -1; }
+    .curl-body-grid { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }
+    .curl-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .curl-result { display: grid; gap: 10px; border-top: 1px solid var(--line); padding-top: 12px; }
+    .curl-result[hidden] { display: none; }
+    .curl-result-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; }
+    .curl-result-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+    .curl-code { border: 1px solid var(--line); border-radius: 7px; background: rgba(23,33,29,.04); overflow: hidden; min-width: 0; }
+    .curl-code strong { display: block; padding: 8px 10px; color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; border-bottom: 1px solid var(--line); }
+    .curl-code pre { margin: 0; padding: 10px; max-height: 360px; overflow: auto; color: var(--ink); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .probe-results { padding: 14px; display: grid; gap: 12px; }
+    .probe-results[hidden] { display: none; }
+    .probe-results-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+    .probe-results-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .probe-results-title h2 { margin: 0; font-size: 15px; letter-spacing: 0; }
+    .probe-results-title p { margin: 2px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
+    .probe-results-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .probe-results-actions button { min-height: 32px; padding: 6px 9px; font-size: 12px; box-shadow: none; }
+    .probe-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; }
+    .probe-summary-item { border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.46); padding: 8px 10px; min-width: 0; }
+    .probe-summary-item span { display: block; color: var(--muted); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+    .probe-summary-item strong { display: block; font-size: 16px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .probe-result-list { display: grid; gap: 7px; max-height: 310px; overflow: auto; }
+    .probe-result-row { display: grid; grid-template-columns: minmax(150px, 1fr) 88px repeat(3, minmax(72px, .45fr)) minmax(180px, 1.2fr); gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.42); padding: 9px 10px; font-size: 12px; }
+    .probe-result-row strong { overflow-wrap: anywhere; }
+    .probe-result-row small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 2px; }
+    .probe-state { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; border: 1px solid currentColor; padding: 4px 7px; font-size: 11px; line-height: 1; white-space: nowrap; }
+    .probe-detail { color: var(--muted); line-height: 1.35; overflow-wrap: anywhere; }
+    .probe-raw { border: 1px solid var(--line); border-radius: 7px; background: rgba(23,33,29,.04); overflow: hidden; }
+    .probe-raw summary { cursor: pointer; list-style: none; padding: 9px 10px; color: var(--muted); font-size: 12px; }
+    .probe-raw summary::-webkit-details-marker { display: none; }
+    .probe-raw pre { margin: 0; border-top: 1px solid var(--line); padding: 10px; max-height: 260px; overflow: auto; color: var(--ink); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .import-panel { padding: 18px; display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, .45fr) minmax(150px, .45fr) auto; gap: 10px; align-items: end; }
     .import-panel .section-head { grid-column: 1 / -1; }
     .requests { padding: 18px; }
@@ -3679,7 +6095,7 @@ function dashboardHtml() {
     .last-refresh { flex: 0 0 auto; color: rgba(99,112,107,.82); }
     .empty { padding: 24px; color: var(--muted); }
     @media (max-width: 1100px) { .diagnostic-strip { grid-template-columns: 1fr; } .workbench-head { display: none; } .workbench-row { grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(120px, 1fr)); } .facts { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 760px) { header, .summary, .model-panel, .import-panel, .grid, .workbench-row, .workbench-models-row, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .model-strip-label { padding-top: 0; } .workbench-actions { justify-content: flex-start; } .usage-history-day summary, .usage-site-row { grid-template-columns: 1fr 1fr; } .request-row { grid-template-columns: 1fr; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
+    @media (max-width: 760px) { header, .summary, .model-panel, .curl-panel, .curl-body-grid, .curl-result-body, .import-panel, .grid, .workbench-row, .workbench-models-row, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .curl-actions { justify-content: flex-start; } .model-strip-label { padding-top: 0; } .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-history-day summary, .usage-site-row { grid-template-columns: 1fr 1fr; } .request-row, .probe-result-row { grid-template-columns: 1fr; } .probe-results-head { flex-direction: column; } .probe-results-actions { justify-content: flex-start; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
   </style>
 </head>
 <body>
@@ -3749,6 +6165,56 @@ function dashboardHtml() {
         <div class="model-readout" id="modelReadout">尚未完成模型探测。</div>
         <button class="ghost" id="clearModel" type="button" data-icon="x">清空覆盖</button>
       </div>
+      <section class="curl-panel panel dashboard-region" data-dashboard-region="curl-debugger" aria-labelledby="curl-debugger-title">
+        <div class="section-head">
+          <div>
+            <h2 id="curl-debugger-title"><span class="title-mark" data-icon="activity"></span>Curl Debugger</h2>
+            <p>直接填 Base URL 和 API Key 发出一次原始请求，完整展示状态码、响应头和响应体。</p>
+          </div>
+          <div class="curl-actions">
+            <button class="ghost" id="sendCurlTest" type="button" data-icon="play">发送请求</button>
+            <button class="ghost" id="copyCurlResult" type="button" data-icon="download" disabled>复制结果</button>
+          </div>
+        </div>
+        <label>Base URL<input id="curlBaseUrl" placeholder="https://api.example.com" autocomplete="off" /></label>
+        <label>Path<input id="curlPath" value="/v1/models" autocomplete="off" /></label>
+        <label>Method<select id="curlMethod"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
+        <label>Auth<select id="curlAuthType"><option value="bearer">Bearer</option><option value="codex">Codex CLI</option><option value="x-api-key">X-API-Key</option><option value="anthropic">Anthropic</option><option value="none">None</option></select></label>
+        <label class="curl-wide">API Key<input id="curlApiKey" type="password" placeholder="sk-..." autocomplete="off" /></label>
+        <div class="curl-body-grid">
+          <label>Headers JSON<textarea id="curlHeaders" spellcheck="false" placeholder='{"OpenAI-Beta":"responses=experimental"}'></textarea></label>
+          <label>Body<textarea id="curlBody" spellcheck="false" placeholder='{"model":"gpt-5.5","input":"hello"}'></textarea></label>
+        </div>
+        <section id="curlResult" class="curl-result" aria-live="polite" hidden>
+          <div id="curlResultSummary" class="curl-result-summary"></div>
+          <div class="curl-result-body">
+            <div class="curl-code"><strong>Response Headers</strong><pre id="curlResultHeaders"></pre></div>
+            <div class="curl-code"><strong>Response Body</strong><pre id="curlResultBody"></pre></div>
+          </div>
+          <div class="curl-code"><strong>Full Debug JSON</strong><pre id="curlResultRaw"></pre></div>
+        </section>
+      </section>
+      <section id="probeResults" class="probe-results panel" aria-live="polite" hidden>
+        <div class="probe-results-head">
+          <div class="probe-results-title">
+            <span class="title-mark" data-icon="radar"></span>
+            <div>
+              <h2 id="probeResultsTitle">测试结果</h2>
+              <p id="probeResultsMeta">等待测试完成。</p>
+            </div>
+          </div>
+          <div class="probe-results-actions">
+            <button class="ghost" id="copyProbeResults" type="button" data-icon="download">复制 JSON</button>
+            <button class="ghost" id="clearProbeResults" type="button" data-icon="x">清空</button>
+          </div>
+        </div>
+        <div id="probeResultsSummary" class="probe-summary"></div>
+        <div id="probeResultsList" class="probe-result-list"></div>
+        <details class="probe-raw">
+          <summary>原始响应 JSON</summary>
+          <pre id="probeResultsRaw"></pre>
+        </details>
+      </section>
     </section>
 
     <section class="dashboard-region" data-dashboard-region="upstream-workbench" aria-labelledby="upstream-workbench-title">
@@ -3857,12 +6323,36 @@ function dashboardHtml() {
     const signinPendingCount = document.querySelector('#signinPendingCount');
     const signinFilterCount = document.querySelector('#signinFilterCount');
     const signinFilterButtons = [...document.querySelectorAll('[data-signin-filter]')];
+    const probeResults = document.querySelector('#probeResults');
+    const probeResultsTitle = document.querySelector('#probeResultsTitle');
+    const probeResultsMeta = document.querySelector('#probeResultsMeta');
+    const probeResultsSummary = document.querySelector('#probeResultsSummary');
+    const probeResultsList = document.querySelector('#probeResultsList');
+    const probeResultsRaw = document.querySelector('#probeResultsRaw');
+    const copyProbeResults = document.querySelector('#copyProbeResults');
+    const clearProbeResults = document.querySelector('#clearProbeResults');
+    const sendCurlTest = document.querySelector('#sendCurlTest');
+    const copyCurlResult = document.querySelector('#copyCurlResult');
+    const curlBaseUrl = document.querySelector('#curlBaseUrl');
+    const curlPath = document.querySelector('#curlPath');
+    const curlMethod = document.querySelector('#curlMethod');
+    const curlAuthType = document.querySelector('#curlAuthType');
+    const curlApiKey = document.querySelector('#curlApiKey');
+    const curlHeaders = document.querySelector('#curlHeaders');
+    const curlBody = document.querySelector('#curlBody');
+    const curlResult = document.querySelector('#curlResult');
+    const curlResultSummary = document.querySelector('#curlResultSummary');
+    const curlResultHeaders = document.querySelector('#curlResultHeaders');
+    const curlResultBody = document.querySelector('#curlResultBody');
+    const curlResultRaw = document.querySelector('#curlResultRaw');
     let editingName = '';
     let upstreamCache = new Map();
     let cardsSignature = '';
     let modelOptionsSignature = '';
     let adminToken = localStorage.getItem('codexPoolAdminToken') || '';
     let signinFilter = localStorage.getItem('codexPoolSigninFilter') || 'all';
+    let latestProbeResult = null;
+    let latestCurlResult = null;
     const probingUpstreams = new Set();
     const claudeCheckingUpstreams = new Set();
     const claudeCheckResults = new Map();
@@ -3917,6 +6407,91 @@ function dashboardHtml() {
     }
     hydrateStaticIcons();
     const setToast = (message) => { toast.textContent = message || ''; };
+    const healthValue = (health, snakeName, camelName = snakeName) => health?.[snakeName] ?? health?.[camelName];
+    function probeHealthFromResult(item) {
+      return item?.health || item || {};
+    }
+    function probeResultState(result, health) {
+      if (result?.probe_status === 'skipped') return 'skipped';
+      if (result?.probe_ok === true) return 'ok';
+      if (result?.ok === false) return 'failed';
+      return health?.state || 'unknown';
+    }
+    function probeResultRows(payload, mode) {
+      if (!payload) return [];
+      if (mode === 'one') {
+        const health = probeHealthFromResult(payload);
+        return [{
+          name: payload.upstream || payload.account || payload.name || '当前站点',
+          status: probeResultState(payload, health),
+          health
+        }];
+      }
+      const upstreams = payload.result?.upstreams || payload.upstreams || [];
+      return upstreams.map((upstream) => ({
+        name: upstream.name || 'unknown',
+        status: upstream.enabled === false ? 'skipped' : probeResultState(upstream, upstream.health),
+        health: upstream.health || {},
+        enabled: upstream.enabled
+      }));
+    }
+    function probeSummaryItems(payload, mode, responseOk) {
+      if (!payload) return [];
+      if (mode === 'one') {
+        const health = probeHealthFromResult(payload);
+        return [
+          ['结果', responseOk ? probeStatusText(payload) : '失败'],
+          ['状态', health?.state || 'unknown'],
+          ['HTTP', fmt(healthValue(health, 'http_status', 'httpStatus'))],
+          ['延迟', fmt(healthValue(health, 'latency_ms', 'latencyMs'), 'ms')],
+          ['模型', fmt(healthValue(health, 'models_count', 'modelsCount'))]
+        ];
+      }
+      const summary = payload.summary || {};
+      return [
+        ['结果', responseOk ? probeStatusText(payload) : '失败'],
+        ['可用', String(summary.ok_count ?? 0) + '/' + String(summary.enabled_count ?? summary.total_count ?? 0)],
+        ['失败', fmt(summary.failed_count ?? 0)],
+        ['跳过', fmt(summary.skipped_count ?? 0)],
+        ['总数', fmt(summary.total_count ?? 0)]
+      ];
+    }
+    function renderProbeResult(payload, { mode, title, responseOk = true, error = '' } = {}) {
+      latestProbeResult = { mode, title, responseOk, error, payload, at: new Date().toISOString() };
+      if (!probeResults) return;
+      const rows = probeResultRows(payload, mode);
+      probeResults.hidden = false;
+      probeResultsTitle.textContent = title || '测试结果';
+      probeResultsMeta.textContent = new Date().toLocaleString() + ' · ' + (responseOk ? '请求完成' : '请求失败') + (error ? ' · ' + error : '');
+      probeResultsSummary.innerHTML = probeSummaryItems(payload, mode, responseOk).map(([label, value]) =>
+        '<div class="probe-summary-item"><span>' + esc(label) + '</span><strong title="' + esc(value) + '">' + esc(value) + '</strong></div>'
+      ).join('');
+      probeResultsList.innerHTML = rows.length ? rows.map((row) => {
+        const health = row.health || {};
+        const state = health?.state || row.status || 'unknown';
+        const statusClass = row.status === 'ok' || state === 'ok' ? 'ok' : row.status === 'skipped' ? 'cold' : stateClass(state);
+        const errorText = error || health?.error || health?.warning || '';
+        const feedback = errorText || '模型 ' + fmt(healthValue(health, 'models_count', 'modelsCount')) + ' 个';
+        return '<div class="probe-result-row">'
+          + '<div><small>Upstream</small><strong>' + esc(row.name) + '</strong></div>'
+          + '<div><small>Result</small><span class="probe-state ' + statusClass + '">' + esc(row.status || state) + '</span></div>'
+          + '<div><small>State</small><strong>' + esc(state) + '</strong></div>'
+          + '<div><small>HTTP</small><strong>' + esc(fmt(healthValue(health, 'http_status', 'httpStatus'))) + '</strong></div>'
+          + '<div><small>Latency</small><strong>' + esc(fmt(healthValue(health, 'latency_ms', 'latencyMs'), 'ms')) + '</strong></div>'
+          + '<div class="probe-detail"><small>Feedback</small>' + esc(feedback) + '</div>'
+          + '</div>';
+      }).join('') : '<div class="empty">暂无测试明细。</div>';
+      probeResultsRaw.textContent = JSON.stringify(latestProbeResult, null, 2);
+      probeResults.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+    function clearProbeResult() {
+      latestProbeResult = null;
+      if (!probeResults) return;
+      probeResults.hidden = true;
+      probeResultsSummary.innerHTML = '';
+      probeResultsList.innerHTML = '';
+      probeResultsRaw.textContent = '';
+    }
     function claudeCheckSummary(result) {
       if (!result) return '';
       const modelCount = result.models?.length || 0;
@@ -3970,6 +6545,105 @@ function dashboardHtml() {
         : 'unsupported';
       return \`<div class="claude-result claude-card-result" data-claude-result data-state="\${state}" title="\${esc(result.reason || '')}">\${esc(claudeCheckSummary(result))}</div>\`;
     }
+    function parseOptionalJson(text, label) {
+      const raw = String(text || '').trim();
+      if (!raw) return {};
+      try {
+        return JSON.parse(raw);
+      } catch (error) {
+        throw new Error(\`\${label} 不是合法 JSON：\${error.message}\`);
+      }
+    }
+    function prettyBody(text) {
+      const raw = String(text ?? '');
+      if (!raw.trim()) return '';
+      try {
+        return JSON.stringify(JSON.parse(raw), null, 2);
+      } catch {
+        return raw;
+      }
+    }
+    function curlSummaryItems(result = {}) {
+      const judgement = result.judgement || {};
+      return [
+        ['HTTP', result.status_code || result.statusCode || 0],
+        ['Verdict', judgement.status || (result.ok ? 'ok' : 'failed')],
+        ['Judgement', judgement.judgement_type || 'unknown'],
+        ['Represents', judgement.representative === false ? 'no' : judgement.representative === true ? 'yes' : 'unknown'],
+        ['Evidence', judgement.evidence || 'unknown'],
+        ['Decision', judgement.decision || 'unknown'],
+        ['Scope', judgement.effect_scope || judgement.scope || 'unknown'],
+        ['Authority', judgement.authoritative === false ? 'not authoritative' : 'authoritative'],
+        ['Dispatch', judgement.blocks_dispatch ? 'block' : 'ignore'],
+        ['Latency', fmt(result.latency_ms || result.latencyMs || 0, 'ms')],
+        ['Method', result.method || curlMethod.value],
+        ['Target', result.target_url || '—']
+      ];
+    }
+    function renderCurlResult(result, responseOk = true) {
+      latestCurlResult = result || null;
+      if (!curlResult) return;
+      curlResult.hidden = false;
+      copyCurlResult.disabled = !latestCurlResult;
+      const error = result?.error || '';
+      curlResultSummary.innerHTML = curlSummaryItems(result).map(([label, value]) =>
+        '<div class="probe-summary-item"><span>' + esc(label) + '</span><strong title="' + esc(value) + '">' + esc(value) + '</strong></div>'
+      ).join('') + (error
+        ? '<div class="probe-summary-item"><span>Error</span><strong class="' + (responseOk ? 'warn' : 'bad') + '" title="' + esc(error) + '">' + esc(error) + '</strong></div>'
+        : '');
+      curlResultHeaders.textContent = JSON.stringify(result?.headers || {}, null, 2);
+      curlResultBody.textContent = result?.response_too_large
+        ? '[response body too large]'
+        : prettyBody(result?.body || '');
+      curlResultRaw.textContent = JSON.stringify(result || {}, null, 2);
+      curlResult.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+    function curlPayload() {
+      return {
+        base_url: curlBaseUrl.value.trim(),
+        path: curlPath.value.trim() || '/',
+        method: curlMethod.value,
+        auth_type: curlAuthType.value,
+        api_key: curlApiKey.value.trim(),
+        headers: parseOptionalJson(curlHeaders.value, 'Headers JSON'),
+        body: curlBody.value
+      };
+    }
+    async function runCurlDebugger() {
+      if (!curlBaseUrl.value.trim()) {
+        setToast('请填写 Base URL。');
+        return;
+      }
+      let payload;
+      try {
+        payload = curlPayload();
+      } catch (error) {
+        renderCurlResult({ ok: false, error: error.message, status_code: 0, headers: {}, body: '' }, false);
+        setToast(error.message);
+        return;
+      }
+      sendCurlTest.disabled = true;
+      setButtonLabel(sendCurlTest, 'play', '请求中');
+      renderCurlResult({ ok: true, method: payload.method, target_url: payload.base_url + payload.path, latency_ms: 0, status_code: 0, headers: {}, body: '', error: '请求中' }, true);
+      try {
+        const response = await fetch('/pool/test-curl', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...authHeaders() },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        renderCurlResult(result, response.ok);
+        setToast(response.ok
+          ? \`请求完成：HTTP \${result.status_code}，\${result.latency_ms}ms\`
+          : \`请求失败：\${result.error || 'HTTP ' + result.status_code}\`);
+      } catch (error) {
+        renderCurlResult({ ok: false, error: error.message, status_code: 0, headers: {}, body: '' }, false);
+        setToast(\`请求失败：\${error.message}\`);
+      } finally {
+        sendCurlTest.disabled = false;
+        setButtonLabel(sendCurlTest, 'play', '发送请求');
+      }
+    }
     function formClaudePayload() {
       const form = new FormData(upstreamForm);
       const upstreamName = editingName || String(form.get('name') || '').trim();
@@ -4003,7 +6677,7 @@ function dashboardHtml() {
     const stateClass = (state) => {
       if (state === 'ok') return 'ok';
       if (state === 'models_unsupported' || state === 'unexpected_status' || state === 'unsupported' || state === 'no_amount' || state === 'rate_limited' || state === 'blocked') return 'warn';
-      if (state === 'unknown' || state === 'disabled') return 'cold';
+      if (state === 'unknown' || state === 'disabled' || state === 'advanced_curl_required' || state === 'codex_forward_only') return 'cold';
       return 'bad';
     };
     const fmt = (value, suffix = '') => value === null || value === undefined || value === '' ? '—' : \`\${value}\${suffix}\`;
@@ -4285,7 +6959,7 @@ function dashboardHtml() {
       return models.length === 0 || models.includes(model);
     };
     const hasConfiguredKey = (upstream) => (upstream.keys || []).some((key) => key.configured);
-    const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key'].includes(upstream.health?.state || '');
+    const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key', 'missing_model_override', 'models_unsupported', 'unexpected_status'].includes(upstream.health?.state || '');
     function requestFailureText(request) {
       if (!request || request.outcome === 'ok') return '';
       const upstream = request.upstream ? ' on ' + request.upstream : '';
@@ -4383,7 +7057,9 @@ function dashboardHtml() {
       u.availability?.multiplier ?? '',
       (u.availability?.recent || []).map((value) => value ? '1' : '0').join(''),
       (u.keys || []).map((k) => \`\${k.label}:\${k.configured}\`).join(','),
-      (u.keys || []).map((k) => \`\${k.label}:\${k.health?.state || ''}:\${k.health?.error || ''}\`).join(','),
+      (u.keys || []).map((k) => \`\${k.label}:\${k.health?.state || ''}:\${k.health?.error || ''}:\${k.health?.warning || ''}\`).join(','),
+      u.health?.error || '',
+      u.health?.warning || '',
       (u.health?.models || []).join(','),
       activeModel,
       signinFilter
@@ -4392,8 +7068,9 @@ function dashboardHtml() {
       return (upstream.keys || []).map((key) => {
         const state = key.configured ? key.health?.state || 'ready' : 'missing';
         const className = key.configured ? stateClass(state === 'ready' ? 'ok' : state) : 'bad';
-        const error = key.health?.error ? \` title="\${esc(key.health.error)}"\` : '';
-        return \`<span class="key \${className}"\${error}>\${esc(key.label)}: \${esc(state)}</span>\`;
+        const note = key.health?.error || key.health?.warning || '';
+        const title = note ? \` title="\${esc(note)}"\` : '';
+        return \`<span class="key \${className}"\${title}>\${esc(key.label)}: \${esc(state)}</span>\`;
       }).join('');
     }
     function usageDaysHtml(upstream) {
@@ -4659,7 +7336,7 @@ function dashboardHtml() {
       const nextCardsSignature = cardSignature(ups, activeModel);
       if (nextCardsSignature !== cardsSignature) {
         cards.classList.toggle('stable', Boolean(cardsSignature));
-        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Models</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + ups.map((u, index) => \`
+        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + ups.map((u, index) => \`
         <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'}" data-upstream="\${esc(u.name)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
           <div class="workbench-cell">
             <div class="name">\${esc(u.name)}</div>
@@ -4675,12 +7352,9 @@ function dashboardHtml() {
           <div class="workbench-cell">
             <div class="mini-line">Weight <strong data-field="weight">\${u.weight}</strong> -> <strong data-field="selection_weight">\${fmt(u.selection_weight)}</strong> · Score <strong data-field="selection_score">\${fmt(u.selection_score)}</strong></div>
             \${availabilityHtml(u)}
+            <div class="mini-line">Models <strong data-field="models_count">\${fmt(u.health?.models_count)}</strong> · Active <strong>\${activeModel ? esc(activeModel) : 'Following request'}</strong></div>
             <div class="mini-line">Cooldown <strong data-field="cooldown">\${Math.ceil((u.cooldown_ms || 0) / 1000)}s</strong></div>
             <div class="mini-line">Failures <strong data-field="failures">\${u.failures}</strong></div>
-          </div>
-          <div class="workbench-cell">
-            <div class="mini-line">Discovered <strong data-field="models_count">\${fmt(u.health?.models_count)}</strong></div>
-            <div class="mini-line">Active <strong>\${activeModel ? esc(activeModel) : 'Following request'}</strong></div>
           </div>
           <div class="workbench-cell">
             <div class="mini-line">Calls <strong data-field="calls">\${u.stats?.attempts || 0}</strong></div>
@@ -4719,10 +7393,31 @@ function dashboardHtml() {
       markEditingCard();
     }
     async function probeAll() {
-      const response = await fetch('/pool/probe', { method: 'POST', headers: authHeaders() });
-      const result = await response.json();
-      setToast(response.ok ? '全部站点探测完成。' : \`全部探测失败：\${result.error || response.status}\`);
+      renderProbeResult({ probe_status: 'running', summary: { total_count: upstreamCache.size, enabled_count: [...upstreamCache.values()].filter((upstream) => upstream.enabled).length } }, { mode: 'all', title: '全部测试结果', responseOk: true, error: '测试中' });
+      try {
+        const response = await fetch('/pool/probe', { method: 'POST', headers: authHeaders() });
+        const result = await response.json();
+        const enabledCount = result.summary?.enabled_count ?? result.summary?.total_count ?? 0;
+        renderProbeResult(result, { mode: 'all', title: '全部测试结果', responseOk: response.ok, error: response.ok ? '' : result.error || String(response.status) });
+        setToast(response.ok
+          ? (result.probe_ok
+            ? \`全部站点探测通过：\${result.summary?.ok_count ?? 0}/\${enabledCount}\`
+            : \`全部站点探测完成：\${result.summary?.ok_count ?? 0}/\${enabledCount} 可用\`)
+          : \`全部探测失败：\${result.error || response.status}\`);
+      } catch (error) {
+        renderProbeResult({ ok: false, error: error.message }, { mode: 'all', title: '全部测试结果', responseOk: false, error: error.message });
+        setToast(\`全部探测失败：\${error.message}\`);
+      }
       await load();
+    }
+    function probeStatusText(result) {
+      if (result.probe_status === 'running') return '测试中';
+      if (result.probe_status === 'skipped') return '待真实探测';
+      return result.probe_ok ? '通过' : '未通过';
+    }
+    function probeStatusNote(result) {
+      if (result.probe_status === 'skipped') return '，待真实探测';
+      return \`，真实探测\${probeStatusText(result)}\`;
     }
     async function probeOne(name) {
       probingUpstreams.add(name);
@@ -4735,10 +7430,12 @@ function dashboardHtml() {
       try {
         const response = await fetch(\`/pool/upstreams/\${encodeURIComponent(name)}/probe\`, { method: 'POST', headers: authHeaders() });
         const result = await response.json();
+        renderProbeResult(result, { mode: 'one', title: \`\${name} 测试结果\`, responseOk: response.ok, error: response.ok ? '' : result.error || String(response.status) });
         setToast(response.ok
-          ? \`\${name} 测试完成：\${result.health?.state || 'unknown'}，模型 \${result.health?.modelsCount ?? result.health?.models_count ?? 0} 个\`
+          ? \`\${name} 测试\${probeStatusText(result)}：\${result.health?.state || 'unknown'}，模型 \${result.health?.modelsCount ?? result.health?.models_count ?? 0} 个\`
           : \`\${name} 测试失败：\${result.error || response.status}\`);
       } catch (error) {
+        renderProbeResult({ ok: false, upstream: name, error: error.message, health: { state: 'network_error', error: error.message } }, { mode: 'one', title: \`\${name} 测试结果\`, responseOk: false, error: error.message });
         setToast(\`\${name} 测试失败：\${error.message}\`);
       } finally {
         probingUpstreams.delete(name);
@@ -4840,8 +7537,9 @@ function dashboardHtml() {
           body: JSON.stringify({ enabled })
         });
         const result = await response.json();
+        const probeNote = enabled ? probeStatusNote(result) : '';
         setToast(response.ok
-          ? \`\${name} 已\${enabled ? '启用' : '停用'}，状态：\${result.health?.state || 'unknown'}\`
+          ? \`\${name} 已\${enabled ? '启用' : '停用'}，状态：\${result.health?.state || 'unknown'}\${probeNote}\`
           : \`\${name} 切换失败：\${result.error || response.status}\`);
       } catch (error) {
         setToast(\`\${name} 切换失败：\${error.message}\`);
@@ -4960,10 +7658,34 @@ function dashboardHtml() {
     document.querySelector('#refresh').addEventListener('click', load);
     document.querySelector('#probeAll').addEventListener('click', probeAll);
     document.querySelector('#billingAll').addEventListener('click', probeBillingAll);
+    clearProbeResults.addEventListener('click', clearProbeResult);
+    copyProbeResults.addEventListener('click', async () => {
+      if (!latestProbeResult) {
+        setToast('暂无测试结果可复制。');
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(latestProbeResult, null, 2));
+        setToast('测试结果 JSON 已复制。');
+      } catch (error) {
+        setToast('复制失败：' + error.message);
+      }
+    });
     importUpstreams.addEventListener('click', importUpstreamsFromFile);
     checkClaude.addEventListener('click', checkClaudeForForm);
     document.querySelector('#downloadUsageCsv').addEventListener('click', () => downloadUsage('csv'));
     document.querySelector('#downloadUsageJson').addEventListener('click', () => downloadUsage('json'));
+    sendCurlTest.addEventListener('click', runCurlDebugger);
+    copyCurlResult.addEventListener('click', async () => {
+      if (!latestCurlResult) return;
+      await navigator.clipboard.writeText(JSON.stringify(latestCurlResult, null, 2));
+      setToast('Curl 测试结果 JSON 已复制。');
+    });
+    curlMethod.addEventListener('change', () => {
+      const noBody = curlMethod.value === 'GET' || curlMethod.value === 'HEAD';
+      curlBody.disabled = noBody;
+    });
+    curlBody.disabled = curlMethod.value === 'GET' || curlMethod.value === 'HEAD';
     function toggleTokenBreakdown() {
       const hidden = totalTokenBreakdown.hasAttribute('hidden');
       totalTokenBreakdown.toggleAttribute('hidden', !hidden);
@@ -5075,8 +7797,9 @@ function dashboardHtml() {
       });
       const result = await response.json();
       const apiNote = result.api_detected || payload.api ? \`，协议：\${result.api || payload.api}\` : '';
+      const probeNote = response.ok ? probeStatusNote(result) : '';
       setToast(response.ok
-        ? \`\${payload.replace ? '已保存' : '已添加'}：\${result.upstream}，探测状态：\${result.health?.state}\${apiNote}\`
+        ? \`\${payload.replace ? '已保存' : '已添加'}：\${result.upstream}，探测状态：\${result.health?.state}\${probeNote}\${apiNote}\`
         : \`\${payload.replace ? '保存失败' : '添加失败'}：\${result.error}\`);
       if (response.ok) resetEdit();
       await load();
@@ -5104,7 +7827,9 @@ function createStatusPayload(config, state) {
       override: state.modelOverride,
       known: knownModels(state)
     },
-    recent_requests: state.recentRequests,
+    recent_requests: config.debug?.capture_request_headers === true
+      ? state.recentRequests
+      : stripRequestDebugFields(state.recentRequests),
     health: {
       enabled: config.health?.enabled !== false,
       interval_ms: Number(config.health?.interval_ms || 60000),
@@ -5122,8 +7847,9 @@ function createStatusPayload(config, state) {
     billing: aggregateBilling(state.upstreams),
     upstreams: state.upstreams.map((upstream) => {
       const availability = availabilitySummary(upstream.stats, state.availability);
-      const available = upstreamAvailable(upstream, at);
+      const available = upstreamAvailable(upstream, at, state.modelOverride);
       const selectionWeight = upstreamSelectionWeight(upstream, availability);
+      const effectiveHealthState = healthProbeEffectiveState(upstream.health, state.modelOverride);
       return {
         name: upstream.name,
         base_url: upstream.baseUrl,
@@ -5134,7 +7860,8 @@ function createStatusPayload(config, state) {
         signin_completed_date: visibleSigninCompletedDate(upstream.signinAvailable, upstream.signinCompletedDate, today),
         proxy_url: upstream.proxyUrl || undefined,
         codex_oauth: upstream.codexOAuth,
-        request_mode: upstream.codexOAuth ? 'codex_oauth' : undefined,
+        request_mode: upstream.requestMode,
+        resolved_request_mode: upstream.resolvedRequestMode || undefined,
         oauth_expires_at: upstream.oauthExpiresAt || undefined,
         oauth_client_id: upstream.oauthClientId || undefined,
         oauth_email: upstream.oauthEmail || undefined,
@@ -5163,12 +7890,15 @@ function createStatusPayload(config, state) {
         quota: upstream.quota,
         billing: billingPayload(upstream.billing, upstream.billingConfig),
         health: {
-          state: upstream.health.state,
+          state: effectiveHealthState,
+          raw_state: upstream.health.state,
           checked_at: upstream.health.checkedAt,
           latency_ms: upstream.health.latencyMs,
           http_status: upstream.health.httpStatus,
-          error: upstream.health.error,
+          error: healthProbeEffectiveError(upstream.health, state.modelOverride),
+          warning: upstream.health.warning || '',
           diagnostics: upstream.health.diagnostics || undefined,
+          probe_model: upstream.health.probeModel || '',
           models: upstream.health.models || [],
           models_count: upstream.health.modelsCount,
           key_label: upstream.health.keyLabel
@@ -5187,7 +7917,8 @@ function createStatusPayload(config, state) {
             checked_at: key.health.checkedAt,
             latency_ms: key.health.latencyMs,
             http_status: key.health.httpStatus,
-            error: key.health.error
+            error: key.health.error,
+            warning: key.health.warning || ''
           }
         }))
       };
@@ -5228,6 +7959,7 @@ function createCodexOAuthAccountsPayload(config, state, secrets = {}) {
           latency_ms: upstream.health.latencyMs,
           http_status: upstream.health.httpStatus,
           error: upstream.health.error,
+          warning: upstream.health.warning || '',
           diagnostics: upstream.health.diagnostics || undefined
         } : null
       };
@@ -5378,6 +8110,13 @@ function apiFromImportItem(item) {
   return undefined;
 }
 
+function requestModeFromImportItem(item) {
+  const value = firstString(item.request_mode, item.requestMode, item.wire_api, item.wireApi).toLowerCase();
+  if (!value) return undefined;
+  const mode = normalizeRequestMode(value);
+  return ['responses', 'chat_completions', 'codex_oauth'].includes(mode) ? mode : undefined;
+}
+
 function oauthExtraFromImportItem(item) {
   const credentials = item.credentials && typeof item.credentials === 'object' && !Array.isArray(item.credentials)
     ? item.credentials
@@ -5429,6 +8168,7 @@ function normalizeImportItem(item, index, options = {}) {
     ...(proxyUrl ? { proxy_url: proxyUrl } : {}),
     health_path: codexOAuth ? '' : firstString(item.health_path, item.healthPath, item.models_path, item.modelsPath),
     probe_auth: codexOAuth ? 'none' : probeAuth,
+    request_mode: codexOAuth ? 'codex_oauth' : requestModeFromImportItem(item),
     api: api || undefined,
     probe_headers: item.probe_headers || item.probeHeaders,
     billing: item.billing,
@@ -5632,6 +8372,12 @@ function validateUpstreamPayload(payload, config) {
   const proxyUrlInput = hasOwn('proxy_url') ? payload.proxy_url : existing?.proxy_url;
   const codexOAuthInput = hasOwn('codex_oauth') ? payload.codex_oauth : existing?.codex_oauth;
   const requestModeInput = hasOwn('request_mode') ? payload.request_mode : existing?.request_mode;
+  const requestMode = normalizeRequestMode(requestModeInput, codexOAuthInput === true);
+  if (!['auto', 'responses', 'chat_completions', 'codex_oauth'].includes(requestMode)) {
+    const error = new Error('request_mode must be "auto", "responses", "chat_completions", or "codex_oauth"');
+    error.statusCode = 400;
+    throw error;
+  }
   const oauthExpiresAtInput = hasOwn('oauth_expires_at') ? payload.oauth_expires_at : existing?.oauth_expires_at;
   const oauthClientIdInput = hasOwn('oauth_client_id') ? payload.oauth_client_id : existing?.oauth_client_id;
   const oauthEmailInput = hasOwn('oauth_email') ? payload.oauth_email : existing?.oauth_email;
@@ -5658,8 +8404,8 @@ function validateUpstreamPayload(payload, config) {
     signin_available: signinAvailable,
     signin_completed_date: signinCompletedDate,
     proxy_url: normalizeProxyUrl(proxyUrlInput) || undefined,
-    codex_oauth: codexOAuthInput === true || String(requestModeInput || '').trim().toLowerCase() === 'codex_oauth' || undefined,
-    request_mode: String(requestModeInput || '').trim().toLowerCase() === 'codex_oauth' || codexOAuthInput === true ? 'codex_oauth' : undefined,
+    codex_oauth: codexOAuthInput === true || requestMode === 'codex_oauth' || undefined,
+    request_mode: requestMode === 'auto' ? undefined : requestMode,
     oauth_expires_at: typeof oauthExpiresAtInput === 'string'
       ? oauthExpiresAtInput.trim()
       : undefined,
@@ -5758,6 +8504,8 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     return jsonResponse(res, 200, {
       ok: true,
       service: 'codex-api-pool',
+      pid: process.pid,
+      uptime_s: Math.round(process.uptime()),
       listen: `${config.server?.host || '127.0.0.1'}:${config.server?.port || 8787}`,
       upstreams: state.upstreams.length
     });
@@ -5765,6 +8513,38 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
 
   if (!isAdminAuthorized(req, config)) {
     return jsonResponse(res, 401, { error: 'unauthorized: invalid Codex API pool admin token' });
+  }
+
+  if (req.method === 'GET' && pathname === '/pool/debug-choose') {
+    const at = now();
+    const model = 'gpt-5.5';
+    const log = [];
+
+    let candidates = state.upstreams.filter((upstream) => {
+      const isUpstreamAvail = upstreamAvailable(upstream, at);
+      const keyAvail = upstream.keys.some((key) => keyAvailable(key, at));
+      log.push({
+        upstream: upstream.name,
+        upstreamAvailable: isUpstreamAvail,
+        enabled: upstream.enabled,
+        hasBaseUrl: !!upstream.baseUrl,
+        healthAllowsSelection: healthAllowsSelection(upstream, model),
+        codexOAuthExpired: codexOAuthExpired(upstream, at),
+        cooldownPass: upstream.cooldownUntil <= at,
+        keyAvailable: keyAvail
+      });
+      return isUpstreamAvail && keyAvail;
+    });
+
+    const modelCandidates = candidates.filter((upstream) => upstreamSupportsModel(upstream, model));
+    const knownModelCandidates = modelCandidates.filter((upstream) => upstreamHasKnownModel(upstream, model));
+
+    return jsonResponse(res, 200, {
+      log,
+      candidates: candidates.map(c => c.name),
+      modelCandidates: modelCandidates.map(c => c.name),
+      knownModelCandidates: knownModelCandidates.map(c => c.name)
+    });
   }
 
   if (req.method === 'GET' && (pathname === '/pool/status' || pathname === '/pool/upstreams')) {
@@ -5798,9 +8578,16 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
   }
 
   if (req.method === 'POST' && pathname === '/pool/probe') {
-    await runHealthChecks(state, config);
+    await runHealthChecks(state, config, console, { live: true });
     persistStats(state, statsPath);
-    return jsonResponse(res, 200, { ok: true, result: createStatusPayload(config, state) });
+    const summary = healthProbeSummary(state.upstreams, state.modelOverride);
+    return jsonResponse(res, 200, {
+      ok: true,
+      probe_ok: summary.probe_ok,
+      probe_status: summary.probe_status,
+      summary,
+      result: createStatusPayload(config, state)
+    });
   }
 
   if (req.method === 'POST' && pathname === '/pool/claude-check') {
@@ -5821,6 +8608,12 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     });
   }
 
+  if (req.method === 'POST' && pathname === '/pool/test-curl') {
+    const payload = await readJsonBody(req, maxBodyBytes);
+    const result = await runCurlTest(payload, config);
+    return jsonResponse(res, 200, result);
+  }
+
   if (req.method === 'POST' && pathname === '/pool/billing') {
     await runBillingChecks(state, config);
     persistStats(state, statsPath);
@@ -5833,8 +8626,13 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (model.length > 200) {
       return jsonResponse(res, 400, { error: 'model must be 200 chars or fewer' });
     }
+    const previousModel = state.modelOverride;
     state.modelOverride = model;
     config.model_override = model;
+    if (previousModel !== model) {
+      invalidateHealthForModelChange(state, model);
+      persistStats(state, statsPath);
+    }
     await saveConfig(config, options.configPath);
     return jsonResponse(res, 200, { ok: true, model_override: model });
   }
@@ -5883,7 +8681,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     const upstream = state.upstreams.find((item) => item.name === name);
     const health = upstream?.enabled ? await probeOneUpstream(state, upstream, config) : upstream?.health || null;
     persistStats(state, statsPath);
-    return jsonResponse(res, 200, { ok: true, account: name, enabled: payload.enabled, health });
+    return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, state.modelOverride), account: name, enabled: payload.enabled, health });
   }
 
   const codexOauthProbeMatch = pathname.match(/^\/pool\/codex-oauth\/accounts\/([^/]+)\/probe$/);
@@ -5893,7 +8691,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (!upstream) return jsonResponse(res, 404, { error: `codex oauth account not found: ${name}` });
     const health = await probeOneUpstream(state, upstream, config, { live: true });
     persistStats(state, statsPath);
-    return jsonResponse(res, 200, { ok: true, account: name, health });
+    return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, state.modelOverride), account: name, health });
   }
 
   const enabledMatch = pathname.match(/^\/pool\/upstreams\/([^/]+)\/enabled$/);
@@ -5923,7 +8721,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     const upstream = state.upstreams.find((item) => item.name === name);
     const health = upstream?.enabled ? await probeOneUpstream(state, upstream, config) : upstream?.health || null;
     persistStats(state, statsPath);
-    return jsonResponse(res, 200, { ok: true, upstream: name, enabled: payload.enabled, health });
+    return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, state.modelOverride), upstream: name, enabled: payload.enabled, health });
   }
 
   const signinMatch = pathname.match(/^\/pool\/upstreams\/([^/]+)\/signin$/);
@@ -6057,6 +8855,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
       api_detected: detectedApi,
       persisted: Boolean(options.configPath),
       plaintext_key_warning: upstream.keys.some((key) => key.value) ? 'one or more keys were saved as plaintext values' : null,
+      ...probeResultPayload(health, state.modelOverride),
       health
     });
   }
@@ -6100,7 +8899,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (!upstream) return jsonResponse(res, 404, { error: `upstream not found: ${name}` });
     const health = await probeOneUpstream(state, upstream, config, { live: true });
     persistStats(state, statsPath);
-    return jsonResponse(res, 200, { ok: true, upstream: name, health });
+    return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, state.modelOverride), upstream: name, health });
   }
 
   const billingMatch = pathname.match(/^\/pool\/upstreams\/([^/]+)\/billing$/);
@@ -6159,74 +8958,200 @@ export function createPoolServer(config, options = {}) {
       }
 
       const originalBody = await readBody(req, maxBodyBytes);
-      const originalModel = modelFromBody(req, originalBody);
+      const incomingHeaderSample = captureIncomingRequestHeaders(config, req.headers);
+      const responsesJsonOptions = { inferJsonLike: pathname === '/v1/responses' };
+      const originalModel = modelFromBody(req, originalBody, responsesJsonOptions);
       const requestedModel = isClaudeModel(originalModel)
         ? originalModel
         : state.modelOverride || originalModel;
       const tried = new Set();
       const attempts = [];
       const maxAttempts = Math.max(1, state.retry.maxAttempts);
+      const unsupportedToolTypes = pathname === '/v1/responses'
+        ? unsupportedResponsesToolTypesFromBody(req, originalBody, responsesJsonOptions)
+        : [];
+      const hasUnsupportedResponsesTools = unsupportedToolTypes.length > 0;
+      const unsupportedChatOutputFormatTypes = pathname === '/v1/responses'
+        ? unconvertibleChatOutputFormatTypesFromBody(req, originalBody, responsesJsonOptions)
+        : [];
+      const hasUnsupportedChatOutputFormat = unsupportedChatOutputFormatTypes.length > 0;
+      const unsupportedInputTypes = pathname === '/v1/responses'
+        ? unsupportedResponsesInputTypesFromBody(req, originalBody, responsesJsonOptions)
+        : [];
+      const hasUnsupportedInputTypes = unsupportedInputTypes.length > 0;
+      const requiresNativeResponses = hasUnsupportedResponsesTools || hasUnsupportedChatOutputFormat || hasUnsupportedInputTypes;
+      const originalBodyIsJson = Boolean(jsonObjectFromRequestBody(req, originalBody, responsesJsonOptions));
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        const candidate = chooseCandidate(state, tried, { preferredModel: requestedModel, allowUnknownModelFallback: attempt > 1 });
+
+      let networkAttempt = 1;
+      while (networkAttempt <= maxAttempts) {
+        const candidate = chooseCandidate(state, tried, {
+          preferredModel: requestedModel,
+          allowUnknownModelFallback: networkAttempt > 1,
+          candidateFilter: requiresNativeResponses
+            ? (upstream) => canAttemptNativeResponses(pathname, upstream, requestedModel)
+            : null
+        });
         if (!candidate) break;
 
         const { upstream, key } = candidate;
         tried.add(`${upstream.name}:${key.index}`);
-        upstream.inFlight += 1;
-        const allowRetry = attempt < maxAttempts;
         const attemptedModel = requestedModel;
         const useAnthropicAdapter = shouldUseAnthropicResponsesAdapter(pathname, attemptedModel);
+        const canUseChatAdapter = canUseChatCompletionsAdapter(pathname, upstream, attemptedModel);
+
+        const attempt = networkAttempt;
+        networkAttempt += 1;
+        const allowRetry = attempt < maxAttempts;
+        const allowChatCompletionsAdapter = canUseChatAdapter && !requiresNativeResponses;
+        let useChatCompletionsAdapter = allowChatCompletionsAdapter && (
+          upstream.requestMode === 'chat_completions' ||
+          upstream.resolvedRequestMode === 'chat_completions'
+        );
         const useCodexOAuth = !useAnthropicAdapter && upstream.codexOAuth;
-        const targetUrl = useAnthropicAdapter
+        let targetUrl = useAnthropicAdapter
           ? joinUrlPath(upstream.baseUrl, anthropicMessagesPathForBaseUrl(upstream.baseUrl))
-          : useCodexOAuth
+          : useChatCompletionsAdapter
+            ? joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl))
+            : useCodexOAuth
             ? codexOAuthTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix)
             : joinTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix);
-        const body = useAnthropicAdapter
-          ? buildAnthropicMessagesPayload(rewriteModelInBody(req, originalBody, attemptedModel), attemptedModel)
-          : rewriteModelInBody(req, originalBody, attemptedModel);
+        let body = useAnthropicAdapter
+          ? buildAnthropicMessagesPayload(rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions), attemptedModel)
+          : useChatCompletionsAdapter
+            ? buildChatCompletionsPayload(rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions), attemptedModel)
+          : rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions);
         const requestHeaders = useAnthropicAdapter
           ? buildAnthropicRequestHeaders(targetUrl, key.value, req.headers, upstream.probeHeaders)
           : useCodexOAuth
             ? buildCodexOAuthRequestHeaders(targetUrl, key.value, req.headers, codexOAuthExtraHeaders(upstream))
-            : undefined;
-        const requestMethod = useAnthropicAdapter ? 'POST' : req.method;
+            : useChatCompletionsAdapter || originalBodyIsJson
+              ? buildJsonRequestHeaders(targetUrl, key.value, req.headers)
+              : undefined;
+        const routeTrace = requestRouteTrace({
+          pathname,
+          useAnthropicAdapter,
+          useChatCompletionsAdapter,
+          useCodexOAuth,
+          requiresNativeResponses,
+          unsupportedToolTypes,
+          unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
+          unsupportedInputTypes
+        });
+        let requestHeadersForAttempt = requestHeaders;
+        let requestMethod = useAnthropicAdapter || useChatCompletionsAdapter ? 'POST' : req.method;
+        let attemptTimeoutMs = timeoutMs;
+        if (
+          allowChatCompletionsAdapter &&
+          upstream.requestMode === 'auto' &&
+          !upstream.resolvedRequestMode &&
+          !useChatCompletionsAdapter
+        ) {
+          attemptTimeoutMs = chatFallbackProbeTimeoutMs(config, timeoutMs);
+        }
+        const chatFallbackAutoRetry = allowChatCompletionsAdapter &&
+          !useChatCompletionsAdapter &&
+          upstream.requestMode === 'auto';
+        const retryableStatusForAttempt = requiresNativeResponses
+          ? retryableStatusWithNativeResponsesUnsupported(state.retry.retryableStatus)
+          : state.retry.retryableStatus;
         recordAttempt(upstream, key);
 
-        const result = await requestUpstream({
+        let result = await requestTrackedUpstream({
           req,
           body,
           targetUrl,
           upstream,
           key,
-          timeoutMs,
-          allowRetry,
-          retryableStatus: state.retry.retryableStatus,
+          timeoutMs: attemptTimeoutMs,
+          allowRetry: allowRetry || chatFallbackAutoRetry || requiresNativeResponses,
+          retryableStatus: retryableStatusForAttempt,
           method: requestMethod,
-          headers: requestHeaders
+          headers: requestHeadersForAttempt
         });
+        if (
+          result.type === 'retry' &&
+          allowChatCompletionsAdapter &&
+          !useChatCompletionsAdapter &&
+          upstream.requestMode === 'auto'
+        ) {
+          useChatCompletionsAdapter = true;
+          targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
+          body = buildChatCompletionsPayload(rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions), attemptedModel);
+          requestHeadersForAttempt = buildJsonRequestHeaders(targetUrl, key.value, req.headers);
+          requestMethod = 'POST';
+          Object.assign(routeTrace, requestRouteTrace({
+            pathname,
+            useChatCompletionsAdapter: true,
+            requiresNativeResponses,
+            unsupportedToolTypes,
+            unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
+            unsupportedInputTypes
+          }));
+          result = await requestTrackedUpstream({
+            req,
+            body,
+            targetUrl,
+            upstream,
+            key,
+            timeoutMs,
+            allowRetry,
+            retryableStatus: state.retry.retryableStatus,
+            method: requestMethod,
+            headers: requestHeadersForAttempt
+          });
+          if (result.type === 'response' && result.statusCode >= 200 && result.statusCode < 300) {
+            upstream.resolvedRequestMode = 'chat_completions';
+            upstream.cooldownUntil = 0;
+            upstream.failures = 0;
+            key.cooldownUntil = 0;
+            key.failures = 0;
+          }
+        }
+
+
+
 
         if (result.type === 'response') {
+          if (
+            canUseChatAdapter &&
+            !useChatCompletionsAdapter &&
+            upstream.requestMode === 'auto' &&
+            result.statusCode >= 200 &&
+            result.statusCode < 300
+          ) {
+            upstream.resolvedRequestMode = 'responses';
+          }
           applyQuota(upstream, key, result.response.headers);
           const usageCapture = createUsageCapture(result.response.headers);
           const isSuccessfulAnthropicAdapter = useAnthropicAdapter && result.statusCode >= 200 && result.statusCode < 300;
+          const isSuccessfulChatAdapter = useChatCompletionsAdapter && result.statusCode >= 200 && result.statusCode < 300;
           const adaptAnthropicStream = isSuccessfulAnthropicAdapter && isEventStream(result.response.headers) && isUncompressedResponse(result.response.headers);
           const adaptAnthropicJson = isSuccessfulAnthropicAdapter && !isEventStream(result.response.headers) && isUncompressedResponse(result.response.headers);
-          const normalizeResponsesStream = !adaptAnthropicStream && shouldNormalizeResponsesStream(pathname, result.response.headers);
+          const adaptChatStream = isSuccessfulChatAdapter && isEventStream(result.response.headers) && isUncompressedResponse(result.response.headers);
+          const adaptChatJson = isSuccessfulChatAdapter && !isEventStream(result.response.headers) && isUncompressedResponse(result.response.headers);
+          const normalizeResponsesStream = !adaptAnthropicStream && !adaptChatStream && shouldNormalizeResponsesStream(pathname, result.response.headers);
           const headers = sanitizeResponseHeaders(result.response.headers, upstream.name);
-          if (normalizeResponsesStream || adaptAnthropicStream || adaptAnthropicJson) deleteHeader(headers, 'content-length');
+          if (normalizeResponsesStream || adaptAnthropicStream || adaptAnthropicJson || adaptChatStream || adaptChatJson) deleteHeader(headers, 'content-length');
           if (adaptAnthropicStream) headers['content-type'] = 'text/event-stream; charset=utf-8';
           if (adaptAnthropicJson) headers['content-type'] = 'application/json; charset=utf-8';
+          if (adaptChatStream) headers['content-type'] = 'text/event-stream; charset=utf-8';
+          if (adaptChatJson) headers['content-type'] = 'application/json; charset=utf-8';
+          addRouteTraceHeaders(headers, routeTrace);
           res.writeHead(result.statusCode, headers);
           const anthropicStreamAdapter = adaptAnthropicStream
             ? createAnthropicResponsesStreamAdapter(res, attemptedModel)
+            : null;
+          const chatStreamAdapter = adaptChatStream
+            ? createChatResponsesStreamAdapter(res, attemptedModel)
             : null;
           const responsesCompletionNormalizer = normalizeResponsesStream
             ? createResponsesCompletionNormalizer(res, attemptedModel)
             : null;
           const anthropicJsonChunks = adaptAnthropicJson ? [] : null;
           let anthropicJsonSize = 0;
+          const chatJsonChunks = adaptChatJson ? [] : null;
+          let chatJsonSize = 0;
           let upstreamStreamFinished = false;
 
           const handleUpstreamStreamFailure = (error) => {
@@ -6241,6 +9166,7 @@ export function createPoolServer(config, options = {}) {
               rememberRequest(state, {
                 method: req.method,
                 path: pathname,
+                ...requestDebugFields(incomingHeaderSample),
                 upstream: upstream.name,
                 key: key.label,
                 originalModel: originalModel || null,
@@ -6249,17 +9175,19 @@ export function createPoolServer(config, options = {}) {
                 durationMs: now() - result.startedAt,
                 retried: attempt > 1,
                 outcome: 'client_aborted',
-                reason: 'client disconnected before upstream stream completed'
+                reason: 'client disconnected before upstream stream completed',
+                route: routeTrace
               });
               persistStats(state, statsPath);
               return;
             }
-            recordResponseStats(upstream, key, STREAM_ERROR_STATUS, false);
-            recordAttemptOutcome(state, upstream, key, STREAM_ERROR_STATUS);
+            recordResponseStats(upstream, key, STREAM_ERROR_STATUS, false, false);
+            recordAttemptOutcome(state, upstream, key, false);
             recordFailure(state, upstream, key, reason, STREAM_ERROR_STATUS, undefined);
             rememberRequest(state, {
               method: req.method,
               path: pathname,
+              ...requestDebugFields(incomingHeaderSample),
               upstream: upstream.name,
               key: key.label,
               originalModel: originalModel || null,
@@ -6268,7 +9196,8 @@ export function createPoolServer(config, options = {}) {
               durationMs: now() - result.startedAt,
               retried: attempt > 1,
               outcome: 'stream_error',
-              reason
+              reason,
+              route: routeTrace
             });
             persistStats(state, statsPath);
             if (!res.destroyed) res.destroy(error || new Error(reason));
@@ -6277,9 +9206,13 @@ export function createPoolServer(config, options = {}) {
           result.response.on('data', (chunk) => {
             usageCapture.push(chunk);
             if (anthropicStreamAdapter) anthropicStreamAdapter.write(chunk);
+            else if (chatStreamAdapter) chatStreamAdapter.write(chunk);
             else if (anthropicJsonChunks) {
               anthropicJsonSize += chunk.length;
               anthropicJsonChunks.push(chunk);
+            } else if (chatJsonChunks) {
+              chatJsonSize += chunk.length;
+              chatJsonChunks.push(chunk);
             } else if (responsesCompletionNormalizer) responsesCompletionNormalizer.write(chunk);
             else res.write(chunk);
           });
@@ -6288,25 +9221,40 @@ export function createPoolServer(config, options = {}) {
             if (upstreamStreamFinished) return;
             upstreamStreamFinished = true;
             if (anthropicStreamAdapter) anthropicStreamAdapter.end();
+            else if (chatStreamAdapter) chatStreamAdapter.end();
             else if (anthropicJsonChunks) res.end(anthropicMessageToResponsesJson(Buffer.concat(anthropicJsonChunks, anthropicJsonSize), attemptedModel));
+            else if (chatJsonChunks) res.end(chatCompletionToResponsesJson(Buffer.concat(chatJsonChunks, chatJsonSize), attemptedModel));
             else if (responsesCompletionNormalizer) responsesCompletionNormalizer.end();
             else res.end();
             upstream.inFlight = Math.max(0, upstream.inFlight - 1);
-            recordResponseStats(upstream, key, result.statusCode, false);
+            const capturedUsage = usageCapture.result();
+            const responseSucceeded = result.statusCode >= 200 &&
+              result.statusCode < 400 &&
+              capturedUsage.hasOutput &&
+              !capturedUsage.hasExplicitZeroOutputTokens;
+            const responseReason = responseSucceeded || result.statusCode >= 400
+              ? `HTTP ${result.statusCode}`
+              : capturedUsage.hasExplicitZeroOutputTokens
+                ? `HTTP ${result.statusCode} with output tokens 0`
+                : `HTTP ${result.statusCode} without concrete output`;
+            recordResponseStats(upstream, key, result.statusCode, false, responseSucceeded);
             finishResponseAttempt({
               state,
               upstream,
               key,
               method: req.method,
               pathname,
+              incomingHeaders: incomingHeaderSample,
               originalModel,
               attemptedModel,
               statusCode: result.statusCode,
               startedAt: result.startedAt,
               attempt,
-              reason: `HTTP ${result.statusCode}`,
+              reason: responseReason,
               retryAfter: result.response.headers?.['retry-after'],
-              tokenCount: usageCapture.tokenCount(),
+              tokenCount: capturedUsage.tokens,
+              succeeded: responseSucceeded,
+              routeTrace,
               statsPath
             });
           });
@@ -6323,15 +9271,18 @@ export function createPoolServer(config, options = {}) {
           return;
         }
 
-        upstream.inFlight = Math.max(0, upstream.inFlight - 1);
         applyQuota(upstream, key, result.headers || {});
-        recordResponseStats(upstream, key, result.statusCode, true);
-        recordAttemptOutcome(state, upstream, key, result.statusCode);
+        recordResponseStats(upstream, key, result.statusCode, true, false);
+        recordAttemptOutcome(state, upstream, key, false);
         persistStats(state, statsPath);
-        recordFailure(state, upstream, key, result.reason, result.statusCode, result.retryAfter);
+        const nativeResponsesUnsupported = requiresNativeResponses && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(result.statusCode);
+        if (!nativeResponsesUnsupported) {
+          recordFailure(state, upstream, key, result.reason, result.statusCode, result.retryAfter);
+        }
         rememberRequest(state, {
           method: req.method,
           path: pathname,
+          ...requestDebugFields(incomingHeaderSample),
           upstream: upstream.name,
           key: key.label,
           originalModel: originalModel || null,
@@ -6340,7 +9291,8 @@ export function createPoolServer(config, options = {}) {
           durationMs: now() - result.startedAt,
           retried: true,
           outcome: 'retry',
-          reason: result.reason
+          reason: result.reason,
+          route: routeTrace
         });
         persistStats(state, statsPath);
         attempts.push({
@@ -6348,7 +9300,8 @@ export function createPoolServer(config, options = {}) {
           key: key.label,
           model: attemptedModel || null,
           status: result.statusCode,
-          reason: result.reason
+          reason: result.reason,
+          route: routeTrace
         });
 
         const smallBackoff = Math.min(1000, 100 * attempt);
@@ -6356,28 +9309,57 @@ export function createPoolServer(config, options = {}) {
       }
 
       const lastAttempt = attempts[attempts.length - 1] || null;
+      const nativeResponsesFailure = requiresNativeResponses && pathname === '/v1/responses';
+      const failureStatus = nativeResponsesFailure ? 422 : 502;
+      const failureReason = nativeResponsesFailure
+          ? attempts.length
+          ? nativeResponsesRequiredFailureMessage(unsupportedToolTypes, unsupportedChatOutputFormatTypes, unsupportedInputTypes)
+          : noNativeResponsesCandidateMessage(unsupportedToolTypes, unsupportedChatOutputFormatTypes, unsupportedInputTypes)
+        : attempts.length
+          ? 'all upstream attempts failed'
+          : 'no available upstream candidate';
+      const failureRouteTrace = requestRouteTrace({
+        pathname,
+        requiresNativeResponses,
+        unsupportedToolTypes,
+        unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
+        unsupportedInputTypes
+      });
       rememberRequest(state, {
         method: req.method,
         path: pathname,
+        ...requestDebugFields(incomingHeaderSample),
         upstream: lastAttempt?.upstream || null,
         key: lastAttempt?.key || null,
         originalModel: originalModel || null,
         actualModel: requestedModel || null,
-        status: 502,
+        status: failureStatus,
         durationMs: null,
         retried: attempts.length > 1,
         outcome: 'failed',
-        reason: attempts.length ? 'all upstream attempts failed' : 'no available upstream candidate'
+        reason: failureReason,
+        route: failureRouteTrace
       });
       persistStats(state, statsPath);
 
-      return jsonResponse(res, 502, {
-        error: 'all upstream attempts failed',
+      const failurePayload = {
+        error: failureReason,
         attempts
-      });
+      };
+      if (nativeResponsesFailure) {
+        if (unsupportedToolTypes.length > 0) failurePayload.unsupported_tool_types = unsupportedToolTypes;
+        if (unsupportedChatOutputFormatTypes.length > 0) failurePayload.unsupported_output_format_types = unsupportedChatOutputFormatTypes;
+        if (unsupportedInputTypes.length > 0) failurePayload.unsupported_input_types = unsupportedInputTypes;
+        failurePayload.incompatible_upstreams = nativeResponsesCandidateDiagnostics(state, pathname, requestedModel, tried);
+        failurePayload.route = failureRouteTrace;
+      }
+      return jsonResponse(res, failureStatus, failurePayload);
     } catch (error) {
       const statusCode = error.statusCode || 500;
-      return jsonResponse(res, statusCode, { error: error.message });
+      const payload = { error: error.message };
+      if (Array.isArray(error.unsupportedToolTypes)) payload.unsupported_tool_types = error.unsupportedToolTypes;
+      if (Array.isArray(error.unsupportedOutputFormatTypes)) payload.unsupported_output_format_types = error.unsupportedOutputFormatTypes;
+      return jsonResponse(res, statusCode, payload);
     }
   });
 
@@ -6385,6 +9367,7 @@ export function createPoolServer(config, options = {}) {
   server.config = config;
   server.healthTimer = healthTimer;
   server.statsPath = statsPath;
+  server.shuttingDown = false;
 
   server.on('close', () => {
     if (healthTimer) clearInterval(healthTimer);
@@ -6394,6 +9377,33 @@ export function createPoolServer(config, options = {}) {
   server.on('clientError', (error, socket) => {
     logger.warn?.(`[client-error] ${error.message}`);
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  });
+
+  server.shutdown = (shutdownOptions = {}) => new Promise((resolve) => {
+    if (server.shuttingDown) {
+      resolve({ alreadyShuttingDown: true });
+      return;
+    }
+    server.shuttingDown = true;
+    const graceMs = Math.max(1000, Number(
+      shutdownOptions.timeoutMs
+      || serverConfig.graceful_shutdown_ms
+      || DEFAULT_GRACEFUL_SHUTDOWN_MS
+    ));
+    if (healthTimer) clearInterval(healthTimer);
+    flushStats(state, statsPath);
+    server.closeIdleConnections?.();
+    const forceTimer = setTimeout(() => {
+      logger.warn?.(`[shutdown] forcing open connections closed after ${graceMs}ms`);
+      server.closeAllConnections?.();
+    }, graceMs);
+    forceTimer.unref?.();
+    server.close((error) => {
+      clearTimeout(forceTimer);
+      if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') logger.warn?.(`[shutdown] ${error.message}`);
+      flushStats(state, statsPath);
+      resolve({ error });
+    });
   });
 
   return server;
@@ -6412,6 +9422,12 @@ export async function loadConfig(configPath = process.env.CODEX_POOL_CONFIG || D
   return { config, configPath: resolved };
 }
 
+export const __testInternals = {
+  openHttpProxyTunnel,
+  guardHttp2SessionSocket,
+  runCurlTest
+};
+
 export async function start(configPath) {
   const loaded = await loadConfig(configPath);
   const config = loaded.config;
@@ -6422,27 +9438,57 @@ export async function start(configPath) {
     statsPath: path.resolve(path.dirname(loaded.configPath), config.stats?.path || 'stats.local.json')
   });
 
-  server.listen(port, host, () => {
-    const authEnv = config.server?.auth_token_env;
-    const authMessage = authEnv
-      ? process.env[authEnv]
-        ? `auth=${authEnv}:${maskSecret(process.env[authEnv])}`
-        : `auth=${authEnv}:missing-deny`
-      : 'auth=disabled';
-    console.log(`[codex-api-pool] listening on http://${host}:${port}${normalizePrefix(config.server?.public_prefix || '/v1')} (${authMessage})`);
-    console.log(`[codex-api-pool] config ${loaded.configPath}`);
-    for (const upstream of server.state.upstreams) {
-      const configuredKeys = upstream.keys.filter((key) => key.value).map((key) => key.label).join(', ') || 'no configured key';
-      console.log(`[codex-api-pool] upstream ${upstream.name} -> ${upstream.baseUrl} keys=[${configuredKeys}] weight=${upstream.weight}`);
-    }
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      const authEnv = config.server?.auth_token_env;
+      const authMessage = authEnv
+        ? process.env[authEnv]
+          ? `auth=${authEnv}:${maskSecret(process.env[authEnv])}`
+          : `auth=${authEnv}:missing-deny`
+        : 'auth=disabled';
+      console.log(`[codex-api-pool] listening on http://${host}:${port}${normalizePrefix(config.server?.public_prefix || '/v1')} (${authMessage})`);
+      console.log(`[codex-api-pool] config ${loaded.configPath}`);
+      for (const upstream of server.state.upstreams) {
+        const configuredKeys = upstream.keys.filter((key) => key.value).map((key) => key.label).join(', ') || 'no configured key';
+        console.log(`[codex-api-pool] upstream ${upstream.name} -> ${upstream.baseUrl} keys=[${configuredKeys}] weight=${upstream.weight}`);
+      }
+      resolve();
+    };
+    server.once('error', onError);
+    server.listen(port, host, onListening);
   });
 
-  const shutdown = () => {
-    console.log('[codex-api-pool] shutting down');
-    server.close(() => process.exit(0));
+  const shutdownMs = Number(config.server?.graceful_shutdown_ms || DEFAULT_GRACEFUL_SHUTDOWN_MS);
+  let shutdownStarted = false;
+  const shutdown = async (reason, exitCode = 0) => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    console.log(`[codex-api-pool] shutting down (${reason})`);
+    const hardExitTimer = setTimeout(() => {
+      console.error(`[codex-api-pool] shutdown exceeded ${shutdownMs}ms; exiting`);
+      process.exit(exitCode);
+    }, shutdownMs + 1000);
+    hardExitTimer.unref?.();
+    await server.shutdown({ timeoutMs: shutdownMs });
+    clearTimeout(hardExitTimer);
+    process.exit(exitCode);
   };
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', () => shutdown('SIGINT', 0));
+  process.once('SIGTERM', () => shutdown('SIGTERM', 0));
+  process.once('uncaughtException', (error) => {
+    console.error(`[codex-api-pool] uncaught exception: ${error.stack || error.message}`);
+    shutdown('uncaughtException', 1);
+  });
+  process.once('unhandledRejection', (reason) => {
+    const message = reason?.stack || reason?.message || String(reason);
+    console.error(`[codex-api-pool] unhandled rejection: ${message}`);
+    shutdown('unhandledRejection', 1);
+  });
 
   return server;
 }

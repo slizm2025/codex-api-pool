@@ -8,7 +8,14 @@
     "start": "node src/server.mjs",
     "smoke": "node test/smoke-test.mjs",
     "add": "node scripts/add-upstream.mjs",
-    "model": "node scripts/set-model.mjs"
+    "model": "node scripts/set-model.mjs",
+    "service": "node scripts/service.mjs",
+    "service:install": "node scripts/service.mjs install",
+    "service:uninstall": "node scripts/service.mjs uninstall",
+    "service:start": "node scripts/service.mjs start",
+    "service:stop": "node scripts/service.mjs stop",
+    "service:restart": "node scripts/service.mjs restart",
+    "service:status": "node scripts/service.mjs status"
   },
   "engines": {
     "node": ">=18"

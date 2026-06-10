@@ -1,8 +1,10 @@
 import http from 'node:http';
+import net from 'node:net';
+import tls from 'node:tls';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createPoolServer } from '../src/server.mjs';
+import { __testInternals, createPoolServer } from '../src/server.mjs';
 import { resolveModelArg, summarizeStatus } from '../scripts/set-model.mjs';
 
 const statsRoot = await mkdtemp(path.join(tmpdir(), 'codex-api-pool-smoke-'));
@@ -74,6 +76,69 @@ function createFakeUpstream(name, handler) {
     req.on('end', () => handler({ name, req, res, body }));
   });
 }
+
+function createConnectProxy() {
+  const server = http.createServer();
+  server.on('connect', (req, clientSocket, head) => {
+    const [host, port] = String(req.url || '').split(':');
+    const targetSocket = net.connect(Number(port || 443), host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head?.length) targetSocket.write(head);
+      targetSocket.pipe(clientSocket);
+      clientSocket.pipe(targetSocket);
+    });
+    targetSocket.on('error', () => clientSocket.destroy());
+    clientSocket.on('error', () => targetSocket.destroy());
+  });
+  return server;
+}
+
+const lateTlsErrorKey = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDeDnT49y/HKRfF
+E4wLfWVkxcdztXTS5z0NWybL/+Canrf1W4eoBoeM3hKaLbRUqIxliWdtjun3PKld
+tXyTcMcOdtoQ3ejBvkaQ42rYycPiYmGujXkC66FHP5d1x3a0yl8VAAhSFebIYPlT
+Hcu9pagzDyCdKgNFRRdPiiheOdeOMAv0qPnOvTCtCVcSA7l+EXiG+l8/ItqlOCmk
+jbqQDZFOy8hC6Dp/mNbMwCrN4Ns1bDKZxfta1iSspTisgU5vmzw0sBMQVQfgSgjS
+Ku+mX4ewPzj3AqCs3jhqDf/uPKUPDnKHqSkHqGTE8I0Jm9MfjrrTniruIPj8aTGr
+cbrqVQ/TAgMBAAECggEBAL5O95MUDj+LCVMesIx8WLSoCIszPb8u7RUQRMzbLDx3
+wMMoQbgQeIWTIbA/cWiI12KCA0FTFVOOCr1EOFMIeaD83WFNPhkloMa2ETFgol/X
+303A87A8D4nHh2AqpaLGOfz+fSMUoCila6j/RUjwu5me4l2vzwPD9fl2N6ihvAqf
+rAiLaR/PjAQV860KgjVjRKtXUZVFDdjupSK13xVdKKv/D1LVRBb7I3B6OFei5G+Y
+a8xYJGeZVeonftvzMq9dhy73NC67lye86J3Exw7uksCfwh3sfDjxl4Jka01Rwuqq
+rcKP7O87IgrS+2Jv+dKmu77JIhqnYNX4csxZUDreXDkCgYEA9mtrLpde3h5VC0CZ
+Y56nFPragXkDZNEd70gDufKZQxNP2OpwYYEiauQZt+8lDew4eGkYhzps4dMhh5nD
+PdAtNHWh6EOb950kpLm2/LxTMYsJaAD1JgOsiMFRjwPuusitJSHDLOdiDaPSNgXk
+nJCVUTndKv8MQvYRZG0h3QBsQh0CgYEA5rCOJTpdTDpwbATosh1b5QmK4nhp1s0V
+8FFb0Zvoeb7NGXS3Bi8OpGjTxKI8gqPZVaG1Jfz9JZvhqRl6iaYkfLBkGZbv2WcV
+lTLU9pWqhIU7fe/iFn72Rvq33cxw7Wd59CeNnFepSivwTzInYVqNU39OKmHLfeE3
+1Yj4BWI89q8CgYADfUHnRv1w570Mi72gS37SLTsq2ivSIaPq33ouB+FjscJPsAIn
+X0y9dr1mfVxo9g9WpSZTw+AG0paG9QZuuaPqOkAwqcRrnS4HpxmQOppy+SUI8/qE
+r0iiJxqgi821l2HcRL4exKf+yXMQkMTL8sAqhkc7dKEX0aQtZ94y4u6lgQKBgEEq
+ZK0NhKdw5qsM4/LUqk3T2UDKRROhkW32fZqDkTM6+9MSDlWX22oEFrY4IiHBSTaQ
+XIyjn5sNIrzS7rONlEcIyO4VniFqpkUkO9aARs/ylvCnX9V8/fLlBiWIh+n4ThHz
+TmR4uuCx8stcXpV4r+2DS8BbKdGgWlZev7k9m/0PAoGAY/ZpI9VJoXBLGEWze+BN
+TGS8YsW7HcXCljqfItaCRtH9ZcIG6PvaRqG3FeuHmM7w9vVMkfISBUuK25xiu57/
+zRsD/gELmpQ5L3ZlCNDeGxNJo++FJ5bjHeWFczbET7Jf9LPZuIpfaRB6Y/rGv4V1
+AKbzUTYS6G81quBHTLufI8c=
+-----END PRIVATE KEY-----`;
+
+const lateTlsErrorCert = `-----BEGIN CERTIFICATE-----
+MIICpDCCAYwCCQDmhbq2yrY7VTANBgkqhkiG9w0BAQsFADAUMRIwEAYDVQQDDAls
+b2NhbGhvc3QwHhcNMjYwNjA5MDYxMTIzWhcNMjYwNjEwMDYxMTIzWjAUMRIwEAYD
+VQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDe
+DnT49y/HKRfFE4wLfWVkxcdztXTS5z0NWybL/+Canrf1W4eoBoeM3hKaLbRUqIxl
+iWdtjun3PKldtXyTcMcOdtoQ3ejBvkaQ42rYycPiYmGujXkC66FHP5d1x3a0yl8V
+AAhSFebIYPlTHcu9pagzDyCdKgNFRRdPiiheOdeOMAv0qPnOvTCtCVcSA7l+EXiG
++l8/ItqlOCmkjbqQDZFOy8hC6Dp/mNbMwCrN4Ns1bDKZxfta1iSspTisgU5vmzw0
+sBMQVQfgSgjSKu+mX4ewPzj3AqCs3jhqDf/uPKUPDnKHqSkHqGTE8I0Jm9MfjrrT
+niruIPj8aTGrcbrqVQ/TAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAIs1KTZdQu3H
+t2S8QR4GKsYtHDFpsxXm/Z/cSz8m6OVdq3bFjMER0GDC6rSy4Dl4YL37AW5jRBOC
+S6IqEo2IqD50inQNULrU68/+OwnOA0sUDTJHINvjiXsCYy0jOrY/fc99bVTW+pGe
+/WSPPZjTqhuEQA98bHviNi0+48Jum0odmRxIweoRn7AYs+UZny3trQmR3UpFyD6L
+I+rIZ0s8UOnTrqbfR5fhUgzmwOZH5/wmNxx5bQ3uKieFlJlETA0EkHTxnStybnUv
+YufnQ0pxWz1KHhrTkW/p+BrtIHSqshC3RPNvRSZGYZbTWgeWewBzH4yu6+auK/dN
+mPUvOW2Y5GE=
+-----END CERTIFICATE-----`;
 
 async function requestJson(url, token) {
   const body = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
@@ -151,9 +216,13 @@ const good = createFakeUpstream('good', ({ req, res, body }) => {
   }
   res.writeHead(200, {
     'content-type': 'application/json',
-    'x-saw-authorization': req.headers.authorization ? 'yes' : 'no'
+    'x-saw-authorization': req.headers.authorization ? 'yes' : 'no',
+    'x-saw-x-api-key': req.headers['x-api-key'] ? 'yes' : 'no',
+    'x-saw-api-key': req.headers['api-key'] ? 'yes' : 'no',
+    'x-saw-anthropic-version': req.headers['anthropic-version'] ? 'yes' : 'no',
+    'x-saw-openai-organization': req.headers['openai-organization'] ? 'yes' : 'no'
   });
-  res.end(JSON.stringify({ ok: true, body: JSON.parse(body) }));
+  res.end(JSON.stringify({ ok: true, id: 'resp_good', object: 'response', output_text: 'ok', body: JSON.parse(body) }));
 });
 
 const added = createFakeUpstream('added', ({ req, res, body }) => {
@@ -163,7 +232,7 @@ const added = createFakeUpstream('added', ({ req, res, body }) => {
     return;
   }
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ ok: true, added: true, body: JSON.parse(body) }));
+  res.end(JSON.stringify({ ok: true, id: 'resp_added', object: 'response', output_text: 'ok', added: true, body: JSON.parse(body) }));
 });
 
 const usageUpstream = createFakeUpstream('usage-site', ({ req, res, body }) => {
@@ -183,11 +252,32 @@ const usageUpstream = createFakeUpstream('usage-site', ({ req, res, body }) => {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({
     ok: true,
+    output_text: 'usage-ok',
     body: payload,
     usage: {
       input_tokens: 11,
       output_tokens: 26,
       total_tokens: 37
+    }
+  }));
+});
+
+const zeroOutputUsage = createFakeUpstream('zero-output-usage', ({ req, res }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    id: 'resp_zero_output',
+    object: 'response',
+    output_text: 'looks-ok-but-no-output-tokens',
+    output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'looks-ok-but-no-output-tokens' }] }],
+    usage: {
+      input_tokens: 9,
+      output_tokens: 0,
+      total_tokens: 9
     }
   }));
 });
@@ -209,6 +299,229 @@ const responsesMissingCompleted = createFakeUpstream('responses-missing-complete
   res.end(JSON.stringify({ ok: true }));
 });
 
+const responsesDataOnly = createFakeUpstream('responses-data-only', ({ req, res }) => {
+  if (req.url.endsWith('/models') || req.url.endsWith('/responses')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
+const responsesObjectOnly = createFakeUpstream('responses-object-only', ({ req, res }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  if (req.url.endsWith('/responses')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_object_only', object: 'response' }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
+const chatChoicesEmpty = createFakeUpstream('chat-choices-empty', ({ req, res }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  if (req.url.endsWith('/responses')) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'responses unsupported' }));
+    return;
+  }
+  if (req.url.endsWith('/chat/completions')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'chatcmpl_empty', object: 'chat.completion', choices: [] }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
+const anthropicContentEmpty = createFakeUpstream('anthropic-content-empty', ({ req, res }) => {
+  if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'claude-opus-test' }] }));
+    return;
+  }
+  if (req.url === '/v1/messages' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_empty',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-opus-test'
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
+let chatOnlyResponsesHits = 0;
+let chatOnlyChatHits = 0;
+const chatOnly = createFakeUpstream('chat-only', ({ req, res, body }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'models unsupported' }));
+    return;
+  }
+  if (req.url.endsWith('/responses')) {
+    chatOnlyResponsesHits += 1;
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'responses unsupported' }));
+    return;
+  }
+  if (req.url.endsWith('/chat/completions')) {
+    chatOnlyChatHits += 1;
+    const payload = JSON.parse(body);
+    const leakedFields = ['previous_response_id', 'include', 'reasoning', 'text', 'truncation', 'background', 'conversation']
+      .filter((field) => Object.prototype.hasOwnProperty.call(payload, field));
+    if (leakedFields.length > 0) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'expected chat payload to be scrubbed of Responses-only fields', leakedFields, payload }));
+      return;
+    }
+    const lastContent = payload.messages.at(-1)?.content;
+    if (!['test-model', 'gpt-5.5'].includes(payload.model) || !Array.isArray(payload.messages) || !['hello', 'ping', 'please use tool'].includes(lastContent)) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'expected chat completions payload', payload }));
+      return;
+    }
+    if (lastContent === 'please use tool') {
+      const tool = payload.tools?.[0];
+      if (
+        tool?.type !== 'function' ||
+        tool.function?.name !== 'lookup_weather' ||
+        tool.function?.parameters?.properties?.location?.type !== 'string' ||
+        payload.tool_choice?.type !== 'function' ||
+        payload.tool_choice?.function?.name !== 'lookup_weather'
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected chat tool payload', payload }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-tool-json',
+        object: 'chat.completion',
+        created: 1,
+        model: 'test-model',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: 'call_chat_weather',
+              type: 'function',
+              function: { name: 'lookup_weather', arguments: '{"location":"Shanghai"}' }
+            }]
+          },
+          finish_reason: 'tool_calls'
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+      }));
+      return;
+    }
+    if (payload.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-stream', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-stream', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: { content: 'pong' }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: 'chatcmpl-stream', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } })}\n\n`);
+      res.end('data: [DONE]\n\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-json',
+      object: 'chat.completion',
+      created: 1,
+      model: 'test-model',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 }
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
+let cachedChatThenNativeResponsesHits = 0;
+let cachedChatThenNativeChatHits = 0;
+const cachedChatThenNative = createFakeUpstream('cached-chat-then-native', ({ req, res, body }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  if (req.url.endsWith('/responses')) {
+    cachedChatThenNativeResponsesHits += 1;
+    const payload = JSON.parse(body || '{}');
+    const hasNativeResponsesFeature = Array.isArray(payload.tools)
+      && payload.tools.some((tool) => tool?.type && tool.type !== 'function');
+    const hasNativeToolChoice = payload.tool_choice?.type
+      && !['function', 'auto', 'none', 'required'].includes(payload.tool_choice.type);
+    const hasNativeOnlyTextFormat = payload.text?.format?.type === 'grammar';
+    const hasNativeOnlyInput = Array.isArray(payload.input) && payload.input.some((item) => {
+      if (!item || typeof item !== 'object') return false;
+      if (item.type && !['message', 'function_call', 'function_call_output'].includes(item.type)) return true;
+      const content = item.content ?? item.text ?? item.message;
+      return Array.isArray(content) && content.some((block) => block && typeof block === 'object' && block.type && !['text', 'input_text', 'output_text'].includes(block.type));
+    });
+    if (!hasNativeResponsesFeature && !hasNativeToolChoice && !hasNativeOnlyTextFormat && !hasNativeOnlyInput) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'responses unsupported for plain requests' }));
+      return;
+    }
+    if (payload.metadata?.wrong_content_type_test === true && req.headers['content-type'] !== 'application/json') {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'expected proxy to normalize JSON content-type for native Responses', headers: req.headers, payload }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      id: 'resp_cached_native',
+      object: 'response',
+      output_text: 'native-ok',
+      body: payload
+    }));
+    return;
+  }
+  if (req.url.endsWith('/chat/completions')) {
+    cachedChatThenNativeChatHits += 1;
+    const payload = JSON.parse(body || '{}');
+    const leakedNativeTool = payload.tools?.find?.((tool) => tool?.type && tool.type !== 'function');
+    const leakedNativeToolChoice = payload.tool_choice?.type
+      && !['function', 'auto', 'none', 'required'].includes(payload.tool_choice.type);
+    if (leakedNativeTool || leakedNativeToolChoice) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'native Responses tool state must not be converted to chat', leakedNativeTool, leakedNativeToolChoice, payload }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-cached-json',
+      object: 'chat.completion',
+      created: 1,
+      model: payload.model,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'cached-pong' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 }
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
+let anthropicMessagesHits = 0;
 const anthropicMessages = createFakeUpstream('anthropic-messages', ({ req, res, body }) => {
   if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -220,7 +533,58 @@ const anthropicMessages = createFakeUpstream('anthropic-messages', ({ req, res, 
     res.end(JSON.stringify({ error: 'expected anthropic messages auth and path' }));
     return;
   }
+  anthropicMessagesHits += 1;
   const payload = JSON.parse(body);
+  const leakedFields = ['previous_response_id', 'include', 'reasoning', 'text', 'truncation', 'parallel_tool_calls']
+    .filter((field) => Object.prototype.hasOwnProperty.call(payload, field));
+  if (leakedFields.length > 0) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'expected anthropic payload to be scrubbed of Responses-only fields', leakedFields, payload }));
+    return;
+  }
+  const firstMessageText = payload.messages?.[0]?.content?.find?.((block) => block?.type === 'text')?.text || '';
+  if (firstMessageText === 'need weather') {
+    const tool = payload.tools?.[0];
+    const toolUse = payload.messages?.[1]?.content?.[0];
+    const toolResult = payload.messages?.[2]?.content?.[0];
+    if (
+      tool?.name !== 'lookup_weather' ||
+      tool.input_schema?.properties?.location?.type !== 'string' ||
+      payload.tool_choice?.type !== 'tool' ||
+      payload.tool_choice?.name !== 'lookup_weather' ||
+      toolUse?.type !== 'tool_use' ||
+      toolUse.id !== 'call_weather_1' ||
+      toolUse.name !== 'lookup_weather' ||
+      toolUse.input?.location !== 'Shanghai' ||
+      toolResult?.type !== 'tool_result' ||
+      toolResult.tool_use_id !== 'call_weather_1' ||
+      !String(toolResult.content || '').includes('sunny')
+    ) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unexpected anthropic tool payload', payload }));
+      return;
+    }
+    if (payload.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_tool_test', type: 'message', role: 'assistant', model: payload.model, usage: { input_tokens: 4, output_tokens: 1 } } })}\n\n`);
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_weather_2', name: 'lookup_weather', input: {} } })}\n\n`);
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"location":"Shanghai"}' } })}\n\n`);
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+      res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 3 } })}\n\n`);
+      res.end(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_tool_test',
+      type: 'message',
+      role: 'assistant',
+      model: payload.model,
+      content: [{ type: 'tool_use', id: 'toolu_weather_2', name: 'lookup_weather', input: { location: 'Shanghai' } }],
+      usage: { input_tokens: 4, output_tokens: 3 }
+    }));
+    return;
+  }
   const userText = payload.messages?.[0]?.content?.[0]?.text || '';
   if (payload.model !== 'claude-opus-test' || payload.max_tokens !== 128 || userText !== 'hello claude') {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -336,10 +700,16 @@ const cloudflareTimeout = createFakeUpstream('cloudflare-timeout', ({ req, res }
   res.end('<!doctype html><title>522: Connection timed out</title>');
 });
 
-const streamAbort = createFakeUpstream('stream-abort', ({ req, res }) => {
+const streamAbort = createFakeUpstream('stream-abort', ({ req, res, body }) => {
   if (req.url.endsWith('/models')) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  const payload = JSON.parse(body || '{}');
+  if (!payload.stream) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_stream_probe', object: 'response', output: [], output_text: 'ok' }));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -355,13 +725,25 @@ const nextModelSite = createFakeUpstream('next-model-site', ({ req, res, body })
     return;
   }
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ ok: true, body: JSON.parse(body) }));
+  res.end(JSON.stringify({ ok: true, id: 'resp_next_model', object: 'response', output_text: 'ok', body: JSON.parse(body) }));
 });
 
 const anthropicModels = createFakeUpstream('anthropic-models', ({ req, res }) => {
   if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ data: [{ id: 'claude-sonnet-test' }] }));
+    return;
+  }
+  if (req.url === '/v1/messages' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_anthropic_probe',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-test',
+      content: [{ type: 'text', text: 'ok' }],
+      usage: { input_tokens: 1, output_tokens: 1 }
+    }));
     return;
   }
   res.writeHead(401, { 'content-type': 'application/json' });
@@ -374,6 +756,28 @@ const dualProtocolModels = createFakeUpstream('dual-protocol-models', ({ req, re
     res.end(JSON.stringify({ data: [{ id: 'claude-sonnet-test' }] }));
     return;
   }
+  if (req.url === '/v1/messages' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_dual_probe',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-test',
+      content: [{ type: 'text', text: 'ok' }],
+      usage: { input_tokens: 1, output_tokens: 1 }
+    }));
+    return;
+  }
+  if (req.url === '/v1/responses' && req.headers.authorization === 'Bearer upstream-secret') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'resp_dual_probe',
+      object: 'response',
+      output: [],
+      output_text: 'ok'
+    }));
+    return;
+  }
   if (req.url === '/v1/models' && req.headers.authorization === 'Bearer upstream-secret') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ data: [{ id: 'gpt-test' }, { id: 'claude-sonnet-test' }] }));
@@ -384,8 +788,10 @@ const dualProtocolModels = createFakeUpstream('dual-protocol-models', ({ req, re
 });
 
 let codexOauthLastRequest = null;
+let codexOauthRequestCount = 0;
 const codexOauthBackend = createFakeUpstream('codex-oauth-backend', ({ req, res, body }) => {
   codexOauthLastRequest = { url: req.url, headers: req.headers, body };
+  codexOauthRequestCount += 1;
   if (
     req.url === '/backend-api/codex/responses'
     && req.headers.authorization === 'Bearer oauth-secret'
@@ -395,8 +801,14 @@ const codexOauthBackend = createFakeUpstream('codex-oauth-backend', ({ req, res,
     && /^codex_cli_rs\/0\.125\.0\b/.test(req.headers['user-agent'] || '')
     && req.headers['x-api-key'] === undefined
   ) {
+    const payload = JSON.parse(body);
+    if (payload.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(`data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_oauth_probe', object: 'response', output: [], output_text: 'ok' } })}\n\n`);
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, body: JSON.parse(body) }));
+    res.end(JSON.stringify({ ok: true, id: 'resp_oauth', object: 'response', output_text: 'ok', body: payload }));
     return;
   }
   res.writeHead(400, { 'content-type': 'application/json' });
@@ -462,7 +874,14 @@ const modelErrorInfo = await listen(modelError);
 const goodInfo = await listen(good);
 const addedInfo = await listen(added);
 const usageInfo = await listen(usageUpstream);
+const zeroOutputUsageInfo = await listen(zeroOutputUsage);
 const responsesMissingCompletedInfo = await listen(responsesMissingCompleted);
+const responsesDataOnlyInfo = await listen(responsesDataOnly);
+const responsesObjectOnlyInfo = await listen(responsesObjectOnly);
+const chatChoicesEmptyInfo = await listen(chatChoicesEmpty);
+const anthropicContentEmptyInfo = await listen(anthropicContentEmpty);
+const chatOnlyInfo = await listen(chatOnly);
+const cachedChatThenNativeInfo = await listen(cachedChatThenNative);
 const anthropicMessagesInfo = await listen(anthropicMessages);
 const billingInfo = await listen(billingUpstream);
 const billingHugeLimitInfo = await listen(billingHugeLimitUpstream);
@@ -558,6 +977,40 @@ try {
     throw new Error('expected availability visualization to render real samples before trailing empty window slots');
   }
 
+  const lateTlsErrorServer = tls.createServer({
+    key: lateTlsErrorKey,
+    cert: lateTlsErrorCert,
+    ALPNProtocols: ['h2', 'http/1.1']
+  }, (socket) => {
+    socket.on('error', () => {});
+  });
+  const lateTlsErrorProxy = createConnectProxy();
+  const originalTlsRejectUnauthorized = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  const lateTlsErrorServerInfo = await listen(lateTlsErrorServer, 'localhost');
+  const lateTlsErrorProxyInfo = await listen(lateTlsErrorProxy);
+  try {
+    const tunnelSocket = await __testInternals.openHttpProxyTunnel(
+      lateTlsErrorProxyInfo.url,
+      'localhost',
+      lateTlsErrorServerInfo.port,
+      1000
+    );
+    try {
+      tunnelSocket.emit('error', new Error('late TLS socket EPIPE'));
+      tunnelSocket.emit('error', new Error('second late TLS socket EPIPE'));
+    } catch (error) {
+      throw new Error(`expected late TLS socket errors to be guarded after CONNECT tunnel setup: ${error.message}`);
+    } finally {
+      tunnelSocket.destroy();
+    }
+  } finally {
+    if (originalTlsRejectUnauthorized === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = originalTlsRejectUnauthorized;
+    await close(lateTlsErrorProxy);
+    await close(lateTlsErrorServer);
+  }
+
   const authFailPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -573,7 +1026,7 @@ try {
       base_cooldown_ms: 1000,
       key_cooldown_ms: 1000
     },
-    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
     upstreams: [
       { name: 'good', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
     ]
@@ -610,6 +1063,32 @@ try {
     throw new Error(`unexpected response body: ${result.text}`);
   }
 
+  const sensitiveHeaderBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
+  const sensitiveHeaderResponse = await fetch(`${poolInfo.url}/v1/responses`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer pool-secret',
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(sensitiveHeaderBody)),
+      'x-api-key': 'client-secret-that-must-not-forward',
+      'api-key': 'client-api-key-that-must-not-forward',
+      'anthropic-version': '2023-06-01',
+      'openai-organization': 'org-client-that-must-not-forward'
+    },
+    body: sensitiveHeaderBody
+  });
+  const sensitiveHeaderText = await sensitiveHeaderResponse.text();
+  if (
+    sensitiveHeaderResponse.status !== 200 ||
+    sensitiveHeaderResponse.headers.get('x-saw-authorization') !== 'yes' ||
+    sensitiveHeaderResponse.headers.get('x-saw-x-api-key') !== 'no' ||
+    sensitiveHeaderResponse.headers.get('x-saw-api-key') !== 'no' ||
+    sensitiveHeaderResponse.headers.get('x-saw-anthropic-version') !== 'no' ||
+    sensitiveHeaderResponse.headers.get('x-saw-openai-organization') !== 'no'
+  ) {
+    throw new Error(`expected ordinary OpenAI-compatible forwarding to strip client auth/vendor headers: ${sensitiveHeaderResponse.status} ${sensitiveHeaderText}`);
+  }
+
   const modelErrorPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -625,7 +1104,7 @@ try {
       base_cooldown_ms: 1000,
       key_cooldown_ms: 1000
     },
-    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
     upstreams: [
       { name: 'model-error', base_url: `${modelErrorInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
       { name: 'good', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
@@ -718,6 +1197,57 @@ try {
     await close(usagePool);
   }
 
+  const zeroOutputUsagePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 5,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'zero-output-usage', base_url: `${zeroOutputUsageInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const zeroOutputUsagePoolInfo = await listen(zeroOutputUsagePool);
+  try {
+    const zeroOutputResult = await requestJson(zeroOutputUsagePoolInfo.url, 'pool-secret');
+    if (zeroOutputResult.response.status !== 200) {
+      throw new Error(`expected upstream HTTP 200 to still pass through to client: ${zeroOutputResult.response.status} ${zeroOutputResult.text}`);
+    }
+    const zeroOutputStatus = (await getJson(`${zeroOutputUsagePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const zeroOutputSite = zeroOutputStatus.upstreams.find((upstream) => upstream.name === 'zero-output-usage');
+    const zeroOutputRecent = zeroOutputStatus.recent_requests?.[0];
+    if (
+      zeroOutputSite?.stats?.successes !== 0 ||
+      zeroOutputSite?.stats?.failures !== 1 ||
+      zeroOutputSite?.availability?.samples !== 1 ||
+      zeroOutputSite?.availability?.successes !== 0 ||
+      zeroOutputSite?.availability?.failures !== 1 ||
+      zeroOutputSite?.usage?.total_tokens !== 0
+    ) {
+      throw new Error(`expected HTTP 200 with output_tokens=0 to count as failed availability without token usage: ${JSON.stringify(zeroOutputSite)}`);
+    }
+    if (
+      zeroOutputRecent?.outcome !== 'error' ||
+      zeroOutputRecent?.status !== 200 ||
+      zeroOutputRecent?.tokens !== 0 ||
+      !String(zeroOutputRecent?.reason || '').includes('output tokens 0')
+    ) {
+      throw new Error(`expected recent request to expose zero-output HTTP 200 as failed call: ${JSON.stringify(zeroOutputRecent)}`);
+    }
+  } finally {
+    await close(zeroOutputUsagePool);
+  }
+
   const missingCompletedPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -758,6 +1288,804 @@ try {
     }
   } finally {
     await close(missingCompletedPool);
+  }
+
+  const responsesDataOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'responses-data-only', base_url: `${responsesDataOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const responsesDataOnlyPoolInfo = await listen(responsesDataOnlyPool);
+  try {
+    const dataOnlyBatchProbe = await postJson(`${responsesDataOnlyPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      dataOnlyBatchProbe.response.status !== 200 ||
+      dataOnlyBatchProbe.json.ok !== true ||
+      dataOnlyBatchProbe.json.probe_ok !== false ||
+      dataOnlyBatchProbe.json.probe_status !== 'failed' ||
+      dataOnlyBatchProbe.json.summary?.ok_count !== 0 ||
+      dataOnlyBatchProbe.json.summary?.failed_count !== 1
+    ) {
+      throw new Error(`expected batch probe summary to report failed model probe: ${dataOnlyBatchProbe.text}`);
+    }
+    const dataOnlyProbe = await postJson(`${responsesDataOnlyPoolInfo.url}/pool/upstreams/responses-data-only/probe`, 'pool-secret', {});
+    if (dataOnlyProbe.response.status !== 200 || dataOnlyProbe.json.probe_ok !== false || dataOnlyProbe.json.probe_status !== 'failed' || dataOnlyProbe.json.health?.state === 'ok') {
+      throw new Error(`expected /responses data-only body not to pass health probe: ${dataOnlyProbe.text}`);
+    }
+    const dataOnlyStatus = (await getJson(`${responsesDataOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const dataOnlySite = dataOnlyStatus.upstreams.find((upstream) => upstream.name === 'responses-data-only');
+    if (dataOnlySite?.available !== false || dataOnlySite?.selection_score !== 0) {
+      throw new Error(`expected failed health probe to remove upstream from Selection: ${JSON.stringify(dataOnlySite)}`);
+    }
+  } finally {
+    await close(responsesDataOnlyPool);
+  }
+
+  const responsesObjectOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'responses-object-only', base_url: `${responsesObjectOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const responsesObjectOnlyPoolInfo = await listen(responsesObjectOnlyPool);
+  try {
+    const objectOnlyProbe = await postJson(`${responsesObjectOnlyPoolInfo.url}/pool/upstreams/responses-object-only/probe`, 'pool-secret', {});
+    if (
+      objectOnlyProbe.response.status !== 200 ||
+      objectOnlyProbe.json.probe_ok !== false ||
+      objectOnlyProbe.json.probe_status !== 'failed' ||
+      objectOnlyProbe.json.health?.state === 'ok' ||
+      !String(objectOnlyProbe.json.health?.error || '').includes('without Responses output/output_text')
+    ) {
+      throw new Error(`expected /responses object-only body not to pass health probe: ${objectOnlyProbe.text}`);
+    }
+  } finally {
+    await close(responsesObjectOnlyPool);
+  }
+
+  const chatChoicesEmptyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'chat-choices-empty', base_url: `${chatChoicesEmptyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const chatChoicesEmptyPoolInfo = await listen(chatChoicesEmptyPool);
+  try {
+    const choicesEmptyProbe = await postJson(`${chatChoicesEmptyPoolInfo.url}/pool/upstreams/chat-choices-empty/probe`, 'pool-secret', {});
+    if (
+      choicesEmptyProbe.response.status !== 200 ||
+      choicesEmptyProbe.json.probe_ok !== false ||
+      choicesEmptyProbe.json.probe_status !== 'failed' ||
+      choicesEmptyProbe.json.health?.state === 'ok' ||
+      !String(choicesEmptyProbe.json.health?.error || '').includes('without choices')
+    ) {
+      throw new Error(`expected chat completions empty choices not to pass health probe: ${choicesEmptyProbe.text}`);
+    }
+  } finally {
+    await close(chatChoicesEmptyPool);
+  }
+
+  const anthropicContentEmptyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'claude-opus-test',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'anthropic-content-empty', api: 'anthropic', base_url: `${anthropicContentEmptyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const anthropicContentEmptyPoolInfo = await listen(anthropicContentEmptyPool);
+  try {
+    const contentEmptyProbe = await postJson(`${anthropicContentEmptyPoolInfo.url}/pool/upstreams/anthropic-content-empty/probe`, 'pool-secret', {});
+    if (
+      contentEmptyProbe.response.status !== 200 ||
+      contentEmptyProbe.json.probe_ok !== false ||
+      contentEmptyProbe.json.probe_status !== 'failed' ||
+      contentEmptyProbe.json.health?.state === 'ok' ||
+      !String(contentEmptyProbe.json.health?.error || '').includes('without content')
+    ) {
+      throw new Error(`expected Anthropic empty content not to pass health probe: ${contentEmptyProbe.text}`);
+    }
+  } finally {
+    await close(anthropicContentEmptyPool);
+  }
+
+  const nativeUnsupportedToolPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'native-responses', request_mode: 'responses', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const nativeUnsupportedToolPoolInfo = await listen(nativeUnsupportedToolPool);
+  try {
+    const unsupportedToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'search the web',
+      stream: false,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }],
+      metadata: { keep_unknown_tool_test: true }
+    });
+    const response = await fetch(`${nativeUnsupportedToolPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedToolBody))
+      },
+      body: unsupportedToolBody
+    });
+    const text = await response.text();
+    const json = JSON.parse(text);
+    if (
+      response.status !== 200 ||
+      json.body?.tools?.[0]?.type !== 'web_search_preview' ||
+      json.body?.tools?.[0]?.search_context_size !== 'low' ||
+      json.body?.metadata?.keep_unknown_tool_test !== true
+    ) {
+      throw new Error(`expected native Responses upstream to receive unsupported tool fields intact: ${response.status} ${text}`);
+    }
+  } finally {
+    await close(nativeUnsupportedToolPool);
+  }
+
+  chatOnlyResponsesHits = 0;
+  chatOnlyChatHits = 0;
+  const mixedUnsupportedToolPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'known-chat-only', request_mode: 'chat_completions', base_url: `${chatOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
+      { name: 'native-after-chat', request_mode: 'responses', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const mixedUnsupportedToolPoolInfo = await listen(mixedUnsupportedToolPool);
+  const originalRandomForMixedUnsupported = Math.random;
+  try {
+    Math.random = () => 0;
+    const unsupportedToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'search the web',
+      stream: false,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }]
+    });
+    const response = await fetch(`${mixedUnsupportedToolPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedToolBody))
+      },
+      body: unsupportedToolBody
+    });
+    const text = await response.text();
+    const json = JSON.parse(text);
+    if (
+      response.status !== 200 ||
+      json.body?.tools?.[0]?.type !== 'web_search_preview' ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 0
+    ) {
+      throw new Error(`expected unsupported Responses tool to skip known chat-only and reach native Responses: ${response.status} ${text} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+  } finally {
+    Math.random = originalRandomForMixedUnsupported;
+    await close(mixedUnsupportedToolPool);
+  }
+
+  chatOnlyResponsesHits = 0;
+  chatOnlyChatHits = 0;
+  const explicitChatOnlyUnsupportedToolPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'explicit-chat-only', request_mode: 'chat_completions', base_url: `${chatOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const explicitChatOnlyUnsupportedToolPoolInfo = await listen(explicitChatOnlyUnsupportedToolPool);
+  try {
+    const unsupportedToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'search the web',
+      stream: false,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }]
+    });
+    const response = await fetch(`${explicitChatOnlyUnsupportedToolPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedToolBody))
+      },
+      body: unsupportedToolBody
+    });
+    const text = await response.text();
+    const json = JSON.parse(text);
+    if (
+      response.status !== 422 ||
+      json.unsupported_tool_types?.[0] !== 'web_search_preview' ||
+      !String(json.error || '').includes('no compatible upstream candidate') ||
+      json.attempts?.length !== 0 ||
+      json.incompatible_upstreams?.[0]?.upstream !== 'explicit-chat-only' ||
+      !String(json.incompatible_upstreams?.[0]?.reason || '').includes('request_mode=chat_completions') ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 0
+    ) {
+      throw new Error(`expected explicit chat-only unsupported tool to fail before any upstream call: ${response.status} ${text} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+  } finally {
+    await close(explicitChatOnlyUnsupportedToolPool);
+  }
+
+  const autoUnsupportedToolPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000,
+      chat_fallback_probe_timeout_ms: 50
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
+    upstreams: [
+      { name: 'chat-only-auto', base_url: `${chatOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const autoUnsupportedToolPoolInfo = await listen(autoUnsupportedToolPool);
+  try {
+    const unsupportedToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'search the web',
+      stream: false,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }]
+    });
+    const response = await fetch(`${autoUnsupportedToolPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedToolBody))
+      },
+      body: unsupportedToolBody
+    });
+    const text = await response.text();
+    const json = JSON.parse(text);
+    if (
+      response.status !== 422 ||
+      json.unsupported_tool_types?.[0] !== 'web_search_preview' ||
+      chatOnlyResponsesHits !== 1 ||
+      chatOnlyChatHits !== 0
+    ) {
+      throw new Error(`expected auto unsupported tool to fail clearly without chat fallback: ${response.status} ${text} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+    const plainBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
+    const plainResponse = await fetch(`${autoUnsupportedToolPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(plainBody))
+      },
+      body: plainBody
+    });
+    const plainText = await plainResponse.text();
+    const plainJson = JSON.parse(plainText);
+    if (
+      plainResponse.status !== 200 ||
+      plainJson.output_text !== 'pong' ||
+      chatOnlyResponsesHits !== 2 ||
+      chatOnlyChatHits !== 1
+    ) {
+      throw new Error(`expected native-tool miss not to cooldown auto chat fallback: ${plainResponse.status} ${plainText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+  } finally {
+    await close(autoUnsupportedToolPool);
+  }
+
+  cachedChatThenNativeResponsesHits = 0;
+  cachedChatThenNativeChatHits = 0;
+  const cachedChatThenNativePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000,
+      chat_fallback_probe_timeout_ms: 50
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
+    upstreams: [
+      { name: 'cached-chat-then-native', base_url: `${cachedChatThenNativeInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const cachedChatThenNativePoolInfo = await listen(cachedChatThenNativePool);
+  try {
+    const warmupBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
+    const warmupResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(warmupBody))
+      },
+      body: warmupBody
+    });
+    const warmupText = await warmupResponse.text();
+    const warmupJson = JSON.parse(warmupText);
+    if (
+      warmupResponse.status !== 200 ||
+      warmupJson.output_text !== 'cached-pong' ||
+      cachedChatThenNativeResponsesHits !== 1 ||
+      cachedChatThenNativeChatHits !== 1
+    ) {
+      throw new Error(`expected warmup to cache chat completions fallback: ${warmupResponse.status} ${warmupText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+    }
+    const warmupStatus = (await getJson(`${cachedChatThenNativePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const warmupSite = warmupStatus.upstreams.find((upstream) => upstream.name === 'cached-chat-then-native');
+    if (warmupSite?.resolved_request_mode !== 'chat_completions') {
+      throw new Error(`expected warmup to resolve request mode as chat_completions: ${JSON.stringify(warmupSite)}`);
+    }
+
+    const nativeToolsBody = JSON.stringify({
+      model: 'test-model',
+      input: 'use native responses tools',
+      stream: false,
+      tools: [
+        { type: 'custom', name: 'shell', description: 'run a custom tool' },
+        { type: 'namespace', namespace: 'mcp__node_repl', tools: [{ name: 'js' }] },
+        { type: 'tool_search', query: 'browser automation' },
+        { type: 'web_search', search_context_size: 'low' },
+        { type: 'image_generation', size: '1024x1024' }
+      ],
+      text: { format: { type: 'grammar', syntax: 'lark', definition: 'start: /ok/' } },
+      metadata: { cached_chat_native_tools_test: true }
+    });
+    const nativeToolsResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(nativeToolsBody))
+      },
+      body: nativeToolsBody
+    });
+    const nativeToolsText = await nativeToolsResponse.text();
+    const nativeToolsJson = JSON.parse(nativeToolsText);
+    const forwardedToolTypes = nativeToolsJson.body?.tools?.map((tool) => tool?.type);
+    if (
+      nativeToolsResponse.status !== 200 ||
+      nativeToolsJson.body?.metadata?.cached_chat_native_tools_test !== true ||
+      nativeToolsJson.body?.text?.format?.type !== 'grammar' ||
+      !['custom', 'namespace', 'tool_search', 'web_search', 'image_generation'].every((type) => forwardedToolTypes?.includes(type)) ||
+      cachedChatThenNativeResponsesHits !== 2 ||
+      cachedChatThenNativeChatHits !== 1
+    ) {
+      throw new Error(`expected cached chat fallback to re-probe native Responses with native tools intact: ${nativeToolsResponse.status} ${nativeToolsText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+    }
+
+    const nativeToolChoiceBody = JSON.stringify({
+      model: 'test-model',
+      input: 'force native tool choice',
+      stream: false,
+      tool_choice: { type: 'web_search', name: 'web_search' },
+      metadata: { native_tool_choice_test: true }
+    });
+    const nativeToolChoiceResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(nativeToolChoiceBody))
+      },
+      body: nativeToolChoiceBody
+    });
+    const nativeToolChoiceText = await nativeToolChoiceResponse.text();
+    const nativeToolChoiceJson = JSON.parse(nativeToolChoiceText);
+    if (
+      nativeToolChoiceResponse.status !== 200 ||
+      nativeToolChoiceJson.body?.tool_choice?.type !== 'web_search' ||
+      nativeToolChoiceJson.body?.metadata?.native_tool_choice_test !== true ||
+      cachedChatThenNativeResponsesHits !== 3 ||
+      cachedChatThenNativeChatHits !== 1
+    ) {
+      throw new Error(`expected cached chat fallback to re-probe native Responses for native tool_choice: ${nativeToolChoiceResponse.status} ${nativeToolChoiceText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+    }
+
+    const wrongContentTypeBody = JSON.stringify({
+      model: 'test-model',
+      input: 'json body with wrong content type',
+      stream: false,
+      tools: [{ type: 'web_search', search_context_size: 'low' }],
+      metadata: { wrong_content_type_test: true }
+    });
+    const wrongContentTypeResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'text/plain',
+        'content-length': String(Buffer.byteLength(wrongContentTypeBody))
+      },
+      body: wrongContentTypeBody
+    });
+    const wrongContentTypeText = await wrongContentTypeResponse.text();
+    const wrongContentTypeJson = JSON.parse(wrongContentTypeText);
+    if (
+      wrongContentTypeResponse.status !== 200 ||
+      wrongContentTypeJson.body?.tools?.[0]?.type !== 'web_search' ||
+      wrongContentTypeJson.body?.metadata?.wrong_content_type_test !== true ||
+      cachedChatThenNativeResponsesHits !== 4 ||
+      cachedChatThenNativeChatHits !== 1
+    ) {
+      throw new Error(`expected JSON body with wrong content-type to preserve native Responses fields and normalize upstream content-type: ${wrongContentTypeResponse.status} ${wrongContentTypeText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+    }
+
+    const nativeInputBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'look at this' }] },
+        { role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ],
+      metadata: { native_input_test: true }
+    });
+    const nativeInputResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(nativeInputBody))
+      },
+      body: nativeInputBody
+    });
+    const nativeInputText = await nativeInputResponse.text();
+    const nativeInputJson = JSON.parse(nativeInputText);
+    if (
+      nativeInputResponse.status !== 200 ||
+      nativeInputJson.body?.input?.[1]?.content?.[0]?.type !== 'input_image' ||
+      nativeInputJson.body?.input?.[2]?.type !== 'reasoning' ||
+      nativeInputJson.body?.metadata?.native_input_test !== true ||
+      cachedChatThenNativeResponsesHits !== 5 ||
+      cachedChatThenNativeChatHits !== 1
+    ) {
+      throw new Error(`expected cached chat fallback to re-probe native Responses for native input items: ${nativeInputResponse.status} ${nativeInputText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+    }
+  } finally {
+    await close(cachedChatThenNativePool);
+  }
+
+  chatOnlyResponsesHits = 0;
+  chatOnlyChatHits = 0;
+  const chatOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000,
+      chat_fallback_probe_timeout_ms: 50
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
+    upstreams: [
+      { name: 'chat-only', base_url: `${chatOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const chatOnlyPoolInfo = await listen(chatOnlyPool);
+  try {
+    const jsonBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
+    const jsonResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(jsonBody))
+      },
+      body: jsonBody
+    });
+    const jsonText = await jsonResponse.text();
+    const json = JSON.parse(jsonText);
+    if (jsonResponse.status !== 200 || json.object !== 'response' || json.output_text !== 'pong' || json.usage?.total_tokens !== 5) {
+      throw new Error(`expected chat completions JSON to be adapted to Responses JSON: ${jsonResponse.status} ${jsonText}`);
+    }
+    const streamBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: true });
+    const streamResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(streamBody))
+      },
+      body: streamBody
+    });
+    const streamText = await streamResponse.text();
+    if (streamResponse.status !== 200 || !streamText.includes('response.output_text.delta') || !streamText.includes('pong') || !streamText.includes('response.completed') || !streamText.includes('[DONE]')) {
+      throw new Error(`expected chat completions stream to be adapted to Responses SSE: ${streamResponse.status} ${streamText}`);
+    }
+    const chatToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'please use tool',
+      stream: false,
+      tools: [{
+        type: 'function',
+        name: 'lookup_weather',
+        description: 'Look up weather for a city',
+        parameters: {
+          type: 'object',
+          properties: { location: { type: 'string' } },
+          required: ['location']
+        }
+      }],
+      tool_choice: { type: 'function', name: 'lookup_weather' }
+    });
+    const chatToolResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(chatToolBody))
+      },
+      body: chatToolBody
+    });
+    const chatToolText = await chatToolResponse.text();
+    const chatToolJson = JSON.parse(chatToolText);
+    const chatToolCall = chatToolJson.output?.find((item) => item.type === 'function_call');
+    if (
+      chatToolResponse.status !== 200 ||
+      chatToolCall?.name !== 'lookup_weather' ||
+      chatToolCall?.call_id !== 'call_chat_weather' ||
+      !String(chatToolCall?.arguments || '').includes('Shanghai')
+    ) {
+      throw new Error(`expected chat completions tool call to be adapted to Responses: ${chatToolResponse.status} ${chatToolText}`);
+    }
+    const scrubChatBody = JSON.stringify({
+      model: 'test-model',
+      input: 'hello',
+      stream: false,
+      previous_response_id: 'resp_prev',
+      include: ['reasoning'],
+      reasoning: { effort: 'medium' },
+      text: { format: { type: 'text' } },
+      truncation: 'auto',
+      background: true,
+      conversation: 'conv_1'
+    });
+    const scrubChatResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(scrubChatBody))
+      },
+      body: scrubChatBody
+    });
+    const scrubChatText = await scrubChatResponse.text();
+    const scrubChatJson = JSON.parse(scrubChatText);
+    if (scrubChatResponse.status !== 200 || scrubChatJson.output_text !== 'pong') {
+      throw new Error(`expected chat adapter to scrub Responses-only fields: ${scrubChatResponse.status} ${scrubChatText}`);
+    }
+    const unsupportedChatToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'search the web',
+      stream: false,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }]
+    });
+    const unsupportedChatToolResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedChatToolBody))
+      },
+      body: unsupportedChatToolBody
+    });
+    const unsupportedChatToolText = await unsupportedChatToolResponse.text();
+    const unsupportedChatToolJson = JSON.parse(unsupportedChatToolText);
+    if (
+      unsupportedChatToolResponse.status !== 422 ||
+      unsupportedChatToolJson.unsupported_tool_types?.[0] !== 'web_search_preview' ||
+      !String(unsupportedChatToolJson.error || '').includes('cannot be converted by available upstreams') ||
+      unsupportedChatToolJson.attempts?.[0]?.status !== 404 ||
+      chatOnlyResponsesHits !== 2 ||
+      chatOnlyChatHits !== 4
+    ) {
+      throw new Error(`expected unsupported tool to re-probe native Responses without chat fallback: ${unsupportedChatToolResponse.status} ${unsupportedChatToolText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+    if (chatOnlyResponsesHits !== 2 || chatOnlyChatHits !== 4) {
+      throw new Error(`expected first request to probe responses once, then reuse chat completions: responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+    const unsupportedChatInputBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'look at this' }] },
+        { role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const unsupportedChatInputResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedChatInputBody))
+      },
+      body: unsupportedChatInputBody
+    });
+    const unsupportedChatInputText = await unsupportedChatInputResponse.text();
+    const unsupportedChatInputJson = JSON.parse(unsupportedChatInputText);
+    if (
+      unsupportedChatInputResponse.status !== 422 ||
+      !unsupportedChatInputJson.unsupported_input_types?.includes('content:input_image') ||
+      !unsupportedChatInputJson.unsupported_input_types?.includes('reasoning') ||
+      !String(unsupportedChatInputJson.error || '').includes('cannot be converted by available upstreams') ||
+      unsupportedChatInputJson.attempts?.[0]?.status !== 404 ||
+      chatOnlyResponsesHits !== 3 ||
+      chatOnlyChatHits !== 4
+    ) {
+      throw new Error(`expected native input not to be degraded through chat adapter: ${unsupportedChatInputResponse.status} ${unsupportedChatInputText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+    const chatOnlyStatus = (await getJson(`${chatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const chatOnlySite = chatOnlyStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
+    if (chatOnlySite?.resolved_request_mode !== 'chat_completions' || chatOnlySite?.usage?.total_tokens !== 17 || chatOnlySite?.usage?.input_tokens !== 7 || chatOnlySite?.usage?.output_tokens !== 10) {
+      throw new Error(`expected chat completions fallback mode and usage to be recorded: ${JSON.stringify(chatOnlySite)}`);
+    }
+    const runtimeChatOnly = chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only');
+    runtimeChatOnly.resolvedRequestMode = '';
+    runtimeChatOnly.cooldownUntil = Date.now() + 1000;
+    runtimeChatOnly.failures = 2;
+    runtimeChatOnly.keys[0].cooldownUntil = Date.now() + 1000;
+    runtimeChatOnly.keys[0].failures = 2;
+    const probeResult = await postJson(`${chatOnlyPoolInfo.url}/pool/upstreams/chat-only/probe`, 'pool-secret', {});
+    if (
+      probeResult.response.status !== 200 ||
+      probeResult.json.health?.state !== 'ok' ||
+      probeResult.json.health?.httpStatus !== 200 ||
+      probeResult.json.health?.error ||
+      !String(probeResult.json.health?.warning || '').includes('chat_completions probe ok') ||
+      chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only')?.resolvedRequestMode !== 'chat_completions' ||
+      chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only')?.cooldownUntil !== 0
+    ) {
+      throw new Error(`expected health probe to recover chat-only upstream via chat completions: ${probeResult.text}`);
+    }
+    if (probeResult.json.probe_ok !== true) {
+      throw new Error(`expected successful single-upstream probe_ok true: ${probeResult.text}`);
+    }
+    const postProbeStatus = (await getJson(`${chatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const postProbeChatOnly = postProbeStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
+    if (
+      postProbeChatOnly?.health?.error ||
+      !String(postProbeChatOnly?.health?.warning || '').includes('chat_completions probe ok') ||
+      postProbeChatOnly?.keys?.[0]?.health?.error ||
+      !String(postProbeChatOnly?.keys?.[0]?.health?.warning || '').includes('chat_completions probe ok')
+    ) {
+      throw new Error(`expected /pool/status to expose warning without error after fallback probe: ${JSON.stringify(postProbeChatOnly)}`);
+    }
+  } finally {
+    await close(chatOnlyPool);
   }
 
   const anthropicMessagesPool = createTestPool({
@@ -841,6 +2169,184 @@ try {
     const json = JSON.parse(jsonText);
     if (jsonResponse.status !== 200 || json.status !== 'completed' || json.output_text !== 'pong' || json.usage?.total_tokens !== 5) {
       throw new Error(`expected Anthropic JSON to be adapted to Responses JSON: ${jsonResponse.status} ${jsonText}`);
+    }
+
+    const anthropicToolBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      tools: [{
+        type: 'function',
+        name: 'lookup_weather',
+        description: 'Look up weather for a city',
+        parameters: {
+          type: 'object',
+          properties: { location: { type: 'string' } },
+          required: ['location']
+        }
+      }],
+      tool_choice: { type: 'function', name: 'lookup_weather' },
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'need weather' }] },
+        { type: 'function_call', call_id: 'call_weather_1', name: 'lookup_weather', arguments: '{"location":"Shanghai"}' },
+        { type: 'function_call_output', call_id: 'call_weather_1', output: '{"forecast":"sunny"}' }
+      ]
+    });
+    const anthropicToolResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(anthropicToolBody))
+      },
+      body: anthropicToolBody
+    });
+    const anthropicToolText = await anthropicToolResponse.text();
+    const anthropicToolJson = JSON.parse(anthropicToolText);
+    const anthropicToolCall = anthropicToolJson.output?.find((item) => item.type === 'function_call');
+    if (
+      anthropicToolResponse.status !== 200 ||
+      anthropicToolCall?.name !== 'lookup_weather' ||
+      anthropicToolCall?.call_id !== 'toolu_weather_2' ||
+      !String(anthropicToolCall?.arguments || '').includes('Shanghai')
+    ) {
+      throw new Error(`expected Anthropic tool use to be adapted to Responses JSON: ${anthropicToolResponse.status} ${anthropicToolText}`);
+    }
+
+    const anthropicToolStreamBody = JSON.stringify({ ...JSON.parse(anthropicToolBody), stream: true });
+    const anthropicToolStreamResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(anthropicToolStreamBody))
+      },
+      body: anthropicToolStreamBody
+    });
+    const anthropicToolStreamText = await anthropicToolStreamResponse.text();
+    const requiredAnthropicToolStreamEvents = [
+      'response.output_item.added',
+      'response.function_call_arguments.delta',
+      'response.function_call_arguments.done',
+      'response.output_item.done',
+      'response.completed',
+      '[DONE]'
+    ];
+    if (
+      anthropicToolStreamResponse.status !== 200 ||
+      !anthropicToolStreamText.includes('lookup_weather') ||
+      !anthropicToolStreamText.includes('toolu_weather_2') ||
+      requiredAnthropicToolStreamEvents.some((event) => !anthropicToolStreamText.includes(event))
+    ) {
+      throw new Error(`expected Anthropic streamed tool use to be adapted to Responses SSE: ${anthropicToolStreamResponse.status} ${anthropicToolStreamText}`);
+    }
+
+    const scrubAnthropicBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      previous_response_id: 'resp_prev',
+      include: ['reasoning'],
+      reasoning: { effort: 'medium' },
+      text: { format: { type: 'text' } },
+      truncation: 'auto',
+      parallel_tool_calls: false,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const scrubAnthropicResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(scrubAnthropicBody))
+      },
+      body: scrubAnthropicBody
+    });
+    const scrubAnthropicText = await scrubAnthropicResponse.text();
+    const scrubAnthropicJson = JSON.parse(scrubAnthropicText);
+    if (scrubAnthropicResponse.status !== 200 || scrubAnthropicJson.status !== 'completed' || scrubAnthropicJson.output_text !== 'pong') {
+      throw new Error(`expected Anthropic adapter to scrub Responses-only fields: ${scrubAnthropicResponse.status} ${scrubAnthropicText}`);
+    }
+
+    const anthropicHitsBeforeUnsupportedTool = anthropicMessagesHits;
+    const unsupportedAnthropicToolBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }],
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const unsupportedAnthropicToolResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedAnthropicToolBody))
+      },
+      body: unsupportedAnthropicToolBody
+    });
+    const unsupportedAnthropicToolText = await unsupportedAnthropicToolResponse.text();
+    const unsupportedAnthropicToolJson = JSON.parse(unsupportedAnthropicToolText);
+    if (
+      unsupportedAnthropicToolResponse.status !== 422 ||
+      unsupportedAnthropicToolJson.unsupported_tool_types?.[0] !== 'web_search_preview' ||
+      anthropicMessagesHits !== anthropicHitsBeforeUnsupportedTool
+    ) {
+      throw new Error(`expected unsupported tool not to be degraded through Anthropic adapter: ${unsupportedAnthropicToolResponse.status} ${unsupportedAnthropicToolText} hits=${anthropicMessagesHits - anthropicHitsBeforeUnsupportedTool}`);
+    }
+
+    const anthropicHitsBeforeUnsupportedToolChoice = anthropicMessagesHits;
+    const unsupportedAnthropicToolChoiceBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      tool_choice: { type: 'web_search', name: 'web_search' },
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const unsupportedAnthropicToolChoiceResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedAnthropicToolChoiceBody))
+      },
+      body: unsupportedAnthropicToolChoiceBody
+    });
+    const unsupportedAnthropicToolChoiceText = await unsupportedAnthropicToolChoiceResponse.text();
+    const unsupportedAnthropicToolChoiceJson = JSON.parse(unsupportedAnthropicToolChoiceText);
+    if (
+      unsupportedAnthropicToolChoiceResponse.status !== 422 ||
+      unsupportedAnthropicToolChoiceJson.unsupported_tool_types?.[0] !== 'web_search' ||
+      anthropicMessagesHits !== anthropicHitsBeforeUnsupportedToolChoice
+    ) {
+      throw new Error(`expected unsupported tool_choice not to be silently dropped through Anthropic adapter: ${unsupportedAnthropicToolChoiceResponse.status} ${unsupportedAnthropicToolChoiceText} hits=${anthropicMessagesHits - anthropicHitsBeforeUnsupportedToolChoice}`);
+    }
+
+    const anthropicHitsBeforeRequiredWithoutTools = anthropicMessagesHits;
+    const requiredWithoutToolsBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      tool_choice: 'required',
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const requiredWithoutToolsResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(requiredWithoutToolsBody))
+      },
+      body: requiredWithoutToolsBody
+    });
+    const requiredWithoutToolsText = await requiredWithoutToolsResponse.text();
+    const requiredWithoutToolsJson = JSON.parse(requiredWithoutToolsText);
+    if (
+      requiredWithoutToolsResponse.status !== 422 ||
+      requiredWithoutToolsJson.unsupported_tool_types?.[0] !== 'required' ||
+      anthropicMessagesHits !== anthropicHitsBeforeRequiredWithoutTools
+    ) {
+      throw new Error(`expected required tool_choice without tools not to be silently dropped through Anthropic adapter: ${requiredWithoutToolsResponse.status} ${requiredWithoutToolsText} hits=${anthropicMessagesHits - anthropicHitsBeforeRequiredWithoutTools}`);
     }
   } finally {
     await close(anthropicMessagesPool);
@@ -1041,6 +2547,44 @@ try {
     await close(nonClaudeSelectionPool);
   }
 
+  const knownModelSelectionPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'unknown-model-high-weight', base_url: `${nextModelSiteInfo.url}/v1`, weight: 100, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
+      { name: 'known-model-low-weight', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const knownModelSelectionPoolInfo = await listen(knownModelSelectionPool);
+  const originalKnownModelSelectionRandom = Math.random;
+  try {
+    const knownSite = knownModelSelectionPool.state.upstreams.find((upstream) => upstream.name === 'known-model-low-weight');
+    knownSite.health.models = ['test-model'];
+    knownSite.health.modelsCount = 1;
+    Math.random = () => 0;
+    const result = await requestJson(knownModelSelectionPoolInfo.url, 'pool-secret');
+    if (result.response.status !== 200 || result.response.headers.get('x-codex-api-pool-upstream') !== 'known-model-low-weight') {
+      throw new Error(`expected known model support to beat unknown high-weight upstream on first attempt: ${result.response.status} ${result.text}`);
+    }
+  } finally {
+    Math.random = originalKnownModelSelectionRandom;
+    await close(knownModelSelectionPool);
+  }
+
   const billingPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -1214,6 +2758,7 @@ try {
       base_cooldown_ms: 1000,
       key_cooldown_ms: 1000
     },
+    model_override: 'added-model-a',
     health: { enabled: false, path: '/models', timeout_ms: 1000 },
     upstreams: [
       { name: 'preferred-off', base_url: `${addedInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
@@ -1223,7 +2768,7 @@ try {
   const toggleInfo = await listen(togglePool);
   try {
     const disableResult = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/enabled`, 'pool-secret', { enabled: false });
-    if (disableResult.response.status !== 200 || disableResult.json.enabled !== false || disableResult.json.health?.state !== 'disabled') {
+    if (disableResult.response.status !== 200 || disableResult.json.enabled !== false || disableResult.json.probe_ok !== false || disableResult.json.probe_status !== 'skipped' || disableResult.json.health?.state !== 'disabled') {
       throw new Error(`expected upstream disable to persist disabled state: ${disableResult.text}`);
     }
     const disabledStatus = (await getJson(`${toggleInfo.url}/pool/status`, 'pool-secret')).json;
@@ -1231,7 +2776,6 @@ try {
     if (!disabledPreferred || disabledPreferred.enabled !== false || disabledPreferred.available !== false || disabledStatus.upstreams.length !== 2) {
       throw new Error(`expected disabled upstream to remain visible and unavailable: ${JSON.stringify(disabledStatus.upstreams)}`);
     }
-
     const originalRandom = Math.random;
     try {
       Math.random = () => 0;
@@ -1242,13 +2786,33 @@ try {
     } finally {
       Math.random = originalRandom;
     }
+    const disabledBatchProbe = await postJson(`${toggleInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      disabledBatchProbe.response.status !== 200 ||
+      disabledBatchProbe.json.probe_ok !== true ||
+      disabledBatchProbe.json.probe_status !== 'ok' ||
+      disabledBatchProbe.json.summary?.total_count !== 2 ||
+      disabledBatchProbe.json.summary?.enabled_count !== 1 ||
+      disabledBatchProbe.json.summary?.disabled_count !== 1 ||
+      disabledBatchProbe.json.summary?.ok_count !== 1 ||
+      disabledBatchProbe.json.summary?.failed_count !== 0 ||
+      disabledBatchProbe.json.summary?.skipped_count !== 1 ||
+      disabledBatchProbe.json.summary?.states?.disabled !== 1
+    ) {
+      throw new Error(`expected batch probe to count disabled upstream as skipped without failing enabled probes: ${disabledBatchProbe.text}`);
+    }
 
     const enableResult = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/enabled`, 'pool-secret', { enabled: true });
-    if (enableResult.response.status !== 200 || enableResult.json.enabled !== true || enableResult.json.health?.state !== 'ok') {
+    if (enableResult.response.status !== 200 || enableResult.json.enabled !== true || enableResult.json.probe_ok !== true || enableResult.json.probe_status !== 'ok' || enableResult.json.health?.state !== 'ok') {
       throw new Error(`expected upstream enable to probe and restore health: ${enableResult.text}`);
     }
   } finally {
     await close(togglePool);
+  }
+
+  const preAddModelResult = await postJson(`${poolInfo.url}/pool/model`, 'pool-secret', { model: 'added-model-a' });
+  if (preAddModelResult.response.status !== 200 || preAddModelResult.json.model_override !== 'added-model-a') {
+    throw new Error(`expected pre-add model override to be saved: ${preAddModelResult.text}`);
   }
 
   const addResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
@@ -1264,7 +2828,7 @@ try {
     throw new Error(`expected add upstream 201, got ${addResult.response.status}: ${addResult.text}`);
   }
 
-  if (addResult.json.health?.state !== 'ok' || addResult.json.health?.modelsCount !== 2) {
+  if (addResult.json.probe_ok !== true || addResult.json.probe_status !== 'ok' || addResult.json.health?.state !== 'ok' || addResult.json.health?.modelsCount !== 2) {
     throw new Error(`expected added upstream health ok with two models: ${addResult.text}`);
   }
 
@@ -1285,7 +2849,7 @@ try {
     weight: 3,
     replace: true
   });
-  if (replaceResult.response.status !== 200) {
+  if (replaceResult.response.status !== 200 || replaceResult.json.probe_ok !== true || replaceResult.json.probe_status !== 'ok') {
     throw new Error(`expected replace upstream 200, got ${replaceResult.response.status}: ${replaceResult.text}`);
   }
   const statusAfterReplace = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
@@ -1616,6 +3180,7 @@ try {
       auth_token_env: 'TEST_POOL_TOKEN',
       public_prefix: '/v1'
     },
+    model_override: 'gpt-test',
     health: { enabled: false, path: '/models', timeout_ms: 1000 },
     upstreams: [
       {
@@ -1654,6 +3219,45 @@ try {
     if (!codexOauthProxyLastRequest?.url?.startsWith(`${codexOauthBackendInfo.url}/backend-api/codex/responses`)) {
       throw new Error(`expected Codex OAuth request to pass through proxy_url: ${JSON.stringify(codexOauthProxyLastRequest)}`);
     }
+    codexOauthLastRequest = null;
+    codexOauthProxyLastRequest = null;
+    const codexOauthBatchProbe = await postJson(`${codexOauthPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    const batchOauthSite = codexOauthBatchProbe.json.result?.upstreams?.find((upstream) => upstream.name === 'codex-oauth');
+    if (
+      codexOauthBatchProbe.response.status !== 200 ||
+      codexOauthBatchProbe.json.probe_ok !== true ||
+      codexOauthBatchProbe.json.probe_status !== 'ok' ||
+      codexOauthBatchProbe.json.summary?.ok_count !== 1 ||
+      batchOauthSite?.health?.state !== 'ok' ||
+      codexOauthLastRequest?.url !== '/backend-api/codex/responses' ||
+      !codexOauthProxyLastRequest?.url?.startsWith(`${codexOauthBackendInfo.url}/backend-api/codex/responses`)
+    ) {
+      throw new Error(`expected batch probe to send Codex OAuth live request through proxy_url: ${codexOauthBatchProbe.text} request=${JSON.stringify(codexOauthLastRequest)} proxy=${JSON.stringify(codexOauthProxyLastRequest)}`);
+    }
+    codexOauthLastRequest = null;
+    codexOauthProxyLastRequest = null;
+    codexOauthRequestCount = 0;
+    codexOauthPool.state.probingPromise = sleep(10);
+    codexOauthPool.state.probing = true;
+    codexOauthPool.state.probingLive = false;
+    const [queuedBatchProbe, sharedQueuedBatchProbe] = await Promise.all([
+      postJson(`${codexOauthPoolInfo.url}/pool/probe`, 'pool-secret', {}),
+      postJson(`${codexOauthPoolInfo.url}/pool/probe`, 'pool-secret', {})
+    ]);
+    if (
+      queuedBatchProbe.response.status !== 200 ||
+      queuedBatchProbe.json.probe_ok !== true ||
+      queuedBatchProbe.json.probe_status !== 'ok' ||
+      queuedBatchProbe.json.result?.upstreams?.find((upstream) => upstream.name === 'codex-oauth')?.health?.state !== 'ok' ||
+      sharedQueuedBatchProbe.response.status !== 200 ||
+      sharedQueuedBatchProbe.json.probe_ok !== true ||
+      sharedQueuedBatchProbe.json.probe_status !== 'ok' ||
+      sharedQueuedBatchProbe.json.result?.upstreams?.find((upstream) => upstream.name === 'codex-oauth')?.health?.state !== 'ok' ||
+      codexOauthLastRequest?.url !== '/backend-api/codex/responses' ||
+      codexOauthRequestCount !== 1
+    ) {
+      throw new Error(`expected manual batch probes to share one live OAuth probe after in-flight health: first=${queuedBatchProbe.text} second=${sharedQueuedBatchProbe.text} request=${JSON.stringify(codexOauthLastRequest)} count=${codexOauthRequestCount}`);
+    }
   } finally {
     await close(codexOauthPool);
   }
@@ -1689,7 +3293,7 @@ try {
       || health.state !== 'auth_error'
       || health.httpStatus !== 401
       || health.diagnostics?.compactStatusCode !== 200
-      || health.diagnostics?.compactModel !== 'gpt-5.5'
+      || health.diagnostics?.compactModel !== 'gpt-5.3-codex'
       || !String(health.error || '').includes('not a full Codex OAuth upstream token')
       || !String(health.error || '').includes('app_test_chatgpt_web')
     ) {
@@ -1711,6 +3315,11 @@ try {
     throw new Error(`expected ChatGPT Web session JSON import to be rejected: ${webSessionImport.text}`);
   }
 
+  const preAnthropicModelResult = await postJson(`${poolInfo.url}/pool/model`, 'pool-secret', { model: 'claude-sonnet-test' });
+  if (preAnthropicModelResult.response.status !== 200 || preAnthropicModelResult.json.model_override !== 'claude-sonnet-test') {
+    throw new Error(`expected pre-anthropic model override to be saved: ${preAnthropicModelResult.text}`);
+  }
+
   const anthropicAddResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
     name: 'anthropic-models',
     base_url: anthropicModelsInfo.url,
@@ -1724,7 +3333,7 @@ try {
     throw new Error(`expected anthropic upstream add 201, got ${anthropicAddResult.response.status}: ${anthropicAddResult.text}`);
   }
 
-  if (anthropicAddResult.json.health?.state !== 'ok' || !anthropicAddResult.json.health?.models?.includes('claude-sonnet-test')) {
+  if (anthropicAddResult.json.probe_ok !== true || anthropicAddResult.json.probe_status !== 'ok' || anthropicAddResult.json.health?.state !== 'ok' || !anthropicAddResult.json.health?.models?.includes('claude-sonnet-test')) {
     throw new Error(`expected anthropic model probe to discover claude model: ${anthropicAddResult.text}`);
   }
 
@@ -1734,7 +3343,7 @@ try {
     weight: 2,
     replace: true
   });
-  if (anthropicReplaceResult.response.status !== 200 || anthropicReplaceResult.json.health?.state !== 'ok') {
+  if (anthropicReplaceResult.response.status !== 200 || anthropicReplaceResult.json.probe_ok !== true || anthropicReplaceResult.json.probe_status !== 'ok' || anthropicReplaceResult.json.health?.state !== 'ok') {
     throw new Error(`expected anthropic replace to preserve health probe settings: ${anthropicReplaceResult.text}`);
   }
 
@@ -1747,8 +3356,26 @@ try {
   if (autoAnthropicAddResult.response.status !== 201 || autoAnthropicAddResult.json.api !== 'anthropic' || autoAnthropicAddResult.json.api_detected !== 'anthropic') {
     throw new Error(`expected auto Anthropic detection to persist api=anthropic: ${autoAnthropicAddResult.text}`);
   }
-  if (autoAnthropicAddResult.json.health?.state !== 'ok' || !autoAnthropicAddResult.json.health?.models?.includes('claude-sonnet-test')) {
+  if (autoAnthropicAddResult.json.probe_ok !== true || autoAnthropicAddResult.json.probe_status !== 'ok' || autoAnthropicAddResult.json.health?.state !== 'ok' || !autoAnthropicAddResult.json.health?.models?.includes('claude-sonnet-test')) {
     throw new Error(`expected auto Anthropic detection to reuse Anthropic health: ${autoAnthropicAddResult.text}`);
+  }
+
+  const autoModelsOnlyAddResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
+    name: 'auto-models-only',
+    base_url: `${modelErrorInfo.url}/v1`,
+    weight: 1,
+    keys: [{ env: 'TEST_UPSTREAM_KEY' }]
+  });
+  if (
+    autoModelsOnlyAddResult.response.status !== 201 ||
+    autoModelsOnlyAddResult.json.api_detected !== 'openai' ||
+    autoModelsOnlyAddResult.json.probe_ok !== false ||
+    autoModelsOnlyAddResult.json.probe_status !== 'failed' ||
+    autoModelsOnlyAddResult.json.health?.state === 'ok' ||
+    !autoModelsOnlyAddResult.json.health?.models?.includes('test-model') ||
+    !String(autoModelsOnlyAddResult.json.health?.warning || '').includes('api auto-detected from /models')
+  ) {
+    throw new Error(`expected /models auto-detect not to turn failed real probe into ok: ${autoModelsOnlyAddResult.text}`);
   }
 
   const draftClaudeCheck = await postJson(`${poolInfo.url}/pool/claude-check`, 'pool-secret', {
@@ -1765,6 +3392,11 @@ try {
     !draftClaudeCheck.json.claude_check?.claude_models?.includes('claude-sonnet-test')
   ) {
     throw new Error(`expected draft Claude check to identify Claude-only upstream: ${draftClaudeCheck.text}`);
+  }
+
+  const preDualProtocolModelResult = await postJson(`${poolInfo.url}/pool/model`, 'pool-secret', { model: 'gpt-test' });
+  if (preDualProtocolModelResult.response.status !== 200 || preDualProtocolModelResult.json.model_override !== 'gpt-test') {
+    throw new Error(`expected pre-dual-protocol model override to be saved: ${preDualProtocolModelResult.text}`);
   }
 
   const dualProtocolAddResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
@@ -1796,6 +3428,17 @@ try {
     throw new Error(`expected model override to be saved: ${modelResult.text}`);
   }
 
+  const staleModelStatus = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
+  const staleDualProtocol = staleModelStatus.upstreams.find((upstream) => upstream.name === 'dual-protocol-models');
+  if (
+    staleDualProtocol?.health?.state !== 'stale_model_override' ||
+    staleDualProtocol?.health?.raw_state !== 'stale_model_override' ||
+    staleDualProtocol?.health?.probe_model !== 'gpt-test' ||
+    !String(staleDualProtocol?.health?.error || '').includes('current model_override is added-model-b')
+  ) {
+    throw new Error(`expected model override change to invalidate previous health probe: ${JSON.stringify(staleDualProtocol)}`);
+  }
+
   const overrideResult = await requestJson(poolInfo.url, 'pool-secret');
   if (overrideResult.response.status !== 200 || overrideResult.json.body?.model !== 'added-model-b') {
     throw new Error(`expected request model to be overridden: ${overrideResult.text}`);
@@ -1816,6 +3459,7 @@ try {
       base_cooldown_ms: 1000,
       key_cooldown_ms: 1000
     },
+    model_override: 'test-model',
     health: {
       enabled: false,
       path: '/models',
@@ -1974,9 +3618,8 @@ try {
   });
   const siteFallbackInfo = await listen(siteFallbackPool);
   try {
-    await postJson(`${siteFallbackInfo.url}/pool/upstreams/cloudflare-timeout/probe`, 'pool-secret', {});
-    await postJson(`${siteFallbackInfo.url}/pool/upstreams/next-model-site/probe`, 'pool-secret', {});
     await postJson(`${siteFallbackInfo.url}/pool/model`, 'pool-secret', { model: 'cf-only-model' });
+    await postJson(`${siteFallbackInfo.url}/pool/upstreams/next-model-site/probe`, 'pool-secret', {});
 
     const siteFallbackResult = await requestJson(siteFallbackInfo.url, 'pool-secret');
     if (siteFallbackResult.response.status !== 200) {
@@ -2006,7 +3649,205 @@ try {
     await close(siteFallbackPool);
   }
 
-  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, availability scoring, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, and immediate health probe all passed');
+  let codexForwardOnlyRequest = null;
+  const codexForwardOnlyBackend = createFakeUpstream('codex-forward-only', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));
+      return;
+    }
+    const hasCodexRequestMarkers = req.headers.originator === 'Codex Desktop'
+      && req.headers['x-oai-attestation'] === 'attestation-test'
+      && /^Codex Desktop\//.test(req.headers['user-agent'] || '');
+    if (req.url.endsWith('/responses') && hasCodexRequestMarkers) {
+      codexForwardOnlyRequest = { url: req.url, headers: req.headers, body };
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'resp_codex_forward_only',
+        object: 'response',
+        output_text: 'ok',
+        body: JSON.parse(body || '{}')
+      }));
+      return;
+    }
+    if (req.url.endsWith('/responses') || req.url.endsWith('/chat/completions')) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          message: '请使用最新版的codex客户端或codex cli调用（traceid: test-trace）',
+          type: 'invalid_request_error',
+          code: 'codex_access_restricted',
+          trace_id: 'test-trace'
+        }
+      }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const codexForwardOnlyInfo = await listen(codexForwardOnlyBackend);
+  const codexForwardOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-5.5',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'codex-forward-only', base_url: `${codexForwardOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const codexForwardOnlyPoolInfo = await listen(codexForwardOnlyPool);
+  try {
+    const probe = await postJson(`${codexForwardOnlyPoolInfo.url}/pool/upstreams/codex-forward-only/probe`, 'pool-secret', {});
+    if (
+      probe.response.status !== 200 ||
+      probe.json.probe_ok !== false ||
+      probe.json.probe_status !== 'skipped' ||
+      probe.json.health?.state !== 'advanced_curl_required' ||
+      probe.json.health?.httpStatus !== 403 ||
+      !String(probe.json.health?.error || '').includes('真实 Codex')
+    ) {
+      throw new Error(`expected advanced-curl upstream probe to be skipped, not failed: ${probe.text}`);
+    }
+    const status = (await getJson(`${codexForwardOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const site = status.upstreams.find((upstream) => upstream.name === 'codex-forward-only');
+    if (site?.available !== true || site?.selection_score <= 0 || site?.health?.state !== 'advanced_curl_required') {
+      throw new Error(`expected advanced-curl upstream to stay selectable for real forwarding: ${JSON.stringify(site)}`);
+    }
+    const realCodexBody = JSON.stringify({ model: 'gpt-5.5', input: 'hello', stream: false });
+    const realCodexResponse = await fetch(`${codexForwardOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(realCodexBody)),
+        'user-agent': 'Codex Desktop/0.138.0-alpha.7',
+        originator: 'Codex Desktop',
+        'x-oai-attestation': 'attestation-test'
+      },
+      body: realCodexBody
+    });
+    const realCodexText = await realCodexResponse.text();
+    const realCodexJson = JSON.parse(realCodexText);
+    if (
+      realCodexResponse.status !== 200 ||
+      realCodexJson.output_text !== 'ok' ||
+      codexForwardOnlyRequest?.headers?.authorization !== 'Bearer upstream-secret' ||
+      codexForwardOnlyRequest?.headers?.['x-oai-attestation'] !== 'attestation-test'
+    ) {
+      throw new Error(`expected Codex-marked real request to dispatch after skipped probe: ${realCodexResponse.status} ${realCodexText} forwarded=${JSON.stringify(codexForwardOnlyRequest)}`);
+    }
+  } finally {
+    await close(codexForwardOnlyPool);
+    await close(codexForwardOnlyBackend);
+  }
+
+  const codexCurlDebugBackend = createFakeUpstream('codex-curl-debug', ({ req, res }) => {
+    const hasCodexHeaders = req.headers.authorization === 'Bearer rawchat-secret'
+      && req.headers['openai-beta'] === 'responses=experimental'
+      && req.headers.originator === 'codex_cli_rs'
+    && /^codex_cli_rs\/0\.125\.0\b/.test(req.headers['user-agent'] || '');
+    if (req.url === '/codex/v1/responses' && hasCodexHeaders) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, output_text: 'ok' }));
+      return;
+    }
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'codex_access_restricted' } }));
+  });
+  const codexCurlDebugInfo = await listen(codexCurlDebugBackend);
+  try {
+    const baseUrl = `${codexCurlDebugInfo.url}/codex`;
+    const body = JSON.stringify({ model: 'gpt-5.5', input: 'hello' });
+    const bearerDebugResult = await __testInternals.runCurlTest({
+      base_url: baseUrl,
+      path: '/v1/responses',
+      method: 'POST',
+      auth_type: 'bearer',
+      api_key: 'rawchat-secret',
+      body
+    }, {});
+    if (
+      bearerDebugResult.ok ||
+      bearerDebugResult.status_code !== 403 ||
+      bearerDebugResult.judgement?.status !== 'inconclusive' ||
+      bearerDebugResult.judgement?.judgement_type !== 'wrong_judgement' ||
+      bearerDebugResult.judgement?.representative !== false ||
+      bearerDebugResult.judgement?.effect_scope !== 'test_request_only' ||
+      bearerDebugResult.judgement?.code !== 'requires_advanced_curl_profile' ||
+      bearerDebugResult.judgement?.authoritative !== false ||
+      bearerDebugResult.judgement?.blocks_dispatch !== false
+    ) {
+      throw new Error(`expected plain bearer curl debugger request to be rejected but non-authoritative: ${JSON.stringify(bearerDebugResult)}`);
+    }
+    const codexDebugResult = await __testInternals.runCurlTest({
+      base_url: baseUrl,
+      path: '/v1/responses',
+      method: 'POST',
+      auth_type: 'codex',
+      api_key: 'rawchat-secret',
+      body
+    }, {});
+    if (
+      !codexDebugResult.ok ||
+      codexDebugResult.status_code !== 200 ||
+      codexDebugResult.target_url !== `${baseUrl}/v1/responses` ||
+      codexDebugResult.judgement?.status !== 'ok' ||
+      codexDebugResult.judgement?.judgement_type !== 'capability' ||
+      codexDebugResult.judgement?.representative !== true ||
+      codexDebugResult.judgement?.effect_scope !== 'exact_request' ||
+      codexDebugResult.judgement?.authoritative !== true
+    ) {
+      throw new Error(`expected Codex CLI curl debugger mode to include Codex headers: ${JSON.stringify(codexDebugResult)}`);
+    }
+  } finally {
+    await close(codexCurlDebugBackend);
+  }
+
+  const normalAuthErrorCurlBackend = createFakeUpstream('normal-auth-error-curl', ({ res }) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'invalid_api_key', message: 'invalid api key' } }));
+  });
+  const normalAuthErrorCurlInfo = await listen(normalAuthErrorCurlBackend);
+  try {
+    const normalAuthErrorBody = JSON.stringify({ model: 'gpt-5.5', input: 'hello' });
+    const normalAuthErrorResult = await __testInternals.runCurlTest({
+      base_url: `${normalAuthErrorCurlInfo.url}/v1`,
+      path: '/responses',
+      method: 'POST',
+      auth_type: 'bearer',
+      api_key: 'bad-secret',
+      body: normalAuthErrorBody
+    }, {});
+    if (
+      normalAuthErrorResult.ok ||
+      normalAuthErrorResult.status_code !== 403 ||
+      normalAuthErrorResult.judgement?.status !== 'failed' ||
+      normalAuthErrorResult.judgement?.judgement_type !== 'correct_judgement' ||
+      normalAuthErrorResult.judgement?.representative !== true ||
+      normalAuthErrorResult.judgement?.effect_scope !== 'upstream_auth' ||
+      normalAuthErrorResult.judgement?.code !== 'auth_error' ||
+      normalAuthErrorResult.judgement?.authoritative !== true ||
+      normalAuthErrorResult.judgement?.blocks_dispatch !== true
+    ) {
+      throw new Error(`expected ordinary 403 curl result to remain authoritative auth_error: ${JSON.stringify(normalAuthErrorResult)}`);
+    }
+  } finally {
+    await close(normalAuthErrorCurlBackend);
+  }
+
+  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, and immediate health probe all passed');
 } finally {
   await close(codexOauthProxy);
   await close(codexOauthCompactOnlyBackend);
@@ -2022,7 +3863,14 @@ try {
   await close(billingHugeLimitUpstream);
   await close(billingUpstream);
   await close(anthropicMessages);
+  await close(cachedChatThenNative);
+  await close(chatOnly);
+  await close(anthropicContentEmpty);
+  await close(chatChoicesEmpty);
+  await close(responsesObjectOnly);
+  await close(responsesDataOnly);
   await close(responsesMissingCompleted);
+  await close(zeroOutputUsage);
   await close(usageUpstream);
   await close(added);
   await close(good);

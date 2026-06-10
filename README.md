@@ -13,6 +13,8 @@
 
 代理会在上游开始返回响应之前做重试和切换。一旦上游已经返回 `200` 并开始流式输出，代理会直接转发该流；如果这时上游中途断流，无法无损续接同一个生成，只能让当前 Codex turn 失败或由 Codex 重新发起。
 
+对 OpenAI-compatible 上游，代理默认优先使用 `/v1/responses`。如果某个站点只支持 `/v1/chat/completions`，代理会在 `/responses` 超时或返回可重试错误时自动改打 `/chat/completions`，并把 Chat Completions 的 JSON/SSE 响应转换回 Codex 需要的 Responses JSON/SSE 格式。chat fallback 成功后，该站点在当前进程内会直接复用 `chat_completions` 模式，避免每次都先等 `/responses` 超时。
+
 ## 文件
 
 - `src/server.mjs`: 本地代理服务。
@@ -53,20 +55,120 @@ npm run add -- mysite https://example.com/v1 2 --key sk-xxxx
 
 ## 启动
 
+### 启动速查
+
+当前本地配置来自 `config.local.json`，默认形态如下：
+
+- 监听地址：`127.0.0.1:8787`
+- OpenAI-compatible 入口：`http://127.0.0.1:8787/v1`
+- 管理面板：`http://127.0.0.1:8787/pool/dashboard`
+- Codex 访问本地池的 token 环境变量：`CODEX_POOL_API_KEY`
+- 管理接口 token 环境变量：当前 `admin_auth_token_env` 为空，本机 `/pool/*` 默认不强制 Bearer token
+- 当前模型覆盖：以 `config.local.json` 中的 `model_override` 为准
+- 健康检查：如果 `health.enabled` 是 `false`，需要用命令或管理面板手动探测
+
+前台临时运行：
+
 ```bash
-cd /Users/slizm/Desktop/脚本/codex-api-pool
+cd /Users/slizm/myprojects/codex-api-pool
 npm run start
 ```
 
 不想依赖 npm 脚本也可以直接：
 
 ```bash
-node /Users/slizm/Desktop/脚本/codex-api-pool/src/server.mjs
+node /Users/slizm/myprojects/codex-api-pool/src/server.mjs /Users/slizm/myprojects/codex-api-pool/config.local.json
+```
+
+### 作为 macOS 服务运行
+
+推荐用项目内的服务脚本生成用户级 LaunchAgent。它会使用当前仓库路径、当前 Node 可执行文件、`config.local.json`，并让 launchd 在异常退出时自动拉起服务。
+
+- 服务名：`com.slizm.codex-api-pool`
+- plist 路径：`/Users/slizm/Library/LaunchAgents/com.slizm.codex-api-pool.plist`
+- 标准输出：`/Users/slizm/myprojects/codex-api-pool/pool.out.log`
+- 错误输出：`/Users/slizm/myprojects/codex-api-pool/pool.err.log`
+
+安装或更新服务，并立即启动：
+
+```bash
+npm run service:install
+```
+
+如果你已经在终端里运行着 API Pool，先只写入 plist，不启动服务，避免两个进程争用 `127.0.0.1:8787`：
+
+```bash
+npm run service -- install --no-start
+```
+
+然后停止终端里的前台进程，再启动 LaunchAgent：
+
+```bash
+npm run service:start
+```
+
+查看服务状态和 `/health`：
+
+```bash
+npm run service:status
+```
+
+重启服务：
+
+```bash
+npm run service:restart
+```
+
+停止服务但保留 plist：
+
+```bash
+npm run service:stop
+```
+
+卸载服务并删除 plist：
+
+```bash
+npm run service:uninstall
+```
+
+预览生成的 plist：
+
+```bash
+npm run service -- plist
+```
+
+生成的 LaunchAgent 会先加载 `~/.zshrc`，所以 `CODEX_POOL_API_KEY` 和各上游 API key 应放在 `~/.zshrc` 或它会加载的文件中；否则后台启动时可能读不到这些环境变量。服务端收到 `SIGTERM` 时会优雅停接新请求、落盘运行状态，并在 `server.graceful_shutdown_ms` 后强制关闭仍未结束的连接。
+
+### nohup 兜底后台启动
+
+如果 macOS 拒绝 `launchctl bootstrap`，可以临时用 `nohup` 后台启动。这个方式不阻塞终端，但不会由 launchd 自动守护：
+
+```bash
+nohup /bin/zsh -lc 'source ~/.zshrc; exec node /Users/slizm/myprojects/codex-api-pool/src/server.mjs /Users/slizm/myprojects/codex-api-pool/config.local.json' \
+  >> /Users/slizm/myprojects/codex-api-pool/pool.out.log \
+  2>> /Users/slizm/myprojects/codex-api-pool/pool.err.log \
+  < /dev/null &
+echo $! > /Users/slizm/myprojects/codex-api-pool/pool.pid
+```
+
+检查是否启动成功：
+
+```bash
+curl -s http://127.0.0.1:8787/health
+lsof -nP -iTCP:8787 -sTCP:LISTEN
+```
+
+停止 `nohup` 启动的实例：
+
+```bash
+lsof -tiTCP:8787 -sTCP:LISTEN
+kill "$(lsof -tiTCP:8787 -sTCP:LISTEN)"
 ```
 
 启动后查看状态：
 
 ```bash
+curl -s http://127.0.0.1:8787/health
 curl -s http://127.0.0.1:8787/pool/status
 ```
 
@@ -75,6 +177,64 @@ curl -s http://127.0.0.1:8787/pool/status
 ```bash
 curl -s http://127.0.0.1:8787/pool/status \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
+```
+
+### 常见命令
+
+查看服务健康：
+
+```bash
+curl -s http://127.0.0.1:8787/health
+```
+
+查看完整池状态：
+
+```bash
+curl -s http://127.0.0.1:8787/pool/status
+```
+
+打开管理面板：
+
+```text
+http://127.0.0.1:8787/pool/dashboard
+```
+
+手动探测全部上游：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/probe
+```
+
+手动探测单个上游，例如 `rawchat`：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe
+```
+
+停用或启用单个上游：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+```
+
+刷新余额：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/billing
+curl -s -X POST http://127.0.0.1:8787/pool/billing
+```
+
+查看日志：
+
+```bash
+tail -f /Users/slizm/myprojects/codex-api-pool/pool.out.log
+tail -f /Users/slizm/myprojects/codex-api-pool/pool.err.log
 ```
 
 ## Codex 配置
@@ -247,9 +407,9 @@ npm run add -- runanytime https://runanytime.hxi.me/v1 1 RUNANYTIME_API_KEY --ap
 
 `api: "both"` 表示该上游同时具备 OpenAI-compatible 和 Anthropic Messages 能力。选择 `claude-*` 模型时它可以参与 Claude Selection；选择 GPT/Codex 模型时它也不会被跳过。
 
-新增上游时，如果没有显式传 `--api` 或 `probe_auth`，代理会在常规 OpenAI-compatible 健康探测后，额外尝试一次 Anthropic `/v1/models` 探测。自动写入规则：
+新增上游时，如果没有显式传 `--api` 或 `probe_auth`，代理会在常规 OpenAI-compatible 真实模型探测后，额外尝试一次 Anthropic 能力探测。自动写入规则：
 
-- OpenAI-compatible 探测成功，Anthropic 探测也成功且发现 `claude-*` 模型：写入 `api: "both"`。
+- OpenAI-compatible 真实模型探测成功，Anthropic 探测也成功且发现 `claude-*` 模型：写入 `api: "both"`。
 - OpenAI-compatible 探测失败，Anthropic 探测成功且发现 `claude-*` 模型：写入 `api: "anthropic"`、`probe_auth: "anthropic"` 和默认 `health_path: "/v1/models"`。
 - OpenAI-compatible `/models` 里列出了 Claude 模型，但 Anthropic 探测失败：保持 `api: "openai"`，避免后续误打 `/v1/messages`。
 
@@ -300,11 +460,19 @@ curl -s -X POST 'http://127.0.0.1:8787/pool/import/upstreams?replace=false&secre
   }
 ```
 
-代理会定时请求每个站点的 `/models`，并在状态里显示：
+Health Probe 使用当前 `model_override` 对上游发送一个小的真实模型请求，并在状态里显示结果。OpenAI-compatible 上游会探测 `/v1/responses`，必要时再试 `/v1/chat/completions`；Anthropic 上游会探测 `/v1/messages`。只有真实模型响应返回成功且响应体形状有效时，`health.state` 才会是 `ok`。
 
-- `health.state`: `ok`、`auth_error`、`rate_limited`、`server_error`、`network_error`、`timeout`、`models_unsupported` 等。
+`/models` 只用于补充展示模型列表和 `models_count`，不会把失败的真实模型探测翻成 `ok`。如果没有设置 `model_override`，Health Probe 会显示 `missing_model_override`，避免用随便挑的默认模型误判上游。每次真实探测会记录 `probe_model`；切换 `model_override` 后，旧模型的探测结果会变成 `stale_model_override`，直到用当前模型重新探测。
+
+- 管理接口返回里的顶层 `ok` 只表示本次管理 API 调用成功。
+- `probe_ok` 才表示真实模型探测通过：单站点探测等价于 `health.state == "ok"`；批量 `POST /pool/probe` 会额外返回 `summary.total_count`、`summary.enabled_count`、`summary.disabled_count`、`summary.ok_count`、`summary.failed_count`、`summary.skipped_count` 和 `summary.states`。会触发探测的管理接口（例如启用、添加、替换上游）也会返回 `probe_ok`，不要用顶层 `ok` 判断上游可用性。
+- `probe_status` 用于解释 `probe_ok`：`ok` 表示真实模型探测通过，`failed` 表示真实模型探测执行但失败，`skipped` 表示本次操作没有执行真实模型探测（例如停用上游或 Codex OAuth 非 live 检查）。
+- `health.state`: `ok`、`missing_model_override`、`stale_model_override`、`auth_error`、`rate_limited`、`server_error`、`network_error`、`timeout`、`models_unsupported` 等。
 - `health.http_status`: 探测 HTTP 状态码。
 - `health.latency_ms`: 探测延迟。
+- `health.error`: 真实探测失败时的失败原因；`health.state == "ok"` 时应为空。
+- `health.warning`: 真实探测成功但发生降级/兼容 fallback 时的说明，例如 `/responses` 失败但 `/chat/completions` 成功。
+- `health.probe_model`: 这次 Health Probe 实际使用的模型。
 - `health.models_count`: 如果 `/models` 返回标准模型列表，会显示模型数量。
 - `cooldown_ms`: 当前站点或 key 还要冷却多久。
 
@@ -435,14 +603,15 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
 
 - `stats.attempts`: 真实打到该上游的请求尝试次数。
 - `stats.responses`: 收到响应的次数。
-- `stats.successes`: HTTP 2xx/3xx 次数。
-- `stats.failures`: HTTP 4xx/5xx 或失败响应次数。
+- `stats.successes`: HTTP 2xx/3xx 且响应里有具体模型输出的次数；如果响应提供 token usage，`output_tokens`/`completion_tokens` 必须大于 `0`。
+- `stats.failures`: HTTP 4xx/5xx、网络/流式失败，或 HTTP 2xx/3xx 但没有具体输出/输出 token 为 `0` 的次数。
 - `stats.retries`: 因失败而被代理重试/切换的次数。
-- `availability.rate`: 最近窗口内真实模型请求尝试的可用率，`2xx/3xx` 算成功，其他 HTTP、网络错误、超时、上游流式中断算失败。
+- `availability.rate`: 最近窗口内真实模型请求尝试的可用率，只有 HTTP 2xx/3xx 且有具体输出才算成功；其他 HTTP、网络错误、超时、上游流式中断、空输出或输出 token 为 `0` 都算失败。
 - `availability.multiplier`: Selection 使用的可用率权重乘数。样本少于 `min_samples` 时为 `1.0`。
 - `availability.recent`: 最近窗口的成功/失败样本，检测网站会用它画小色块历史。
 - `selection_weight`: `weight * availability.multiplier` 后的基础选择权重。
 - `selection_score`: 当前动态选择分数；不可用站点为 `0`，可用站点会继续计入 in-flight、延迟、Health State 和连续失败惩罚。
+- Selection 会排除显式 Health Probe 失败的站点，例如 `auth_error`、`rate_limited`、`server_error`、`network_error`、`timeout`、`missing_key`、`missing_model_override`、`unexpected_status`。`unknown` 保留为启动/未探测兼容状态，`oauth_ready` 保留为 Codex OAuth 非 live 探测的兼容状态，`stale_model_override` 表示旧模型探测已过期但仍允许实际请求路径尝试。
 - `usage.today_tokens`: 该站点今天的 token 消耗量。
 - `usage.total_tokens`: 该站点累计 token 消耗量。
 - `usage.by_day`: 该站点按日期聚合的 token 消耗量。
@@ -556,11 +725,14 @@ retry-after
 
 ```json
 "retry": {
+  "chat_fallback_probe_timeout_ms": 15000,
   "retryable_statuses": [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524]
 }
 ```
 
 如果你发现某个站点经常用特殊状态码表示临时失败，可以把该状态码加进这个列表。
+
+`chat_fallback_probe_timeout_ms` 控制自动 chat fallback 的首次 `/responses` 探测等待时间，默认 `15000`。只影响尚未识别协议模式的 OpenAI-compatible 上游；一旦某站点 chat fallback 成功，当前进程内后续请求会直接使用 `/chat/completions`。
 
 统计会持久化到：
 

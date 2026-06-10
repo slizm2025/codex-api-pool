@@ -1,6 +1,9 @@
 config.local.json
 secrets.local.json
 *.log
+*.pid
 .DS_Store
 stats.local.json
 backup/
+old_version/
+patch.diff

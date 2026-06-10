@@ -601,12 +601,12 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
 
 状态接口和检测网站会显示每个站点的统计信息：
 
-- `stats.attempts`: 真实打到该上游的请求尝试次数。
-- `stats.responses`: 收到响应的次数。
+- `stats.attempts`: 真实打到该上游的模型交互请求尝试次数。
+- `stats.responses`: 模型交互请求收到响应的次数。
 - `stats.successes`: HTTP 2xx/3xx 且响应里有具体模型输出的次数；如果响应提供 token usage，`output_tokens`/`completion_tokens` 必须大于 `0`。
 - `stats.failures`: HTTP 4xx/5xx、网络/流式失败，或 HTTP 2xx/3xx 但没有具体输出/输出 token 为 `0` 的次数。
 - `stats.retries`: 因失败而被代理重试/切换的次数。
-- `availability.rate`: 最近窗口内真实模型请求尝试的可用率，只有 HTTP 2xx/3xx 且有具体输出才算成功；其他 HTTP、网络错误、超时、上游流式中断、空输出或输出 token 为 `0` 都算失败。
+- `availability.rate`: 最近窗口内模型交互请求尝试的可用率，只有 HTTP 2xx/3xx 且有具体输出才算成功；其他 HTTP、网络错误、超时、上游流式中断、空输出或输出 token 为 `0` 都算失败。模型列表、Health Probe、Billing Probe 和 Management API 请求不计入。
 - `availability.multiplier`: Selection 使用的可用率权重乘数。样本少于 `min_samples` 时为 `1.0`。
 - `availability.recent`: 最近窗口的成功/失败样本，检测网站会用它画小色块历史。
 - `selection_weight`: `weight * availability.multiplier` 后的基础选择权重。
@@ -627,9 +627,9 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
 - `usage.today_tokens`: 全部站点今天的 token 消耗量。
 - `usage.by_day`: 全部站点按日期聚合后的 token 消耗量。
 
-token 统计来自上游响应里的 `usage.total_tokens`、`input_tokens + output_tokens`、`prompt_tokens + completion_tokens`，或常见 token usage 响应头。未压缩的 JSON 响应和 SSE 流式响应里最终事件携带的 usage 都会被统计；压缩响应或未返回 usage 的站点会显示为 `0`/未知，不会估算。
+token 统计来自模型交互响应里的 `usage.total_tokens`、`input_tokens + output_tokens`、`prompt_tokens + completion_tokens`，或常见 token usage 响应头。未压缩的 JSON 响应和 SSE 流式响应里最终事件携带的 usage 都会被统计；压缩响应或未返回 usage 的站点会显示为 `0`/未知，不会估算。`GET /v1/models` 这类元数据请求不展示在最近调用里，也不影响 token 或 Availability 统计。
 
-可用率默认按每个上游最近 50 次真实模型请求尝试计算，Health Probe 不计入。Selection 仍先排除 Disabled、Cooldown、missing key、模型不匹配等硬不可选上游；在剩余候选中，会把上游权重乘以可用率乘数：
+可用率默认按每个上游最近 50 次模型交互请求尝试计算，Health Probe、模型列表、Billing Probe 和 Management API 请求不计入。Selection 仍先排除 Disabled、Cooldown、missing key、模型不匹配等硬不可选上游；在剩余候选中，会把上游权重乘以可用率乘数：
 
 ```text
 样本少于 10 次: 1.00

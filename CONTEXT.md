@@ -33,8 +33,12 @@ The API Pool's latest classification of an Upstream's observed availability, suc
 _Avoid_: status, state, result
 
 **Availability**:
-The recent success rate of real model request attempts for an Upstream, calculated over a bounded rolling window and used as a Selection weight multiplier. Health Probes do not count toward Availability.
+The recent success rate of Model Interaction Request attempts for an Upstream, calculated over a bounded rolling window and used as a Selection weight multiplier. Health Probes, model listing, Billing probes, and Management API requests do not count toward Availability.
 _Avoid_: health, uptime, cumulative success rate
+
+**Model Interaction Request**:
+A client request that is expected to produce model output, such as a Responses, Chat Completions, or Anthropic Messages request. Metadata and operational requests such as model listing, Health Probes, Billing probes, and Management API calls are not Model Interaction Requests.
+_Avoid_: request, API call, probe, model list
 
 **Selection**:
 The process of choosing an available Upstream and Upstream Key for a request. Selection considers weight, Availability, cooldown, health, in-flight requests, failure history, and model support.
@@ -113,7 +117,7 @@ The primary Management Dashboard region for scanning and operating on Upstreams,
 _Avoid_: card grid, gallery, status wall
 
 **Recent Request Timeline**:
-The Management Dashboard region that explains recent request outcomes, including selected Upstream, attempted model, status, duration, token count, Retry, and Fallback evidence.
+The Management Dashboard region that explains recent Model Interaction Request outcomes, including selected Upstream, attempted model, status, duration, token count, Retry, and Fallback evidence.
 _Avoid_: request log, activity feed, history
 
 **Upstream Editor**:

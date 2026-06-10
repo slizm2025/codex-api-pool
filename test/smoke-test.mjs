@@ -1062,6 +1062,15 @@ try {
   if (!result.json.ok || result.json.body.input !== 'hello') {
     throw new Error(`unexpected response body: ${result.text}`);
   }
+  const realTrafficStatus = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
+  const realTrafficGood = realTrafficStatus.upstreams.find((upstream) => upstream.name === 'good');
+  if (
+    realTrafficGood?.capabilities?.responses?.status !== 'verified' ||
+    realTrafficGood?.capabilities?.responses?.source !== 'real_traffic' ||
+    realTrafficGood?.capabilities?.responses?.representative !== true
+  ) {
+    throw new Error(`expected successful native Responses forwarding to learn protocol capability from real traffic: ${JSON.stringify(realTrafficGood?.capabilities)}`);
+  }
 
   const sensitiveHeaderBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
   const sensitiveHeaderResponse = await fetch(`${poolInfo.url}/v1/responses`, {
@@ -1151,6 +1160,20 @@ try {
   });
   const usagePoolInfo = await listen(usagePool);
   try {
+    const modelsMetadata = await getJson(`${usagePoolInfo.url}/v1/models`, 'pool-secret');
+    if (modelsMetadata.response.status !== 200 || modelsMetadata.json.data?.[0]?.id !== 'usage-model') {
+      throw new Error(`expected model listing metadata request to pass through: ${modelsMetadata.response.status} ${modelsMetadata.text}`);
+    }
+    const metadataOnlyStatus = (await getJson(`${usagePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const metadataOnlySite = metadataOnlyStatus.upstreams.find((upstream) => upstream.name === 'usage-site');
+    if (
+      metadataOnlyStatus.recent_requests?.length !== 0 ||
+      metadataOnlySite?.stats?.attempts !== 0 ||
+      metadataOnlySite?.stats?.responses !== 0 ||
+      metadataOnlySite?.availability?.samples !== 0
+    ) {
+      throw new Error(`expected model listing metadata request to stay out of recent requests and availability: ${JSON.stringify({ recent: metadataOnlyStatus.recent_requests, site: metadataOnlySite })}`);
+    }
     await requestJson(usagePoolInfo.url, 'pool-secret');
     await requestJson(usagePoolInfo.url, 'pool-secret');
     const streamBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: true });
@@ -1872,7 +1895,8 @@ try {
 
   chatOnlyResponsesHits = 0;
   chatOnlyChatHits = 0;
-  const chatOnlyPool = createTestPool({
+  const chatOnlyStatsPath = path.join(statsRoot, 'chat-only-capabilities.json');
+  const chatOnlyPoolConfig = {
     server: {
       host: '127.0.0.1',
       port: 0,
@@ -1893,7 +1917,8 @@ try {
     upstreams: [
       { name: 'chat-only', base_url: `${chatOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
     ]
-  });
+  };
+  const chatOnlyPool = createTestPool(chatOnlyPoolConfig, { statsPath: chatOnlyStatsPath });
   const chatOnlyPoolInfo = await listen(chatOnlyPool);
   try {
     const jsonBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
@@ -2084,8 +2109,44 @@ try {
     ) {
       throw new Error(`expected /pool/status to expose warning without error after fallback probe: ${JSON.stringify(postProbeChatOnly)}`);
     }
+    if (
+      postProbeChatOnly?.capabilities?.chat_completions?.status !== 'verified' ||
+      postProbeChatOnly?.capabilities?.chat_completions?.source !== 'probe' ||
+      postProbeChatOnly?.capabilities?.chat_completions?.representative !== true ||
+      postProbeChatOnly?.capabilities?.responses?.status !== 'failed' ||
+      postProbeChatOnly?.capabilities?.responses?.http_status !== 404
+    ) {
+      throw new Error(`expected /pool/status to expose protocol capability evidence after chat fallback probe: ${JSON.stringify(postProbeChatOnly?.capabilities)}`);
+    }
   } finally {
     await close(chatOnlyPool);
+  }
+  const restoredChatOnlyPool = createTestPool(chatOnlyPoolConfig, { statsPath: chatOnlyStatsPath });
+  const restoredChatOnlyPoolInfo = await listen(restoredChatOnlyPool);
+  try {
+    const restoredStatus = (await getJson(`${restoredChatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const restoredChatOnly = restoredStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
+    if (
+      restoredChatOnly?.capabilities?.chat_completions?.status !== 'verified' ||
+      restoredChatOnly?.capabilities?.chat_completions?.source !== 'probe' ||
+      restoredChatOnly?.capabilities?.responses?.status !== 'failed' ||
+      restoredChatOnly?.capabilities?.responses?.http_status !== 404
+    ) {
+      throw new Error(`expected protocol capability evidence to persist across restart: ${JSON.stringify(restoredChatOnly?.capabilities)}`);
+    }
+    chatOnlyResponsesHits = 0;
+    chatOnlyChatHits = 0;
+    const restoredConvertible = await requestJson(restoredChatOnlyPoolInfo.url, 'pool-secret');
+    if (
+      restoredConvertible.response.status !== 200 ||
+      restoredConvertible.response.headers.get('x-codex-api-pool-route') !== 'responses->chat_completions' ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 1
+    ) {
+      throw new Error(`expected restored verified Chat capability to route convertible Responses directly through Chat: ${restoredConvertible.response.status} ${restoredConvertible.text} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+  } finally {
+    await close(restoredChatOnlyPool);
   }
 
   const anthropicMessagesPool = createTestPool({
@@ -2464,6 +2525,72 @@ try {
     await close(listedClaudePool);
   }
 
+  const capabilityClaudePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      {
+        name: 'capability-claude-site',
+        base_url: `${anthropicMessagesInfo.url}/v1`,
+        weight: 1,
+        keys: [{ env: 'TEST_UPSTREAM_KEY' }]
+      }
+    ]
+  });
+  capabilityClaudePool.state.upstreams[0].health.models = ['claude-opus-test'];
+  capabilityClaudePool.state.upstreams[0].health.modelsCount = 1;
+  capabilityClaudePool.state.upstreams[0].capabilities.anthropic_messages = {
+    status: 'verified',
+    source: 'probe',
+    probe_type: 'model_request',
+    representative: true,
+    checked_at: new Date().toISOString(),
+    model: 'claude-opus-test',
+    http_status: 200,
+    reason: ''
+  };
+  const capabilityClaudePoolInfo = await listen(capabilityClaudePool);
+  try {
+    const body = JSON.stringify({
+      model: 'claude-opus-test',
+      stream: false,
+      max_output_tokens: 128,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] }]
+    });
+    const response = await fetch(`${capabilityClaudePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(body))
+      },
+      body
+    });
+    const text = await response.text();
+    if (
+      response.status !== 200 ||
+      response.headers.get('x-codex-api-pool-upstream') !== 'capability-claude-site' ||
+      response.headers.get('x-codex-api-pool-route') !== 'responses->anthropic_messages'
+    ) {
+      throw new Error(`expected verified Messages capability to select Anthropic adapter for Claude request: ${response.status} ${text}`);
+    }
+  } finally {
+    await close(capabilityClaudePool);
+  }
+
   const claudeSelectionPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -2831,6 +2958,9 @@ try {
   if (addResult.json.probe_ok !== true || addResult.json.probe_status !== 'ok' || addResult.json.health?.state !== 'ok' || addResult.json.health?.modelsCount !== 2) {
     throw new Error(`expected added upstream health ok with two models: ${addResult.text}`);
   }
+  if (addResult.json.capabilities?.responses?.status !== 'verified' || addResult.json.capabilities?.responses?.source !== 'probe') {
+    throw new Error(`expected add upstream response to include protocol capability probe evidence: ${addResult.text}`);
+  }
 
   const statusAfterAdd = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
   if (!statusAfterAdd.model?.known?.includes('added-model-b')) {
@@ -2841,6 +2971,31 @@ try {
   const addedStatus = statusAfterAdd.upstreams.find((upstream) => upstream.name === 'added-site');
   if (!addedStatus?.signin_available || addedStatus?.signin_status !== 'completed' || addedStatus?.signin_completed !== true || addedStatus?.signin_completed_date !== today) {
     throw new Error(`expected status to expose sign-in availability and completion: ${JSON.stringify(addedStatus)}`);
+  }
+
+  const declaredCapabilityResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
+    name: 'declared-chat-site',
+    base_url: `${chatOnlyInfo.url}/v1`,
+    weight: 1,
+    enabled: false,
+    keys: [{ env: 'TEST_UPSTREAM_KEY' }],
+    protocol_capabilities: {
+      chat_completions: 'assumed',
+      responses: 'disabled'
+    }
+  });
+  if (declaredCapabilityResult.response.status !== 201) {
+    throw new Error(`expected declared capability upstream add to succeed: ${declaredCapabilityResult.response.status} ${declaredCapabilityResult.text}`);
+  }
+  const declaredCapabilityStatus = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
+  const declaredCapabilitySite = declaredCapabilityStatus.upstreams.find((upstream) => upstream.name === 'declared-chat-site');
+  if (
+    declaredCapabilitySite?.capabilities?.chat_completions?.status !== 'assumed' ||
+    declaredCapabilitySite?.capabilities?.chat_completions?.source !== 'user_declared' ||
+    declaredCapabilitySite?.capabilities?.responses?.status !== 'disabled' ||
+    declaredCapabilitySite?.capabilities?.responses?.source !== 'user_declared'
+  ) {
+    throw new Error(`expected Management API to expose user-declared protocol capabilities: ${JSON.stringify(declaredCapabilitySite?.capabilities)}`);
   }
 
   const replaceResult = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
@@ -3724,6 +3879,17 @@ try {
     const site = status.upstreams.find((upstream) => upstream.name === 'codex-forward-only');
     if (site?.available !== true || site?.selection_score <= 0 || site?.health?.state !== 'advanced_curl_required') {
       throw new Error(`expected advanced-curl upstream to stay selectable for real forwarding: ${JSON.stringify(site)}`);
+    }
+    if (
+      site?.capabilities?.responses?.status !== 'unknown' ||
+      site?.capabilities?.responses?.source !== 'probe' ||
+      site?.capabilities?.responses?.representative !== false ||
+      site?.capabilities?.responses?.http_status !== 403 ||
+      site?.capabilities?.chat_completions?.status !== 'unknown' ||
+      site?.capabilities?.chat_completions?.representative !== false ||
+      site?.capabilities?.chat_completions?.http_status !== 403
+    ) {
+      throw new Error(`expected non-representative advanced-curl Responses probe to stay unknown: ${JSON.stringify(site?.capabilities)}`);
     }
     const realCodexBody = JSON.stringify({ model: 'gpt-5.5', input: 'hello', stream: false });
     const realCodexResponse = await fetch(`${codexForwardOnlyPoolInfo.url}/v1/responses`, {

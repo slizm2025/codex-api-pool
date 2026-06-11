@@ -10,6 +10,15 @@
     "admin_auth_token_env": ""
   },
   "model_override": "",
+  "compatibility": {
+    "adapter_mode": {
+      "strip_responses_only_features": false,
+      "adapters": {
+        "anthropic_messages": true,
+        "chat_completions": true
+      }
+    }
+  },
   "retry": {
     "max_attempts": 4,
     "failure_threshold": 2,

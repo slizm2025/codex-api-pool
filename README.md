@@ -1,245 +1,185 @@
 # Codex API Pool
 
-本目录实现一个本地 OpenAI-compatible API 池代理。Codex 只连接 `127.0.0.1:8787`，代理在背后自动选择可用 API 站点和 key。
+Codex API Pool 是一个运行在本机的 OpenAI-compatible API Pool。Codex 只连接本地入口，API Pool 在背后根据 Upstream 健康、可用率、冷却状态、模型能力和权重选择真正的上游。
 
-## 能解决什么
+默认本地入口：
 
-- 上游 API 站点不稳定时，自动切换到另一个站点。
-- 某个 key 触发 `429`、`401`、`403` 或连续失败时，进入冷却。
-- 对 `400`、`401`、`403`、`404`、`408`、`409`、`425`、`429`、`5xx`、Cloudflare `521`-`524`、网络错误、超时进行切站点重试。
-- 保持 `/v1/responses`、`/v1/models` 等路径形式，适配 Codex 的 `wire_api = "responses"`。
+```text
+OpenAI-compatible API: http://127.0.0.1:8787/v1
+Management Dashboard: http://127.0.0.1:8787/pool/dashboard
+Health:                http://127.0.0.1:8787/health
+```
 
-## 重要边界
+## 当前架构
 
-代理会在上游开始返回响应之前做重试和切换。一旦上游已经返回 `200` 并开始流式输出，代理会直接转发该流；如果这时上游中途断流，无法无损续接同一个生成，只能让当前 Codex turn 失败或由 Codex 重新发起。
+项目现在由一个 Node.js 进程承载三类能力：
 
-对 OpenAI-compatible 上游，代理默认优先使用 `/v1/responses`。如果某个站点只支持 `/v1/chat/completions`，代理会在 `/responses` 超时或返回可重试错误时自动改打 `/chat/completions`，并把 Chat Completions 的 JSON/SSE 响应转换回 Codex 需要的 Responses JSON/SSE 格式。chat fallback 成功后，该站点在当前进程内会直接复用 `chat_completions` 模式，避免每次都先等 `/responses` 超时。
+| 层 | 入口 | 作用 |
+| --- | --- | --- |
+| Model API | `/v1/*` | 给 Codex 暴露 OpenAI-compatible 接口，处理鉴权、Selection、Retry、Fallback、协议适配和流式转发。 |
+| Management API | `/pool/*` | 查看 Runtime State、管理 Upstream、触发 Health Probe、刷新 Billing、切换 Model Override、导入 JSON。 |
+| Runtime State | `stats.local.json` 和内存状态 | 保存 Usage、Quota、Availability、Recent Requests、Protocol Capabilities、Health State、Billing 等运行态信息。 |
 
-## 文件
+核心请求路径：
 
-- `src/server.mjs`: 本地代理服务。
-- `config.local.json`: 你的本地池配置；默认只引用环境变量，也支持按需保存明文 key。
-- `config.example.json`: 示例配置。
-- `test/smoke-test.mjs`: 本地失败切换烟测。
+```mermaid
+flowchart LR
+  Codex["Codex CLI"] --> Pool["Codex API Pool /v1"]
+  Pool --> Auth["Pool Token 校验"]
+  Auth --> Selection["Selection: weight + availability + health + cooldown + model"]
+  Selection --> Route["协议路线规划"]
+  Route --> Native["Native Responses"]
+  Route --> Chat["Responses -> Chat Completions"]
+  Route --> Anthropic["Responses -> Anthropic Messages"]
+  Route --> OAuth["Codex OAuth Responses"]
+  Native --> Upstream["Upstream"]
+  Chat --> Upstream
+  Anthropic --> Upstream
+  OAuth --> Upstream
+  Upstream --> Stream["转发响应并记录 Usage/Quota/Availability"]
+  Stream --> Codex
+```
 
-## 环境变量
+### 协议路线
 
-推荐使用两层令牌，职责完全分开：
+Codex 侧推荐始终使用 `wire_api = "responses"`。API Pool 会根据模型和 Upstream 能力选择路线：
+
+| Codex 请求 | Upstream 类型 | 行为 |
+| --- | --- | --- |
+| `/v1/responses`, GPT/Codex 模型 | OpenAI Responses | 原样转发到 Upstream 的 Responses 接口。 |
+| `/v1/responses`, GPT/Codex 模型 | Chat Completions-only | 将 Responses payload 转成 Chat Completions，并把 JSON/SSE 转回 Responses 形状。 |
+| `/v1/responses`, `claude-*` 模型 | Anthropic Messages | 将 Responses payload 转成 Anthropic Messages，并把 JSON/SSE 转回 Responses 形状。 |
+| `/v1/responses` | Codex OAuth account | 按 Codex OAuth 需要的 headers 转发到 ChatGPT Codex backend。 |
+| `/v1/models` 等其他路径 | OpenAI-compatible Upstream | 去掉本地前缀后透传。 |
+
+当请求包含当前适配器无法无损转换的 Responses 特性时，API Pool 会优先寻找原生 Responses Upstream；没有合适候选时返回带诊断信息的 `422`，避免静默降级。
+
+如果你明确接受普通对话优先于完整 Responses 语义，可以在 Dashboard 打开 Adapter 兼容模式，或在配置中启用：
+
+```json
+{
+  "compatibility": {
+    "adapter_mode": {
+      "strip_responses_only_features": true,
+      "adapters": {
+        "anthropic_messages": true,
+        "chat_completions": true
+      }
+    }
+  }
+}
+```
+
+开启后，只有在没有可用原生 Responses Route 时，API Pool 才会按目标 API 的官方字段做兼容转换，然后再走 Anthropic Messages 或 Chat Completions adapter。每次请求都会通过响应头和 Recent Request Timeline 标明本次发生了哪些 `converted`、`downgraded`、`stripped`：
+
+- `input_image` 会转成 Chat Completions 的 `image_url` content part，或 Anthropic Messages 的 `image` content block。
+- `input_file` 会按目标 API 细分转换：Chat Completions 支持 `file_id` 或 `file_data`/`filename` 的 `file` content part；Anthropic Messages 支持 PDF/text/URL 形态的 `document` content block。Chat Completions 没有 `file_url` 字段，遇到只有 `file_url` 的文件块时会剔除并上报。
+- 如果用户内容块主体被保留，但目标 API 没有等价子字段，会在 `downgraded.fields` 里上报，例如 `input_image.detail` 或 `input_file.detail`。
+- `custom_tool_call` / `custom_tool_call_output` 会转成 Chat tool calls/tool messages，或 Anthropic `tool_use` / `tool_result`。
+- `custom` tools 会转成 Chat custom tools；到 Anthropic 时会降级成普通 client tool。
+- `namespace` tools 会展开成带 namespace 前缀的普通工具。
+- `web_search` / `web_search_preview` 会转成 Chat `web_search_options` 或 Anthropic `web_search_20260209`，并标记为降级，因为返回的 hosted-tool 事件形状不完全相同。
+- `tool_search` 会转成 Anthropic `tool_search_tool_bm25_20251119`；Chat Completions 没有等价字段，只能剔除并上报。
+- `text.verbosity` 会转成 Chat 顶层 `verbosity`；Anthropic Messages 没有等价字段，只能剔除并上报。
+- `reasoning.effort` 会转成 Chat `reasoning_effort` 或 Anthropic `output_config.effort`；Responses reasoning 输入项、`previous_response_id`、`conversation`、`include`、`background`、`truncation`、`context_management`、`prompt`、`moderation`、`max_tool_calls` 这类 Responses 状态/输出控制字段没有 Chat/Claude 等价字段，只能剔除并上报。
+- `image_generation` 是 Responses 原生图片生成工具，Chat Completions 和 Anthropic Messages 没有等价工具，只能剔除并上报。
+
+用户文本和已确认可映射的多模态内容不会被静默剔除；被剔除的内容必须出现在 `x-codex-api-pool-stripped` 和 Recent Request Timeline 中。
+
+### Selection 与 Retry
+
+Selection 会先排除这些候选：
+
+- Disabled Upstream
+- 缺少 Upstream Key
+- Upstream 或 Key 处于 Cooldown
+- Codex OAuth token 已过期
+- Health State 明确不可用
+- 与 Requested Model 或 Model Override 不匹配
+- 对当前请求不支持所需协议能力
+
+剩余候选按动态分数抽选：
+
+```text
+selection_score = weight * availability_multiplier
+                  / (1 + in_flight + latency_penalty + health_penalty + failure_penalty)
+```
+
+默认可重试状态码：
+
+```text
+400, 401, 403, 404, 408, 409, 425, 429,
+500, 502, 503, 504, 521, 522, 523, 524
+```
+
+重要边界：API Pool 只会在 Upstream 开始返回成功响应前 Retry 或 Fallback。一旦 Upstream 返回 `200` 并开始流式输出，API Pool 会直接转发该流；如果之后中途断流，无法无损续接同一个生成，只能让当前 Codex turn 失败或由 Codex 重新发起。
+
+## 文件结构
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/server.mjs` | API Pool 主服务，包含 Model API、Management API、Selection、Retry、适配器、Dashboard 和状态持久化。 |
+| `src/codex-oauth/*.mjs` | Codex OAuth account 导入、JWT 元数据解析、secret materialize 和运行态投影。 |
+| `scripts/add-upstream.mjs` | 通过 Management API 添加或替换 Upstream。 |
+| `scripts/set-model.mjs` | 通过 Management API 设置 `model_override`。 |
+| `scripts/service.mjs` | 生成和管理 macOS LaunchAgent。 |
+| `config.example.json` | Pool Configuration 示例。 |
+| `config.local.json` | 本机 Pool Configuration，默认启动路径，不提交。 |
+| `secrets.local.json` | Codex OAuth secret 存储，按需生成，不提交。 |
+| `stats.local.json` | Runtime State 持久化文件，按需生成，不提交。 |
+| `test/smoke-test.mjs` | 端到端烟测。 |
+| `CONTEXT.md` | 领域词汇说明。 |
+
+## 快速启动
+
+要求 Node.js `>=18`。
 
 ```bash
-# Codex -> 本地代理，只用于进入本地池，不转发给上游
-export CODEX_POOL_API_KEY="本地代理访问令牌"
+cd /Users/slizm/myprojects/codex-api-pool
+cp config.example.json config.local.json
+```
 
-# 本地代理 -> 各个上游站点，只发给对应站点
+推荐把 Pool Token 和 Upstream Key 放到 shell 环境里：
+
+```bash
+# Codex -> 本地 API Pool，只用于进入本地池，不转发给 Upstream
+export CODEX_POOL_API_KEY="本地池访问令牌"
+
+# API Pool -> 各 Upstream，只发给对应 Upstream
 export RAWCHAT_API_KEY="rawchat 的 key"
 export SUB2API_API_KEY="sub2api 的 key"
 export BLACK_API_KEY="black 的 key"
 ```
 
-如果某个上游 key 没设置，该站点会在检测网站里显示 `missing_key`，不会参与正常调度。
-
-新增站点时也建议给它单独的环境变量，例如：
+前台启动：
 
 ```bash
-export MYSITE_API_KEY="mysite 的 key"
-npm run add -- mysite https://example.com/v1 2 MYSITE_API_KEY
-```
-
-如果你明确希望把上游 key 直接写入本地配置，也可以使用明文模式：
-
-```bash
-npm run add -- mysite https://example.com/v1 2 --key sk-xxxx
-```
-
-明文 key 会写入 `config.local.json`，只适合你确认这台机器和该文件权限都安全的场景。
-
-## 启动
-
-### 启动速查
-
-当前本地配置来自 `config.local.json`，默认形态如下：
-
-- 监听地址：`127.0.0.1:8787`
-- OpenAI-compatible 入口：`http://127.0.0.1:8787/v1`
-- 管理面板：`http://127.0.0.1:8787/pool/dashboard`
-- Codex 访问本地池的 token 环境变量：`CODEX_POOL_API_KEY`
-- 管理接口 token 环境变量：当前 `admin_auth_token_env` 为空，本机 `/pool/*` 默认不强制 Bearer token
-- 当前模型覆盖：以 `config.local.json` 中的 `model_override` 为准
-- 健康检查：如果 `health.enabled` 是 `false`，需要用命令或管理面板手动探测
-
-前台临时运行：
-
-```bash
-cd /Users/slizm/myprojects/codex-api-pool
 npm run start
 ```
 
-不想依赖 npm 脚本也可以直接：
+也可以显式指定配置：
 
 ```bash
-node /Users/slizm/myprojects/codex-api-pool/src/server.mjs /Users/slizm/myprojects/codex-api-pool/config.local.json
+CODEX_POOL_CONFIG=/Users/slizm/myprojects/codex-api-pool/config.local.json node src/server.mjs
 ```
 
-### 作为 macOS 服务运行
-
-推荐用项目内的服务脚本生成用户级 LaunchAgent。它会使用当前仓库路径、当前 Node 可执行文件、`config.local.json`，并让 launchd 在异常退出时自动拉起服务。
-
-- 服务名：`com.slizm.codex-api-pool`
-- plist 路径：`/Users/slizm/Library/LaunchAgents/com.slizm.codex-api-pool.plist`
-- 标准输出：`/Users/slizm/myprojects/codex-api-pool/pool.out.log`
-- 错误输出：`/Users/slizm/myprojects/codex-api-pool/pool.err.log`
-
-安装或更新服务，并立即启动：
-
-```bash
-npm run service:install
-```
-
-如果你已经在终端里运行着 API Pool，先只写入 plist，不启动服务，避免两个进程争用 `127.0.0.1:8787`：
-
-```bash
-npm run service -- install --no-start
-```
-
-然后停止终端里的前台进程，再启动 LaunchAgent：
-
-```bash
-npm run service:start
-```
-
-查看服务状态和 `/health`：
-
-```bash
-npm run service:status
-```
-
-重启服务：
-
-```bash
-npm run service:restart
-```
-
-停止服务但保留 plist：
-
-```bash
-npm run service:stop
-```
-
-卸载服务并删除 plist：
-
-```bash
-npm run service:uninstall
-```
-
-预览生成的 plist：
-
-```bash
-npm run service -- plist
-```
-
-生成的 LaunchAgent 会先加载 `~/.zshrc`，所以 `CODEX_POOL_API_KEY` 和各上游 API key 应放在 `~/.zshrc` 或它会加载的文件中；否则后台启动时可能读不到这些环境变量。服务端收到 `SIGTERM` 时会优雅停接新请求、落盘运行状态，并在 `server.graceful_shutdown_ms` 后强制关闭仍未结束的连接。
-
-### nohup 兜底后台启动
-
-如果 macOS 拒绝 `launchctl bootstrap`，可以临时用 `nohup` 后台启动。这个方式不阻塞终端，但不会由 launchd 自动守护：
-
-```bash
-nohup /bin/zsh -lc 'source ~/.zshrc; exec node /Users/slizm/myprojects/codex-api-pool/src/server.mjs /Users/slizm/myprojects/codex-api-pool/config.local.json' \
-  >> /Users/slizm/myprojects/codex-api-pool/pool.out.log \
-  2>> /Users/slizm/myprojects/codex-api-pool/pool.err.log \
-  < /dev/null &
-echo $! > /Users/slizm/myprojects/codex-api-pool/pool.pid
-```
-
-检查是否启动成功：
-
-```bash
-curl -s http://127.0.0.1:8787/health
-lsof -nP -iTCP:8787 -sTCP:LISTEN
-```
-
-停止 `nohup` 启动的实例：
-
-```bash
-lsof -tiTCP:8787 -sTCP:LISTEN
-kill "$(lsof -tiTCP:8787 -sTCP:LISTEN)"
-```
-
-启动后查看状态：
+检查：
 
 ```bash
 curl -s http://127.0.0.1:8787/health
 curl -s http://127.0.0.1:8787/pool/status
 ```
 
-如果启用了 `admin_auth_token_env`，需要带上管理 token：
+如果 `server.admin_auth_token_env` 配了环境变量，访问 Management API 时要带 Admin Token：
 
 ```bash
 curl -s http://127.0.0.1:8787/pool/status \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
-### 常见命令
-
-查看服务健康：
-
-```bash
-curl -s http://127.0.0.1:8787/health
-```
-
-查看完整池状态：
-
-```bash
-curl -s http://127.0.0.1:8787/pool/status
-```
-
-打开管理面板：
-
-```text
-http://127.0.0.1:8787/pool/dashboard
-```
-
-手动探测全部上游：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/pool/probe
-```
-
-手动探测单个上游，例如 `rawchat`：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe
-```
-
-停用或启用单个上游：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
-  -H "Content-Type: application/json" \
-  -d '{"enabled": false}'
-
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
-  -H "Content-Type: application/json" \
-  -d '{"enabled": true}'
-```
-
-刷新余额：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/billing
-curl -s -X POST http://127.0.0.1:8787/pool/billing
-```
-
-查看日志：
-
-```bash
-tail -f /Users/slizm/myprojects/codex-api-pool/pool.out.log
-tail -f /Users/slizm/myprojects/codex-api-pool/pool.err.log
-```
-
 ## Codex 配置
 
-把 `~/.codex/config.toml` 顶部改成：
+把 `~/.codex/config.toml` 的默认模型 provider 指向本地池：
 
 ```toml
 model = "gpt-5.5"
@@ -253,108 +193,255 @@ wire_api = "responses"
 env_key = "CODEX_POOL_API_KEY"
 ```
 
-原来的 `[model_providers.custom]`、`[model_providers.sub2codex]`、`[model_providers.blackandwhilt]` 可以先保留，方便手动回退；只要 `model_provider = "api_pool"`，Codex 就会走本地池。
+只要 `model_provider = "api_pool"`，Codex 就会走本地池。原来直连单个中转站的 provider 可以保留，方便手动回退。
 
-如果某个 Codex provider 不是走本地池，而是直接连单个中转站，也可以二选一配置 key。推荐环境变量：
+## Pool Configuration
 
-```toml
-[model_providers.xxx]
-name = "xxx"
-base_url = "https://xxxx.cn"
-wire_api = "responses"
-env_key = "XXX_API_KEY"
-requires_openai_auth = true
-web_search = "live"
-supports_websockets = false
+`config.local.json` 的主要结构：
+
+```json
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "public_prefix": "/v1",
+    "auth_token_env": "CODEX_POOL_API_KEY",
+    "admin_auth_token_env": "",
+    "max_body_bytes": 52428800,
+    "request_timeout_ms": 180000,
+    "graceful_shutdown_ms": 15000
+  },
+  "model_override": "",
+  "retry": {
+    "max_attempts": 4,
+    "failure_threshold": 2,
+    "base_cooldown_ms": 30000,
+    "key_cooldown_ms": 60000,
+    "chat_fallback_probe_timeout_ms": 15000
+  },
+  "availability": {
+    "window_size": 50,
+    "min_samples": 10
+  },
+  "health": {
+    "enabled": false,
+    "interval_ms": 60000,
+    "timeout_ms": 10000,
+    "concurrency": 4,
+    "path": "/models"
+  },
+  "billing": {
+    "timeout_ms": 10000,
+    "concurrency": 3
+  },
+  "stats": {
+    "path": "stats.local.json"
+  },
+  "upstreams": []
+}
 ```
 
-或者直接写入明文：
+### Token 分层
 
-```toml
-[model_providers.xxx]
-name = "xxx"
-base_url = "https://xxxx.cn"
-wire_api = "responses"
-experimental_bearer_token = "sk-xxxx"
-requires_openai_auth = true
-web_search = "live"
-supports_websockets = false
+| 名称 | 配置 | 用途 |
+| --- | --- | --- |
+| Pool Token | `server.auth_token_env` | Codex 调用 `/v1/*` 时使用，只在本地校验，不转发给 Upstream。 |
+| Admin Token | `server.admin_auth_token_env` | 访问 `/pool/*` Management API 时使用。为空表示本机管理接口不强制 Bearer token。 |
+| Upstream Key | `upstreams[].keys[].env` 或 `value` | API Pool 调用外部 Upstream 时使用。推荐引用环境变量。 |
+
+如果配置了某个 token env，但服务进程读不到对应环境变量，请求会被拒绝。只有把配置值显式留空，才表示关闭该层鉴权。
+
+### Upstream 配置
+
+最小 OpenAI-compatible Upstream：
+
+```json
+{
+  "name": "rawchat",
+  "api": "openai",
+  "base_url": "https://new.sharedchat.cc/codex",
+  "weight": 3,
+  "keys": [{ "env": "RAWCHAT_API_KEY" }]
+}
 ```
 
-## 手动切换模型
+Anthropic-only Upstream：
 
-保持 Codex 连接本地池不变，通过代理级 `model_override` 在 GPT 和 Claude 之间切换：
+```json
+{
+  "name": "runanytime_claude",
+  "api": "anthropic",
+  "base_url": "https://runanytime.example",
+  "health_path": "/v1/models",
+  "probe_auth": "anthropic",
+  "weight": 1,
+  "keys": [{ "env": "RUN_CLAUDE_API_KEY" }]
+}
+```
+
+同时支持 OpenAI-compatible 和 Anthropic Messages 的 Upstream 使用：
+
+```json
+{
+  "name": "dual",
+  "api": "both",
+  "base_url": "https://example.com/v1",
+  "weight": 1,
+  "keys": [{ "env": "DUAL_API_KEY" }]
+}
+```
+
+常用字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `api` | `openai`、`anthropic` 或 `both`。影响 Claude/GPT 模型的候选过滤。 |
+| `request_mode` | `auto`、`responses`、`chat_completions` 或 `codex_oauth`。未配置时自动判断。 |
+| `weight` | 基础权重，越高越容易被选中，但仍受 Availability、Cooldown、延迟和失败惩罚影响。 |
+| `keys` | 可配置多个 Upstream Key。每个 key 有独立失败次数、Cooldown、Health 和 Quota。 |
+| `proxy_url` | 可选 HTTP 代理，例如 `http://127.0.0.1:7897`，HTTPS 会走 CONNECT 隧道。 |
+| `site_url` | 管理面板打开 Upstream 站点用。 |
+| `signin_available` | 标记该 Upstream 是否需要每日签到。 |
+| `billing` | 自定义 Billing probe 路径和字段。 |
+
+## 运行方式
+
+### 前台运行
 
 ```bash
-cd /Users/slizm/Desktop/脚本/codex-api-pool
+cd /Users/slizm/myprojects/codex-api-pool
+npm run start
+```
+
+### macOS LaunchAgent
+
+服务脚本会生成用户级 LaunchAgent，并让 launchd 守护进程：
+
+```bash
+npm run service:install
+npm run service:status
+npm run service:restart
+npm run service:stop
+npm run service:uninstall
+```
+
+默认信息：
+
+```text
+Label:  com.slizm.codex-api-pool
+plist:  ~/Library/LaunchAgents/com.slizm.codex-api-pool.plist
+stdout: /Users/slizm/myprojects/codex-api-pool/pool.out.log
+stderr: /Users/slizm/myprojects/codex-api-pool/pool.err.log
+```
+
+安装但不立即启动：
+
+```bash
+npm run service -- install --no-start
+```
+
+预览 plist：
+
+```bash
+npm run service -- plist
+```
+
+LaunchAgent 会先加载 `~/.zshrc`，所以 `CODEX_POOL_API_KEY` 和各 Upstream Key 应放在 `~/.zshrc` 或它会加载的文件中。
+
+### nohup 兜底
+
+如果 launchd 不可用，可以临时用 `nohup`：
+
+```bash
+nohup /bin/zsh -lc 'source ~/.zshrc; exec node /Users/slizm/myprojects/codex-api-pool/src/server.mjs /Users/slizm/myprojects/codex-api-pool/config.local.json' \
+  >> /Users/slizm/myprojects/codex-api-pool/pool.out.log \
+  2>> /Users/slizm/myprojects/codex-api-pool/pool.err.log \
+  < /dev/null &
+```
+
+查看监听：
+
+```bash
+lsof -nP -iTCP:8787 -sTCP:LISTEN
+```
+
+## 日常操作
+
+### 管理面板
+
+打开：
+
+```text
+http://127.0.0.1:8787/pool/dashboard
+```
+
+Dashboard 是本地 Operational Console，主要用于：
+
+- 看 API Pool 是否可用、降级或被阻塞
+- 查看 Upstream Health State、Cooldown、Availability、Usage、Billing、Quota
+- 查看 Recent Request Timeline 和 Fallback 证据
+- 添加、编辑、删除、启用、停用 Upstream
+- 触发单个或全部 Health Probe
+- 切换 Model Override
+- 导入 JSON Upstream 或 Codex OAuth account
+- 对 Upstream 执行 curl-style 诊断
+
+如果启用了 Admin Token，页面右上角填写 token 后会保存在浏览器本地存储。
+
+### 切换 Model Override
+
+保持 Codex 连接本地池不变，通过 API Pool 改写 outgoing request body 里的 `model`：
+
+```bash
 npm run model -- gpt
 npm run model -- claude
 npm run model -- off
 ```
 
-别名含义：
+别名：
 
-- `gpt`: 切到 `gpt-5.5`。
-- `claude`: 切到 `claude-opus-4-8`。
-- `off`: 清空 `model_override`，使用 Codex 请求里的原始模型。
+| 别名 | 实际模型 |
+| --- | --- |
+| `gpt` | `gpt-5.5` |
+| `claude` | `claude-opus-4-8` |
+| `off` | 清空 override，使用 Codex 请求中的 Requested Model |
 
-也可以直接传完整模型名：
+也可以传完整模型名：
 
 ```bash
 npm run model -- claude-opus-4-8
 npm run model -- gpt-5.5
 ```
 
-脚本会调用本地 `/pool/model`，随后读取 `/pool/status` 并输出当前覆盖模型、可用上游数量、匹配当前模型的上游数量。如果管理接口启用了鉴权，脚本默认从 `CODEX_POOL_API_KEY` 读取 Bearer token；也可以用 `--token-env` 指定其他环境变量。
-
-## 调整权重
-
-`config.local.json` 中：
-
-```json
-{ "name": "rawchat", "weight": 3 }
-```
-
-权重越高越优先。某个站点坏掉会自动熔断，冷却后再尝试恢复。
-
-## 自测
+如果 Management API 启用了鉴权，脚本默认从 `CODEX_POOL_API_KEY` 读取 Admin Token；也可以指定：
 
 ```bash
-cd /Users/slizm/Desktop/脚本/codex-api-pool
-npm run smoke
+npm run model -- claude --token-env CODEX_POOL_ADMIN_TOKEN
 ```
 
-看到下面输出说明失败切换正常：
+### 添加 Upstream
 
-```text
-smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, availability scoring, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, and immediate health probe all passed
-```
-
-## 主动添加新站点
-
-代理运行后，可以不重启直接添加新站点：
+运行中的 API Pool 可以不重启直接添加 Upstream：
 
 ```bash
-cd /Users/slizm/Desktop/脚本/codex-api-pool
 npm run add -- mysite https://example.com/v1 2 MY_SITE_API_KEY --site-url https://example.com
 ```
 
-参数含义：
+常用参数：
 
-- `mysite`: 站点名称，只能包含字母、数字、点、下划线、短横线。
-- `https://example.com/v1`: 上游 base URL。
-- `2`: 权重，越高越优先。
-- `MY_SITE_API_KEY`: 存放该站点 key 的环境变量名；也可以用 `--key-env MY_SITE_API_KEY` 显式传入。
-- `--key`: 可选，直接把明文 API key 写入 `config.local.json`。
-- `--site-url`: 可选，站点签到页。
-- `--api`: 可选，`openai`、`anthropic` 或 `both`；同时支持 Codex/GPT 和 Claude Messages 的上游应标记为 `both`。
-- `--replace`: 可选，替换同名站点。
-- `--pool-url`: 可选，管理接口地址，默认 `http://127.0.0.1:8787`。
-- `--token-env`: 可选，管理接口 Bearer token 的环境变量名，默认 `CODEX_POOL_API_KEY`。
+| 参数 | 说明 |
+| --- | --- |
+| `name` | Upstream 名称，只能包含字母、数字、点、下划线、短横线。 |
+| `base_url` | Upstream API base URL。 |
+| `weight` | 基础权重。 |
+| `key_env` 或 `--key-env` | 保存 Upstream Key 的环境变量名。 |
+| `--key sk-...` | 将明文 key 写入 `config.local.json`，只适合确认本机文件安全的场景。 |
+| `--api openai|anthropic|both` | 显式声明协议能力。 |
+| `--replace` | 替换同名 Upstream。 |
+| `--pool-url` | Management API 地址，默认 `http://127.0.0.1:8787`。 |
+| `--token-env` | Admin Token 环境变量，默认 `CODEX_POOL_API_KEY`。 |
 
-添加成功后会自动写入 `config.local.json`，并立刻执行一次健康探测。
-
-也可以直接用 HTTP 管理接口：
+HTTP 等价接口：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/pool/upstreams \
@@ -368,68 +455,11 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams \
   }'
 ```
 
-如果要通过 HTTP 管理接口保存明文 key，可以用任意一种等价写法：
+如果没有显式传 `api` 或 `probe_auth`，API Pool 会在添加后尝试探测 OpenAI-compatible 和 Anthropic 能力，并把识别结果写回配置。
 
-```json
-{ "keys": [{ "value": "sk-xxxx" }] }
-```
+### 批量导入
 
-```json
-{ "experimental_bearer_token": "sk-xxxx" }
-```
-
-添加 Claude/Anthropic Messages 上游时，建议显式标记协议，避免 Claude 模型误打普通 OpenAI-compatible 上游：
-
-```bash
-npm run add -- runanytime_claude https://runanytime.hxi.me 1 RUN_CLAUDE_API_KEY --api anthropic --replace
-```
-
-如果同一个上游同时支持 OpenAI-compatible 和 Anthropic Messages，使用：
-
-```bash
-npm run add -- runanytime https://runanytime.hxi.me/v1 1 RUNANYTIME_API_KEY --api both --replace
-```
-
-等价的配置写法：
-
-```json
-{
-  "name": "runanytime_claude",
-  "api": "anthropic",
-  "base_url": "https://runanytime.hxi.me",
-  "health_path": "/v1/models",
-  "probe_auth": "anthropic",
-  "keys": [{ "env": "RUN_CLAUDE_API_KEY" }]
-}
-```
-
-为了兼容旧配置，`probe_auth: "anthropic"` 也会被视为 Anthropic 能力。选择 `claude-*` 模型时，Selection 只会使用 `api: "anthropic"`、`api: "both"` 或 `probe_auth: "anthropic"` 的上游；选择非 Claude 模型时，只会跳过 `api: "anthropic"` 这种 Anthropic-only 上游。
-
-`api: "both"` 表示该上游同时具备 OpenAI-compatible 和 Anthropic Messages 能力。选择 `claude-*` 模型时它可以参与 Claude Selection；选择 GPT/Codex 模型时它也不会被跳过。
-
-新增上游时，如果没有显式传 `--api` 或 `probe_auth`，代理会在常规 OpenAI-compatible 真实模型探测后，额外尝试一次 Anthropic 能力探测。自动写入规则：
-
-- OpenAI-compatible 真实模型探测成功，Anthropic 探测也成功且发现 `claude-*` 模型：写入 `api: "both"`。
-- OpenAI-compatible 探测失败，Anthropic 探测成功且发现 `claude-*` 模型：写入 `api: "anthropic"`、`probe_auth: "anthropic"` 和默认 `health_path: "/v1/models"`。
-- OpenAI-compatible `/models` 里列出了 Claude 模型，但 Anthropic 探测失败：保持 `api: "openai"`，避免后续误打 `/v1/messages`。
-
-不推荐在共享机器或会同步/备份的目录里传 `{ "value": "sk-..." }`，因为这会把 key 明文写入 `config.local.json`。更安全的方式是传 `{ "env": "MY_SITE_API_KEY" }`。
-
-## 从 JSON 批量导入 Upstream
-
-管理页 `http://127.0.0.1:8787/pool/dashboard` 里可以直接上传 sub2api、cpa 或通用 JSON 文件。导入器会识别 `upstreams`、`sites`、`providers`、`endpoints`、`apis`、`accounts`、`nodes` 等数组或对象，并从常见字段生成 Upstream：
-
-- 名称：`name`、`id`、`title`、`label`、`remark`、`provider`
-- Base URL：`base_url`、`baseUrl`、`api_url`、`apiUrl`、`endpoint`、`url`
-- Key：`key_env`、`keyEnv`、`env`，或 `api_key`、`apiKey`、`key`、`token`、`experimental_bearer_token`
-
-如果 sub2api 导出的 JSON 是账号格式，例如顶层包含 `proxies: []` 和 `accounts: [{ "platform": "openai", "type": "oauth", "credentials": { "access_token": "..." } }]`，导入器会把每个 OpenAI OAuth account 转成 `codex_oauth` Upstream：请求会按 sub2api 的方式转发到 `https://chatgpt.com/backend-api/codex/responses`，并使用 `credentials.access_token` 作为 Bearer token。导入器也会从 JWT 里记录 `oauth_client_id`，用于区分 Codex OAuth token 和 ChatGPT Web session token。
-
-OAuth 上游不支持普通 `/models` 探测，后台健康检查会显示 `oauth_ready` 或 token 过期状态。管理页“测试”会发送真实 `/responses` 请求；如果 `/responses` 返回 401/403，会再尝试一次 `/responses/compact` 作为诊断。若 compact 成功但 `/responses` 失败，通常说明该 token 更像 ChatGPT Web session token，只能访问 compact 能力，不能作为完整 Codex 上游。
-
-如果本机直连无法访问 ChatGPT，可以给该 Upstream 加显式 HTTP 代理，例如 `"proxy_url": "http://127.0.0.1:7897"`。HTTPS 上游会通过该代理建立 CONNECT 隧道。
-
-也可以直接调用 Management API：
+Dashboard 支持上传 sub2api、cpa 或通用 JSON。Management API：
 
 ```bash
 curl -s -X POST 'http://127.0.0.1:8787/pool/import/upstreams?replace=false&secret_mode=env' \
@@ -438,304 +468,196 @@ curl -s -X POST 'http://127.0.0.1:8787/pool/import/upstreams?replace=false&secre
   -d @sub2api-or-cpa.json
 ```
 
-参数含义：
+导入器会识别常见结构：
 
-- `replace=false`: 同名 Upstream 会跳过；改成 `true` 会替换。
-- `secret_mode=env`: 如果 JSON 里只有明文 key，只写入自动生成的环境变量名，例如 `MYSITE_API_KEY`。
-- `secret_mode=value`: 保存 JSON 文件内的明文 key 或 OAuth access token，并在响应里返回明文 key 警告。
+- 顶层数组
+- `upstreams`、`sites`、`providers`、`endpoints`、`apis`、`proxies`、`nodes`
+- `accounts`
 
-导入原始 ChatGPT Web session JSON 不会生效；需要使用 sub2api/cpa 导出的 Upstream 或 account JSON。
+`secret_mode=env` 会只写入自动生成的环境变量名，例如 `MYSITE_API_KEY`。`secret_mode=value` 会保存 JSON 里的明文 key，并在响应中返回明文警告。
 
-## 自动检测每个站点
+如果导入的是 sub2api/Codex OAuth account export，API Pool 会写入 `codex_oauth.accounts`，并把 access token 等 secret 存到 `secrets.local.json`。原始 ChatGPT Web session JSON 不会被当作可用 Upstream。
 
-默认配置：
+### Health Probe
 
-```json
-  "health": {
-    "enabled": true,
-    "interval_ms": 60000,
-    "timeout_ms": 10000,
-    "concurrency": 4,
-    "path": "/models"
-  }
-```
-
-Health Probe 使用当前 `model_override` 对上游发送一个小的真实模型请求，并在状态里显示结果。OpenAI-compatible 上游会探测 `/v1/responses`，必要时再试 `/v1/chat/completions`；Anthropic 上游会探测 `/v1/messages`。只有真实模型响应返回成功且响应体形状有效时，`health.state` 才会是 `ok`。
-
-`/models` 只用于补充展示模型列表和 `models_count`，不会把失败的真实模型探测翻成 `ok`。如果没有设置 `model_override`，Health Probe 会显示 `missing_model_override`，避免用随便挑的默认模型误判上游。每次真实探测会记录 `probe_model`；切换 `model_override` 后，旧模型的探测结果会变成 `stale_model_override`，直到用当前模型重新探测。
-
-- 管理接口返回里的顶层 `ok` 只表示本次管理 API 调用成功。
-- `probe_ok` 才表示真实模型探测通过：单站点探测等价于 `health.state == "ok"`；批量 `POST /pool/probe` 会额外返回 `summary.total_count`、`summary.enabled_count`、`summary.disabled_count`、`summary.ok_count`、`summary.failed_count`、`summary.skipped_count` 和 `summary.states`。会触发探测的管理接口（例如启用、添加、替换上游）也会返回 `probe_ok`，不要用顶层 `ok` 判断上游可用性。
-- `probe_status` 用于解释 `probe_ok`：`ok` 表示真实模型探测通过，`failed` 表示真实模型探测执行但失败，`skipped` 表示本次操作没有执行真实模型探测（例如停用上游或 Codex OAuth 非 live 检查）。
-- `health.state`: `ok`、`missing_model_override`、`stale_model_override`、`auth_error`、`rate_limited`、`server_error`、`network_error`、`timeout`、`models_unsupported` 等。
-- `health.http_status`: 探测 HTTP 状态码。
-- `health.latency_ms`: 探测延迟。
-- `health.error`: 真实探测失败时的失败原因；`health.state == "ok"` 时应为空。
-- `health.warning`: 真实探测成功但发生降级/兼容 fallback 时的说明，例如 `/responses` 失败但 `/chat/completions` 成功。
-- `health.probe_model`: 这次 Health Probe 实际使用的模型。
-- `health.models_count`: 如果 `/models` 返回标准模型列表，会显示模型数量。
-- `cooldown_ms`: 当前站点或 key 还要冷却多久。
-
-查看完整状态：
-
-```bash
-curl -s http://127.0.0.1:8787/pool/status \
-  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
-```
-
-立即探测某个站点：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
-  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
-```
-
-临时停用某个站点：
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
-  -H "Authorization: Bearer $CODEX_POOL_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"enabled": false}'
-```
-
-重新启用时把 `enabled` 改成 `true`。停用后的站点仍会出现在状态接口和检测网站中，但不会参与请求调度，也不会被“重新探测全部”命中。
-
-## 站点数量
-
-站点数量不做硬编码限制。你可以随时通过 `npm run add -- ...` 或 `POST /pool/upstreams` 添加新站点；代理会把新站点追加到 `config.local.json`，并立即纳入后续请求调度和健康探测。
-
-实际可添加数量只受本机资源、探测频率、上游超时时间影响。如果站点很多，建议适当调大健康检查间隔，例如：
-
-```json
-"health": {
-  "enabled": true,
-  "interval_ms": 120000,
-  "timeout_ms": 10000,
-  "path": "/models"
-}
-```
-
-## 管理接口鉴权
-
-默认情况下，代理只监听 `127.0.0.1`，并将：
-
-```json
-"admin_auth_token_env": ""
-```
-
-设置为空，表示本机 `/pool/*` 管理接口不强制校验 Bearer token。这样你可以在任意本机终端随时添加站点，不会因为终端环境变量和代理进程环境变量不同而 `unauthorized`。
-
-如果你希望管理接口也强制鉴权，可以改成：
-
-```json
-"admin_auth_token_env": "CODEX_POOL_API_KEY"
-```
-
-然后重启代理。
-
-注意：只要配置了 `auth_token_env` 或 `admin_auth_token_env`，但服务进程没有读到对应环境变量，请求会被拒绝；只有把配置值显式留空，才表示关闭该层鉴权。
-
-## 检测网站
-
-代理内置了一个本地检测网站：
-
-```text
-http://127.0.0.1:8787/pool/dashboard
-```
-
-页面会自动刷新，并展示每个站点的：
-
-- 健康状态
-- HTTP 状态码
-- 延迟
-- 模型数量
-- 冷却时间
-- 最近 50 次真实调用可用率、可用率进度条和最近调用小色块
-- 今日 token 消耗量
-- 站点累计 token 消耗量
-- 最近 14 天每日 token 消耗量
-- key 环境变量是否配置
-- 失败次数
-
-也可以直接在页面底部表单添加新站点，添加后会立即探测并写入 `config.local.json`。
-每张站点卡片也有单独的“测试”按钮，只会探测该站点；顶部“重新探测全部”会探测所有站点。
-每张站点卡片也有单独的“余额”按钮，只会刷新该站点的余额/已消费金额；顶部“刷新余额”会刷新所有启用站点。
-页面只在每个站点卡片里展示具体金额，长金额会用 K/M/B/T 单位缩短并保留完整金额悬浮提示；`/pool/status` 仍保留顶层 billing 汇总，方便程序读取。
-每张站点卡片都有“停用/启用”按钮。停用后卡片仍保留在页面中，方便重新开启，但代理不会把 Codex 请求调度到该站点。
-每张站点卡片也有“删除”按钮，确认后会从配置中移除该站点并刷新页面列表。
-如果启用了管理接口鉴权，在页面右上角的 `Admin token` 输入框填入对应 token 后，页面会把 token 保存在浏览器本地存储中用于后续请求。
-
-## 手动检测模式
-
-如果配置中：
-
-```json
-"health": {
-  "enabled": false,
-  "interval_ms": 60000,
-  "timeout_ms": 10000,
-  "path": "/models"
-}
-```
-
-代理不会定时探测上游。需要检测时手动触发：
-
-检测全部站点：
+手动探测全部：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/pool/probe \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
-检测单个站点：
+手动探测单个：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
-检测网站里的“重新探测全部”按钮也是调用 `POST /pool/probe`。
+Health Probe 使用当前 `model_override` 发送小型真实模型请求。OpenAI-compatible Upstream 会探测 Responses，必要时尝试 Chat Completions；Anthropic Upstream 会探测 Messages；Codex OAuth account 会做 Codex OAuth 路线诊断。
 
-## 调用、额度与 token 统计
+如果没有 `model_override`，Probe 会显示 `missing_model_override`，避免用随机默认模型误判 Upstream。切换 `model_override` 后，旧模型的探测结果会变成 `stale_model_override`，直到重新探测。
 
-状态接口和检测网站会显示每个站点的统计信息：
+### 启用、停用、删除
 
-- `stats.attempts`: 真实打到该上游的模型交互请求尝试次数。
-- `stats.responses`: 模型交互请求收到响应的次数。
-- `stats.successes`: HTTP 2xx/3xx 且响应里有具体模型输出的次数；如果响应提供 token usage，`output_tokens`/`completion_tokens` 必须大于 `0`。
-- `stats.failures`: HTTP 4xx/5xx、网络/流式失败，或 HTTP 2xx/3xx 但没有具体输出/输出 token 为 `0` 的次数。
-- `stats.retries`: 因失败而被代理重试/切换的次数。
-- `availability.rate`: 最近窗口内模型交互请求尝试的可用率，只有 HTTP 2xx/3xx 且有具体输出才算成功；其他 HTTP、网络错误、超时、上游流式中断、空输出或输出 token 为 `0` 都算失败。模型列表、Health Probe、Billing Probe 和 Management API 请求不计入。
-- `availability.multiplier`: Selection 使用的可用率权重乘数。样本少于 `min_samples` 时为 `1.0`。
-- `availability.recent`: 最近窗口的成功/失败样本，检测网站会用它画小色块历史。
-- `selection_weight`: `weight * availability.multiplier` 后的基础选择权重。
-- `selection_score`: 当前动态选择分数；不可用站点为 `0`，可用站点会继续计入 in-flight、延迟、Health State 和连续失败惩罚。
-- Selection 会排除显式 Health Probe 失败的站点，例如 `auth_error`、`rate_limited`、`server_error`、`network_error`、`timeout`、`missing_key`、`missing_model_override`、`unexpected_status`。`unknown` 保留为启动/未探测兼容状态，`oauth_ready` 保留为 Codex OAuth 非 live 探测的兼容状态，`stale_model_override` 表示旧模型探测已过期但仍允许实际请求路径尝试。
-- `usage.today_tokens`: 该站点今天的 token 消耗量。
-- `usage.total_tokens`: 该站点累计 token 消耗量。
-- `usage.by_day`: 该站点按日期聚合的 token 消耗量。
-- `billing.balance_amount`: 该站点余额。
-- `billing.used_amount`: 该站点已消费金额，默认是本月截至今天的账单区间。
-- `billing.limit_amount`: 该站点账单上限/授信额度。
-- `billing.currency`: 金额币种。
-- `quota`: 从上游响应头解析到的剩余额度信息。
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
 
-`/pool/status` 顶层还会返回所有站点汇总后的：
-
-- `usage.total_tokens`: 全部站点累计 token 消耗量。
-- `usage.today_tokens`: 全部站点今天的 token 消耗量。
-- `usage.by_day`: 全部站点按日期聚合后的 token 消耗量。
-
-token 统计来自模型交互响应里的 `usage.total_tokens`、`input_tokens + output_tokens`、`prompt_tokens + completion_tokens`，或常见 token usage 响应头。未压缩的 JSON 响应和 SSE 流式响应里最终事件携带的 usage 都会被统计；压缩响应或未返回 usage 的站点会显示为 `0`/未知，不会估算。`GET /v1/models` 这类元数据请求不展示在最近调用里，也不影响 token 或 Availability 统计。
-
-可用率默认按每个上游最近 50 次模型交互请求尝试计算，Health Probe、模型列表、Billing Probe 和 Management API 请求不计入。Selection 仍先排除 Disabled、Cooldown、missing key、模型不匹配等硬不可选上游；在剩余候选中，会把上游权重乘以可用率乘数：
-
-```text
-样本少于 10 次: 1.00
->= 95%: 1.20
->= 90%: 1.00
->= 75%: 0.65
->= 50%: 0.30
-< 50%: 0.08
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/enabled \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
 ```
 
-检测网站的站点排序会先按启用状态硬分组：所有启用站点都在上方，未启用站点全部在最下方。启用组内优先展示当前可参与 Selection 且匹配 Model Override 的站点，然后按 Availability、`selection_score`、`selection_weight`、失败次数和延迟排序；签到状态只影响筛选和卡片展示，不参与排序。
+删除：
 
-可以在配置中调整窗口和阈值：
-
-```json
-"availability": {
-  "window_size": 50,
-  "min_samples": 10,
-  "boost_threshold": 0.95,
-  "healthy_threshold": 0.9,
-  "degraded_threshold": 0.75,
-  "poor_threshold": 0.5
-}
+```bash
+curl -s -X DELETE http://127.0.0.1:8787/pool/upstreams/rawchat \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
-余额/已消费金额来自独立的 billing 探测，不会跟随页面自动刷新反复请求上游；只有点击“余额”“刷新余额”或调用下面接口时才会刷新：
+Disabled 是用户显式控制的状态，和 Cooldown 不同。Disabled Upstream 会保留在状态和 Dashboard 中，但不会参与 Selection。
+
+### Billing、Usage 与 Quota
+
+刷新单个 Upstream Billing：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/billing \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
+```
 
+刷新全部：
+
+```bash
 curl -s -X POST http://127.0.0.1:8787/pool/billing \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
-默认会在站点 origin 和 `base_url` 两个位置尝试 OpenAI-compatible 常见账单接口：
+导出每日 token usage：
 
-```text
-/dashboard/billing/subscription
-/dashboard/billing/usage?start_date={start_date}&end_date={end_date}
+```bash
+curl -s http://127.0.0.1:8787/pool/usage/daily.json
+curl -s http://127.0.0.1:8787/pool/usage/daily.csv
 ```
 
-例如 `base_url` 是 `https://example.com/v1` 时，会先尝试 `https://example.com/dashboard/billing/...`，如果该路径失败，也会尝试 `https://example.com/v1/dashboard/billing/...`。any 这类把 billing 挂在 `/v1` 下的站点需要后者。
+Usage 来自模型响应里的 `usage` 字段、常见 token usage 响应头，或未压缩 SSE 最终事件。API Pool 不估算 token。`GET /v1/models`、Health Probe、Billing Probe 和 Management API 请求不计入模型 Usage 和 Availability。
 
-其中 `total_usage` 默认按 cents 处理，例如 `1234` 显示为 `USD12.34`；`hard_limit_usd`、`balance`、`spent_amount` 等明确金额字段按原金额处理。
-
-很多中转站会把 `hard_limit_usd` / `system_hard_limit_usd` 固定返回为 `100000000`，用于表示不限额或内部占位。代理默认会把自动推断到的超大 limit 当作占位值忽略，不会显示为 `USD 100M`，也不会用它推导余额；仍会保留可信的 `used_amount`。
-
-余额只通过 API key 可访问的账单端点读取，不再抓取网页登录态、用户钱包或 cookie 保护的页面。New API 站点只要在生成 token 时设置了具体总金额，默认的 subscription/usage 逻辑就能计算余额。
-
-如果某个站点使用自定义接口，可以在对应 upstream 里配置：
-
-```json
-"billing": {
-  "enabled": true,
-  "base_url": "https://example.com",
-  "subscription_path": "/api/billing",
-  "usage_path": "/api/usage?start_date={start_date}&end_date={end_date}",
-  "currency": "USD",
-  "balance_field": "data.balance",
-  "used_field": "data.used_amount",
-  "limit_field": "data.limit",
-  "amount_unit": "usd",
-  "large_limit_threshold": 10000000,
-  "trust_large_limits": false
-}
-```
-
-如果站点只返回自己的点数或 quota 单位，代理不会把它猜成金额。请优先在站点侧为 token 设置明确的总金额，让 subscription/usage 端点返回可计算的 limit 和 used。
-
-如果账单路径返回的是 HTML 登录页、Cloudflare challenge 或其他浏览器防护页面，billing 状态会显示为 `blocked`。这种情况下模型接口可能仍然可用，但代理无法只凭 API key 读取具体余额。
-
-quota 依赖上游是否返回响应头。代理会识别常见字段：
+Quota 来自 Upstream 响应头，例如：
 
 ```text
 x-ratelimit-remaining-requests
 x-ratelimit-remaining-tokens
 x-ratelimit-limit-requests
 x-ratelimit-limit-tokens
-x-ratelimit-reset-requests
-x-ratelimit-reset-tokens
 x-quota-remaining
-x-remaining-quota
-x-api-quota-remaining
 retry-after
 ```
 
-如果上游不返回这些 header，剩余额度会保持未知，不会编造数值。dashboard 会隐藏空的 request/token header quota，避免把它误看成余额字段。
+Billing 默认尝试常见 OpenAI-compatible 账单接口：
 
-## 可重试错误码
+```text
+/dashboard/billing/subscription
+/dashboard/billing/usage?start_date={start_date}&end_date={end_date}
+```
 
-默认会对常见上游错误切换到下一个站点，并保持同一个模型不变。需要调整时可在配置里覆盖：
+如果某个 Upstream 使用自定义接口，可以在 Upstream 上配置：
 
 ```json
-"retry": {
-  "chat_fallback_probe_timeout_ms": 15000,
-  "retryable_statuses": [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524]
+{
+  "billing": {
+    "enabled": true,
+    "base_url": "https://example.com",
+    "subscription_path": "/api/billing",
+    "usage_path": "/api/usage?start_date={start_date}&end_date={end_date}",
+    "currency": "USD",
+    "balance_field": "data.balance",
+    "used_field": "data.used_amount",
+    "limit_field": "data.limit",
+    "amount_unit": "usd",
+    "large_limit_threshold": 10000000,
+    "trust_large_limits": false
+  }
 }
 ```
 
-如果你发现某个站点经常用特殊状态码表示临时失败，可以把该状态码加进这个列表。
+如果账单接口返回 HTML 登录页、Cloudflare challenge 或浏览器防护页，Billing 状态会显示 `blocked`。这不一定代表模型接口不可用。
 
-`chat_fallback_probe_timeout_ms` 控制自动 chat fallback 的首次 `/responses` 探测等待时间，默认 `15000`。只影响尚未识别协议模式的 OpenAI-compatible 上游；一旦某站点 chat fallback 成功，当前进程内后续请求会直接使用 `/chat/completions`。
+## Management API 速查
 
-统计会持久化到：
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET` | `/health` | 服务存活检查，不要求 Admin Token。 |
+| `GET` | `/pool/dashboard` | 本地管理面板。 |
+| `GET` | `/pool/status` | 完整 Runtime State。 |
+| `GET` | `/pool/upstreams` | 同 `/pool/status`，便于语义化读取 Upstream 列表。 |
+| `GET` | `/pool/codex-oauth/accounts` | Codex OAuth account 状态。 |
+| `GET` | `/pool/usage/daily.json` | 每日 token usage JSON。 |
+| `GET` | `/pool/usage/daily.csv` | 每日 token usage CSV。 |
+| `POST` | `/pool/model` | 设置或清空 Model Override。 |
+| `POST` | `/pool/compatibility` | 设置 Adapter 兼容模式。 |
+| `POST` | `/pool/probe` | 探测全部 Upstream。 |
+| `POST` | `/pool/upstreams/:name/probe` | 探测单个 Upstream。 |
+| `POST` | `/pool/claude-check` | 对全部 Upstream 做 Claude 能力检查。 |
+| `POST` | `/pool/upstreams/:name/claude-check` | 对单个 Upstream 做 Claude 能力检查。 |
+| `POST` | `/pool/billing` | 刷新全部 Billing。 |
+| `POST` | `/pool/upstreams/:name/billing` | 刷新单个 Billing。 |
+| `POST` | `/pool/upstreams` | 添加或替换 Upstream。 |
+| `POST` | `/pool/import/upstreams` | 从 JSON 批量导入 Upstream 或 Codex OAuth account。 |
+| `POST` | `/pool/upstreams/:name/enabled` | 启用或停用 Upstream。 |
+| `POST` | `/pool/upstreams/:name/signin` | 更新签到状态。 |
+| `DELETE` | `/pool/upstreams/:name` | 删除 Upstream 或 Codex OAuth account。 |
+| `POST` | `/pool/test-curl` | Dashboard 使用的 curl-style 诊断接口。 |
+
+## Availability 规则
+
+默认窗口是每个 Upstream 最近 50 次 Model Interaction Request attempt。样本少于 10 次时不惩罚。
 
 ```text
-/Users/slizm/Desktop/脚本/codex-api-pool/stats.local.json
+样本少于 10 次: 1.00
+>= 95%:          1.20
+>= 90%:          1.00
+>= 75%:          0.65
+>= 50%:          0.30
+< 50%:           0.08
 ```
+
+只有 HTTP 2xx/3xx 且响应里有具体模型输出才算成功。HTTP 错误、网络错误、超时、上游流式中断、空输出、显式 `output_tokens = 0` 都算失败。
+
+## 常见排障
+
+| 现象 | 优先检查 |
+| --- | --- |
+| Codex 返回 `unauthorized` | `CODEX_POOL_API_KEY` 是否同时存在于 Codex 环境和 API Pool 进程环境。 |
+| `/pool/status` 返回 `unauthorized` | 是否配置了 `admin_auth_token_env`，请求是否带 Admin Token。 |
+| Upstream 显示 `missing_key` | 对应 `keys[].env` 是否在 API Pool 进程环境中存在。 |
+| Health 是 `missing_model_override` | 先执行 `npm run model -- gpt` 设置明确模型，再手动 Probe。 |
+| Claude 请求没有候选 | Upstream 是否标记为 `api: "anthropic"` 或 `api: "both"`，且模型名以 `claude` 开头。 |
+| GPT 请求误打 Claude-only Upstream | 确认 Claude-only Upstream 使用 `api: "anthropic"`。 |
+| Billing 是 `blocked` | 账单端点可能需要网页登录或被 Cloudflare 防护，模型接口可能仍可用。 |
+| 流式中途失败 | Streaming Boundary 之后不会续接，需要 Codex 重新发起请求。 |
+
+## 自测
+
+```bash
+cd /Users/slizm/myprojects/codex-api-pool
+npm run smoke
+```
+
+期望看到：
+
+```text
+smoke ok: ...
+```
+
+烟测覆盖鉴权、Fallback、启停 Upstream、Usage/Billing 统计、Availability、运行时添加、配置保留编辑、JSON 导入、模型发现、Anthropic 模型探测、Model Override、流式错误冷却、HTTP 400/522 Fallback、Recent Requests 和 Health Probe。
+
+## 安全提示
+
+- 推荐所有 Upstream Key 都用环境变量引用，不要把明文 key 写进 `config.local.json`。
+- `server.admin_auth_token_env` 为空时，本机 `/pool/*` 不强制 Bearer token。只监听 `127.0.0.1` 时通常够用；如果暴露到其他网络，必须启用 Admin Token。
+- `config.local.json`、`secrets.local.json`、`stats.local.json`、`pool.out.log`、`pool.err.log` 都可能包含敏感信息或运行痕迹，避免同步到共享位置。
+- Pool Token、Admin Token、Upstream Key 是三个不同概念。Pool Token 不会转发给 Upstream。

@@ -1,7 +1,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { __testInternals, createPoolServer } from '../src/server.mjs';
@@ -225,6 +225,49 @@ const good = createFakeUpstream('good', ({ req, res, body }) => {
   res.end(JSON.stringify({ ok: true, id: 'resp_good', object: 'response', output_text: 'ok', body: JSON.parse(body) }));
 });
 
+let realTrafficOnlyResponsesHits = 0;
+const realTrafficOnly = createFakeUpstream('real-traffic-only', ({ req, res, body }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  if (req.url.endsWith('/chat/completions')) {
+    res.writeHead(522, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'standard chat probe is not representative' }));
+    return;
+  }
+  if (req.url.endsWith('/responses')) {
+    const payload = JSON.parse(body);
+    const inputText = Array.isArray(payload.input)
+      ? payload.input.map((item) => typeof item === 'string' ? item : item?.content || item?.text || '').join('\n')
+      : String(payload.input || '');
+    if (!inputText.includes('hello') && !inputText.includes('search the web')) {
+      res.writeHead(522, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'standard responses probe is not representative' }));
+      return;
+    }
+    realTrafficOnlyResponsesHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      id: 'resp_real_traffic_only',
+      object: 'response',
+      output_text: 'real-ok',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'real-ok' }] }],
+      body: payload,
+      usage: {
+        input_tokens: 5,
+        output_tokens: 2,
+        total_tokens: 7
+      }
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
 const added = createFakeUpstream('added', ({ req, res, body }) => {
   if (req.url.endsWith('/models')) {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -381,7 +424,19 @@ const chatOnly = createFakeUpstream('chat-only', ({ req, res, body }) => {
   if (req.url.endsWith('/chat/completions')) {
     chatOnlyChatHits += 1;
     const payload = JSON.parse(body);
-    const leakedFields = ['previous_response_id', 'include', 'reasoning', 'text', 'truncation', 'background', 'conversation']
+    const leakedFields = [
+      'previous_response_id',
+      'include',
+      'reasoning',
+      'text',
+      'truncation',
+      'background',
+      'conversation',
+      'context_management',
+      'prompt',
+      'moderation',
+      'max_tool_calls'
+    ]
       .filter((field) => Object.prototype.hasOwnProperty.call(payload, field));
     if (leakedFields.length > 0) {
       res.writeHead(400, { 'content-type': 'application/json' });
@@ -389,9 +444,61 @@ const chatOnly = createFakeUpstream('chat-only', ({ req, res, body }) => {
       return;
     }
     const lastContent = payload.messages.at(-1)?.content;
-    if (!['test-model', 'gpt-5.5'].includes(payload.model) || !Array.isArray(payload.messages) || !['hello', 'ping', 'please use tool'].includes(lastContent)) {
+    if (Array.isArray(lastContent) && lastContent.some((part) => part?.type === 'image_url')) {
+      const textPart = lastContent.find((part) => part?.type === 'text');
+      const imagePart = lastContent.find((part) => part?.type === 'image_url');
+      const originalDetailCase = textPart?.text === 'look original';
+      if (
+        !['look at this', 'look original'].includes(textPart?.text) ||
+        imagePart?.image_url?.url !== 'data:image/png;base64,AA==' ||
+        (originalDetailCase ? imagePart?.image_url?.detail !== undefined : imagePart?.image_url?.detail !== 'high')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected chat image payload', payload }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-image-json',
+        object: 'chat.completion',
+        created: 1,
+        model: 'test-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: originalDetailCase ? 'image-original-pong' : 'image-pong' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 }
+      }));
+      return;
+    }
+    if (Array.isArray(lastContent) && lastContent.some((part) => part?.type === 'file')) {
+      const textPart = lastContent.find((part) => part?.type === 'text');
+      const filePart = lastContent.find((part) => part?.type === 'file');
+      if (
+        textPart?.text !== 'read this file' ||
+        filePart?.file?.file_data !== 'VGhpcyBpcyBhIGZpbGU=' ||
+        filePart?.file?.filename !== 'notes.txt'
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected chat file payload', payload }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'chatcmpl-file-json',
+        object: 'chat.completion',
+        created: 1,
+        model: 'test-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'file-pong' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 }
+      }));
+      return;
+    }
+    if (!['test-model', 'gpt-5.5'].includes(payload.model) || !Array.isArray(payload.messages) || !['hello', 'ping', 'please use tool', 'file url only'].includes(lastContent)) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'expected chat completions payload', payload }));
+      return;
+    }
+    if (payload.metadata?.expect_verbosity === true && payload.verbosity !== 'high') {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'expected text.verbosity to map to chat verbosity', payload }));
       return;
     }
     if (lastContent === 'please use tool') {
@@ -535,7 +642,20 @@ const anthropicMessages = createFakeUpstream('anthropic-messages', ({ req, res, 
   }
   anthropicMessagesHits += 1;
   const payload = JSON.parse(body);
-  const leakedFields = ['previous_response_id', 'include', 'reasoning', 'text', 'truncation', 'parallel_tool_calls']
+  const leakedFields = [
+    'previous_response_id',
+    'include',
+    'reasoning',
+    'text',
+    'truncation',
+    'background',
+    'conversation',
+    'context_management',
+    'prompt',
+    'moderation',
+    'max_tool_calls',
+    'parallel_tool_calls'
+  ]
     .filter((field) => Object.prototype.hasOwnProperty.call(payload, field));
   if (leakedFields.length > 0) {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -586,6 +706,55 @@ const anthropicMessages = createFakeUpstream('anthropic-messages', ({ req, res, 
     return;
   }
   const userText = payload.messages?.[0]?.content?.[0]?.text || '';
+  const firstMessageContent = payload.messages?.[0]?.content || [];
+  if (firstMessageContent.some((block) => block?.type === 'image')) {
+    const textBlock = firstMessageContent.find((block) => block?.type === 'text');
+    const imageBlock = firstMessageContent.find((block) => block?.type === 'image');
+    if (
+      textBlock?.text !== 'look at this' ||
+      imageBlock?.source?.type !== 'base64' ||
+      imageBlock?.source?.media_type !== 'image/png' ||
+      imageBlock?.source?.data !== 'AA=='
+    ) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unexpected anthropic image payload', payload }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_image_test',
+      type: 'message',
+      role: 'assistant',
+      model: payload.model,
+      content: [{ type: 'text', text: 'claude-image-pong' }],
+      usage: { input_tokens: 4, output_tokens: 2 }
+    }));
+    return;
+  }
+  if (firstMessageContent.some((block) => block?.type === 'document')) {
+    const textBlock = firstMessageContent.find((block) => block?.type === 'text');
+    const documentBlock = firstMessageContent.find((block) => block?.type === 'document');
+    if (
+      textBlock?.text !== 'read this doc' ||
+      documentBlock?.source?.type !== 'url' ||
+      documentBlock?.source?.url !== 'https://example.com/report.pdf' ||
+      documentBlock?.title !== 'report.pdf'
+    ) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unexpected anthropic document payload', payload }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'msg_document_test',
+      type: 'message',
+      role: 'assistant',
+      model: payload.model,
+      content: [{ type: 'text', text: 'claude-file-pong' }],
+      usage: { input_tokens: 4, output_tokens: 2 }
+    }));
+    return;
+  }
   if (payload.model !== 'claude-opus-test' || payload.max_tokens !== 128 || userText !== 'hello claude') {
     res.writeHead(400, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'unexpected anthropic payload', payload }));
@@ -872,6 +1041,7 @@ delete process.env.TEST_MISSING_POOL_TOKEN;
 const badInfo = await listen(bad);
 const modelErrorInfo = await listen(modelError);
 const goodInfo = await listen(good);
+const realTrafficOnlyInfo = await listen(realTrafficOnly);
 const addedInfo = await listen(added);
 const usageInfo = await listen(usageUpstream);
 const zeroOutputUsageInfo = await listen(zeroOutputUsage);
@@ -1070,6 +1240,160 @@ try {
     realTrafficGood?.capabilities?.responses?.representative !== true
   ) {
     throw new Error(`expected successful native Responses forwarding to learn protocol capability from real traffic: ${JSON.stringify(realTrafficGood?.capabilities)}`);
+  }
+  if (realTrafficGood?.health?.state !== 'ok' || realTrafficGood?.health?.source !== 'real_traffic' || realTrafficGood?.health?.probe_model !== 'test-model') {
+    throw new Error(`expected successful native Responses forwarding to mark Health ok from real traffic: ${JSON.stringify(realTrafficGood?.health)}`);
+  }
+
+  const codexShapedProbeBackend = createFakeUpstream('codex-shaped-probe', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      const payload = JSON.parse(body);
+      const isOldMinimalProbe = payload.input === 'hi' && payload.max_output_tokens === 1;
+      const contentText = JSON.stringify(payload.input || '');
+      const codexHeaders = String(req.headers['user-agent'] || '').includes('codex_cli_rs') &&
+        req.headers.originator === 'codex_cli_rs' &&
+        req.headers['openai-beta'] === 'responses=experimental';
+      const codexBody = Array.isArray(payload.input) &&
+        contentText.includes('Health check') &&
+        payload.input.some((item) => item?.type === 'reasoning') &&
+        payload.instructions &&
+        payload.tool_choice === 'none' &&
+        payload.metadata?.codex_api_pool_probe === 'health' &&
+        payload.max_output_tokens >= 64;
+      if (isOldMinimalProbe || !codexHeaders || !codexBody || req.headers.authorization !== 'Bearer upstream-secret') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected Codex-shaped Responses probe', headers: req.headers, body: payload }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'resp_codex_probe',
+        object: 'response',
+        output_text: 'ok',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+        usage: { input_tokens: 8, output_tokens: 1, total_tokens: 9 }
+      }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const codexShapedProbeInfo = await listen(codexShapedProbeBackend);
+  const codexShapedProbePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'codex-shaped-probe', api: 'openai', base_url: `${codexShapedProbeInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const codexShapedProbePoolInfo = await listen(codexShapedProbePool);
+  try {
+    const codexProbe = await postJson(`${codexShapedProbePoolInfo.url}/pool/upstreams/codex-shaped-probe/probe`, 'pool-secret', {});
+    if (
+      codexProbe.response.status !== 200 ||
+      codexProbe.json.probe_ok !== true ||
+      codexProbe.json.probe_status !== 'ok' ||
+      codexProbe.json.health?.state !== 'ok' ||
+      codexProbe.json.health?.httpStatus !== 200 ||
+      !codexProbe.json.health?.models?.includes('test-model')
+    ) {
+      throw new Error(`expected Health Probe to use Codex-shaped Responses request instead of old minimal probe: ${codexProbe.text}`);
+    }
+  } finally {
+    await close(codexShapedProbePool);
+    await close(codexShapedProbeBackend);
+  }
+
+  realTrafficOnlyResponsesHits = 0;
+  const realTrafficOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'real-traffic-only', api: 'openai', base_url: `${realTrafficOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const realTrafficOnlyPoolInfo = await listen(realTrafficOnlyPool);
+  try {
+    const firstRealTraffic = await requestJson(realTrafficOnlyPoolInfo.url, 'pool-secret');
+    if (firstRealTraffic.response.status !== 200 || firstRealTraffic.json.output_text !== 'real-ok') {
+      throw new Error(`expected real traffic to succeed before non-representative probe: ${firstRealTraffic.response.status} ${firstRealTraffic.text}`);
+    }
+    const realTrafficStatus = (await getJson(`${realTrafficOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const realTrafficSite = realTrafficStatus.upstreams.find((upstream) => upstream.name === 'real-traffic-only');
+    if (
+      realTrafficSite?.health?.state !== 'ok' ||
+      realTrafficSite?.health?.source !== 'real_traffic' ||
+      realTrafficSite?.capabilities?.responses?.source !== 'real_traffic'
+    ) {
+      throw new Error(`expected real traffic success to mark upstream healthy without relying on /models: ${JSON.stringify(realTrafficSite)}`);
+    }
+
+    const nonRepresentativeProbe = await postJson(`${realTrafficOnlyPoolInfo.url}/pool/upstreams/real-traffic-only/probe`, 'pool-secret', {});
+    if (
+      nonRepresentativeProbe.response.status !== 200 ||
+      nonRepresentativeProbe.json.probe_ok !== false ||
+      nonRepresentativeProbe.json.probe_status !== 'skipped' ||
+      nonRepresentativeProbe.json.health?.state !== 'codex_forward_only' ||
+      !String(nonRepresentativeProbe.json.health?.error || '').includes('real responses traffic has succeeded') ||
+      !nonRepresentativeProbe.json.health?.models?.includes('test-model')
+    ) {
+      throw new Error(`expected failed standard probe not to mark real-traffic-verified upstream unavailable: ${nonRepresentativeProbe.text}`);
+    }
+
+    const unsupportedToolBody = JSON.stringify({
+      model: 'test-model',
+      input: 'search the web',
+      stream: false,
+      tools: [{ type: 'web_search_preview', search_context_size: 'low' }]
+    });
+    const afterProbe = await fetch(`${realTrafficOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(unsupportedToolBody))
+      },
+      body: unsupportedToolBody
+    });
+    const afterProbeText = await afterProbe.text();
+    if (afterProbe.status !== 200 || realTrafficOnlyResponsesHits !== 2) {
+      throw new Error(`expected real-traffic-verified upstream to remain selectable after non-representative probe: ${afterProbe.status} ${afterProbeText} hits=${realTrafficOnlyResponsesHits}`);
+    }
+  } finally {
+    await close(realTrafficOnlyPool);
   }
 
   const sensitiveHeaderBody = JSON.stringify({ model: 'test-model', input: 'hello', stream: false });
@@ -1640,6 +1964,237 @@ try {
     await close(explicitChatOnlyUnsupportedToolPool);
   }
 
+  chatOnlyResponsesHits = 0;
+  chatOnlyChatHits = 0;
+  const compatibilityChatOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'compat-chat-only', request_mode: 'chat_completions', base_url: `${chatOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const compatibilityChatOnlyPoolInfo = await listen(compatibilityChatOnlyPool);
+  try {
+    const compatibilityUpdate = await postJson(`${compatibilityChatOnlyPoolInfo.url}/pool/compatibility`, 'pool-secret', {
+      strip_responses_only_features: true,
+      adapters: { chat_completions: true, anthropic_messages: false }
+    });
+    if (
+      compatibilityUpdate.response.status !== 200 ||
+      compatibilityUpdate.json.compatibility?.adapter_mode?.strip_responses_only_features !== true ||
+      compatibilityUpdate.json.compatibility?.adapter_mode?.adapters?.chat_completions !== true ||
+      compatibilityUpdate.json.compatibility?.adapter_mode?.adapters?.anthropic_messages !== false
+    ) {
+      throw new Error(`expected /pool/compatibility to enable chat adapter compatibility: ${compatibilityUpdate.text}`);
+    }
+    const compatibilityBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      previous_response_id: 'resp_prev',
+      include: ['reasoning'],
+      truncation: 'auto',
+      background: true,
+      conversation: 'conv_1',
+      context_management: { truncation: 'auto' },
+      prompt: { id: 'pmpt_123' },
+      moderation: { enabled: true },
+      max_tool_calls: 2,
+      metadata: { expect_verbosity: true },
+      text: { format: { type: 'text' }, verbosity: 'high' },
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ],
+      tools: [
+        { type: 'custom', name: 'native_custom' },
+        { type: 'web_search_preview', search_context_size: 'low' },
+        {
+          type: 'function',
+          name: 'lookup_weather',
+          parameters: { type: 'object', properties: { location: { type: 'string' } } }
+        }
+      ]
+    });
+    const response = await fetch(`${compatibilityChatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityBody))
+      },
+      body: compatibilityBody
+    });
+    const text = await response.text();
+    const json = JSON.parse(text);
+    const status = (await getJson(`${compatibilityChatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const latest = status.recent_requests?.[0];
+    const expectedChatStrippedFields = [
+      'previous_response_id',
+      'include',
+      'truncation',
+      'background',
+      'conversation',
+      'context_management',
+      'prompt',
+      'moderation',
+      'max_tool_calls'
+    ];
+    if (
+      response.status !== 200 ||
+      json.output_text !== 'pong' ||
+      response.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(response.headers.get('x-codex-api-pool-converted') || '').includes('tools=custom,web_search_preview') ||
+      !String(response.headers.get('x-codex-api-pool-converted') || '').includes('fields=text.verbosity->verbosity') ||
+      !String(response.headers.get('x-codex-api-pool-downgraded') || '').includes('tools=web_search_preview') ||
+      !String(response.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      expectedChatStrippedFields.some((field) => !String(response.headers.get('x-codex-api-pool-stripped') || '').includes(field)) ||
+      latest?.compatibility?.mode !== 'adapter' ||
+      latest.compatibility?.converted?.tool_types?.join(',') !== 'custom,web_search_preview' ||
+      !latest.compatibility?.converted?.fields?.includes('text.verbosity->verbosity') ||
+      latest.compatibility?.downgraded?.tool_types?.join(',') !== 'web_search_preview' ||
+      latest.compatibility?.stripped?.tool_types?.length !== 0 ||
+      latest.compatibility?.stripped?.input_types?.join(',') !== 'reasoning' ||
+      expectedChatStrippedFields.some((field) => !latest.compatibility?.stripped?.fields?.includes(field)) ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 1
+    ) {
+      throw new Error(`expected adapter compatibility mode to strip native-only features and route to chat adapter: ${response.status} ${text} latest=${JSON.stringify(latest)} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+
+    const compatibilityImageBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      input: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'look original' },
+            { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'original' }
+          ]
+        },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const imageResponse = await fetch(`${compatibilityChatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityImageBody))
+      },
+      body: compatibilityImageBody
+    });
+    const imageText = await imageResponse.text();
+    const imageJson = JSON.parse(imageText);
+    if (
+      imageResponse.status !== 200 ||
+      imageJson.output_text !== 'image-original-pong' ||
+      imageResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(imageResponse.headers.get('x-codex-api-pool-converted') || '').includes('content=input_image') ||
+      !String(imageResponse.headers.get('x-codex-api-pool-downgraded') || '').includes('fields=input_image.detail') ||
+      String(imageResponse.headers.get('x-codex-api-pool-stripped') || '').includes('content=input_image') ||
+      !String(imageResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 2
+    ) {
+      throw new Error(`expected adapter compatibility mode to convert Responses input_image through chat adapter: ${imageResponse.status} ${imageText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+
+    const compatibilityFileBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      input: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'read this file' },
+            { type: 'input_file', file_data: 'VGhpcyBpcyBhIGZpbGU=', filename: 'notes.txt', detail: 'high' }
+          ]
+        },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const fileResponse = await fetch(`${compatibilityChatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityFileBody))
+      },
+      body: compatibilityFileBody
+    });
+    const fileText = await fileResponse.text();
+    const fileJson = JSON.parse(fileText);
+    if (
+      fileResponse.status !== 200 ||
+      fileJson.output_text !== 'file-pong' ||
+      fileResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(fileResponse.headers.get('x-codex-api-pool-converted') || '').includes('content=input_file') ||
+      !String(fileResponse.headers.get('x-codex-api-pool-downgraded') || '').includes('fields=input_file.detail') ||
+      String(fileResponse.headers.get('x-codex-api-pool-stripped') || '').includes('content=input_file') ||
+      !String(fileResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 3
+    ) {
+      throw new Error(`expected adapter compatibility mode to convert Responses input_file through chat adapter: ${fileResponse.status} ${fileText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+
+    const compatibilityFileUrlBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      input: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'file url only' },
+            { type: 'input_file', file_url: 'https://example.com/report.pdf', filename: 'report.pdf' }
+          ]
+        },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const fileUrlResponse = await fetch(`${compatibilityChatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityFileUrlBody))
+      },
+      body: compatibilityFileUrlBody
+    });
+    const fileUrlText = await fileUrlResponse.text();
+    const fileUrlJson = JSON.parse(fileUrlText);
+    if (
+      fileUrlResponse.status !== 200 ||
+      fileUrlJson.output_text !== 'pong' ||
+      fileUrlResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(fileUrlResponse.headers.get('x-codex-api-pool-stripped') || '').includes('content=input_file') ||
+      !String(fileUrlResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      chatOnlyResponsesHits !== 0 ||
+      chatOnlyChatHits !== 4
+    ) {
+      throw new Error(`expected adapter compatibility mode to report stripping Chat-incompatible Responses input_file file_url: ${fileUrlResponse.status} ${fileUrlText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+  } finally {
+    await close(compatibilityChatOnlyPool);
+  }
+
+  chatOnlyResponsesHits = 0;
+  chatOnlyChatHits = 0;
   const autoUnsupportedToolPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -1993,10 +2548,14 @@ try {
       previous_response_id: 'resp_prev',
       include: ['reasoning'],
       reasoning: { effort: 'medium' },
-      text: { format: { type: 'text' } },
+      text: { format: { type: 'text' }, verbosity: 'high' },
       truncation: 'auto',
       background: true,
-      conversation: 'conv_1'
+      conversation: 'conv_1',
+      context_management: { truncation: 'auto' },
+      prompt: { id: 'pmpt_123' },
+      moderation: { enabled: true },
+      max_tool_calls: 2
     });
     const scrubChatResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
       method: 'POST',
@@ -2009,8 +2568,56 @@ try {
     });
     const scrubChatText = await scrubChatResponse.text();
     const scrubChatJson = JSON.parse(scrubChatText);
-    if (scrubChatResponse.status !== 200 || scrubChatJson.output_text !== 'pong') {
-      throw new Error(`expected chat adapter to scrub Responses-only fields: ${scrubChatResponse.status} ${scrubChatText}`);
+    const expectedStrictFieldTypes = [
+      'previous_response_id',
+      'include',
+      'truncation',
+      'background',
+      'conversation',
+      'context_management',
+      'prompt',
+      'moderation',
+      'max_tool_calls',
+      'text.verbosity'
+    ];
+    if (
+      scrubChatResponse.status !== 422 ||
+      expectedStrictFieldTypes.some((field) => !scrubChatJson.unsupported_field_types?.includes(field)) ||
+      !String(scrubChatJson.error || '').includes('fields') ||
+      scrubChatJson.attempts?.[0]?.status !== 404 ||
+      chatOnlyResponsesHits !== 2 ||
+      chatOnlyChatHits !== 3
+    ) {
+      throw new Error(`expected Responses-only fields to require native Responses in strict mode: ${scrubChatResponse.status} ${scrubChatText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    }
+    const chatImageBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      input: [{
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'look at this' },
+          { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'high' }
+        ]
+      }]
+    });
+    const chatImageResponse = await fetch(`${chatOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(chatImageBody))
+      },
+      body: chatImageBody
+    });
+    const chatImageText = await chatImageResponse.text();
+    const chatImageJson = JSON.parse(chatImageText);
+    if (
+      chatImageResponse.status !== 200 ||
+      chatImageJson.output_text !== 'image-pong' ||
+      chatImageResponse.headers.get('x-codex-api-pool-compatibility')
+    ) {
+      throw new Error(`expected Responses input_image to convert to Chat image_url without native-only failure: ${chatImageResponse.status} ${chatImageText}`);
     }
     const unsupportedChatToolBody = JSON.stringify({
       model: 'test-model',
@@ -2034,12 +2641,12 @@ try {
       unsupportedChatToolJson.unsupported_tool_types?.[0] !== 'web_search_preview' ||
       !String(unsupportedChatToolJson.error || '').includes('cannot be converted by available upstreams') ||
       unsupportedChatToolJson.attempts?.[0]?.status !== 404 ||
-      chatOnlyResponsesHits !== 2 ||
+      chatOnlyResponsesHits !== 3 ||
       chatOnlyChatHits !== 4
     ) {
       throw new Error(`expected unsupported tool to re-probe native Responses without chat fallback: ${unsupportedChatToolResponse.status} ${unsupportedChatToolText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
     }
-    if (chatOnlyResponsesHits !== 2 || chatOnlyChatHits !== 4) {
+    if (chatOnlyResponsesHits !== 3 || chatOnlyChatHits !== 4) {
       throw new Error(`expected first request to probe responses once, then reuse chat completions: responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
     }
     const unsupportedChatInputBody = JSON.stringify({
@@ -2064,18 +2671,18 @@ try {
     const unsupportedChatInputJson = JSON.parse(unsupportedChatInputText);
     if (
       unsupportedChatInputResponse.status !== 422 ||
-      !unsupportedChatInputJson.unsupported_input_types?.includes('content:input_image') ||
       !unsupportedChatInputJson.unsupported_input_types?.includes('reasoning') ||
+      unsupportedChatInputJson.unsupported_input_types?.includes('content:input_image') ||
       !String(unsupportedChatInputJson.error || '').includes('cannot be converted by available upstreams') ||
       unsupportedChatInputJson.attempts?.[0]?.status !== 404 ||
-      chatOnlyResponsesHits !== 3 ||
+      chatOnlyResponsesHits !== 4 ||
       chatOnlyChatHits !== 4
     ) {
-      throw new Error(`expected native input not to be degraded through chat adapter: ${unsupportedChatInputResponse.status} ${unsupportedChatInputText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+      throw new Error(`expected reasoning input not to be degraded through chat adapter while input_image is convertible: ${unsupportedChatInputResponse.status} ${unsupportedChatInputText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
     }
     const chatOnlyStatus = (await getJson(`${chatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
     const chatOnlySite = chatOnlyStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
-    if (chatOnlySite?.resolved_request_mode !== 'chat_completions' || chatOnlySite?.usage?.total_tokens !== 17 || chatOnlySite?.usage?.input_tokens !== 7 || chatOnlySite?.usage?.output_tokens !== 10) {
+    if (chatOnlySite?.resolved_request_mode !== 'chat_completions' || chatOnlySite?.usage?.total_tokens !== 18 || chatOnlySite?.usage?.input_tokens !== 9 || chatOnlySite?.usage?.output_tokens !== 9) {
       throw new Error(`expected chat completions fallback mode and usage to be recorded: ${JSON.stringify(chatOnlySite)}`);
     }
     const runtimeChatOnly = chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only');
@@ -2121,6 +2728,7 @@ try {
   } finally {
     await close(chatOnlyPool);
   }
+  await sleep(900);
   const restoredChatOnlyPool = createTestPool(chatOnlyPoolConfig, { statsPath: chatOnlyStatsPath });
   const restoredChatOnlyPoolInfo = await listen(restoredChatOnlyPool);
   try {
@@ -2325,8 +2933,14 @@ try {
     });
     const scrubAnthropicText = await scrubAnthropicResponse.text();
     const scrubAnthropicJson = JSON.parse(scrubAnthropicText);
-    if (scrubAnthropicResponse.status !== 200 || scrubAnthropicJson.status !== 'completed' || scrubAnthropicJson.output_text !== 'pong') {
-      throw new Error(`expected Anthropic adapter to scrub Responses-only fields: ${scrubAnthropicResponse.status} ${scrubAnthropicText}`);
+    if (
+      scrubAnthropicResponse.status !== 422 ||
+      !scrubAnthropicJson.unsupported_field_types?.includes('previous_response_id') ||
+      !scrubAnthropicJson.unsupported_field_types?.includes('include') ||
+      !scrubAnthropicJson.unsupported_field_types?.includes('truncation') ||
+      !String(scrubAnthropicJson.error || '').includes('fields')
+    ) {
+      throw new Error(`expected Anthropic strict mode to require native Responses for Responses-only fields: ${scrubAnthropicResponse.status} ${scrubAnthropicText}`);
     }
 
     const anthropicHitsBeforeUnsupportedTool = anthropicMessagesHits;
@@ -2354,6 +2968,173 @@ try {
       anthropicMessagesHits !== anthropicHitsBeforeUnsupportedTool
     ) {
       throw new Error(`expected unsupported tool not to be degraded through Anthropic adapter: ${unsupportedAnthropicToolResponse.status} ${unsupportedAnthropicToolText} hits=${anthropicMessagesHits - anthropicHitsBeforeUnsupportedTool}`);
+    }
+
+    const anthropicCompatibilityUpdate = await postJson(`${anthropicMessagesPoolInfo.url}/pool/compatibility`, 'pool-secret', {
+      strip_responses_only_features: true,
+      adapters: { anthropic_messages: true, chat_completions: false }
+    });
+    if (
+      anthropicCompatibilityUpdate.response.status !== 200 ||
+      anthropicCompatibilityUpdate.json.compatibility?.adapter_mode?.strip_responses_only_features !== true ||
+      anthropicCompatibilityUpdate.json.compatibility?.adapter_mode?.adapters?.anthropic_messages !== true ||
+      anthropicCompatibilityUpdate.json.compatibility?.adapter_mode?.adapters?.chat_completions !== false
+    ) {
+      throw new Error(`expected /pool/compatibility to enable Anthropic adapter compatibility: ${anthropicCompatibilityUpdate.text}`);
+    }
+    const anthropicHitsBeforeCompatibility = anthropicMessagesHits;
+    const compatibilityAnthropicBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      previous_response_id: 'resp_prev',
+      include: ['reasoning'],
+      truncation: 'auto',
+      background: true,
+      conversation: 'conv_1',
+      context_management: { truncation: 'auto' },
+      prompt: { id: 'pmpt_123' },
+      moderation: { enabled: true },
+      max_tool_calls: 2,
+      text: { format: { type: 'text' }, verbosity: 'high' },
+      tools: [
+        { type: 'custom', name: 'native_custom' },
+        { type: 'web_search_preview', search_context_size: 'low' },
+        {
+          type: 'function',
+          name: 'lookup_weather',
+          parameters: { type: 'object', properties: { location: { type: 'string' } } }
+        }
+      ],
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'hello claude' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const compatibilityAnthropicResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityAnthropicBody))
+      },
+      body: compatibilityAnthropicBody
+    });
+    const compatibilityAnthropicText = await compatibilityAnthropicResponse.text();
+    const compatibilityAnthropicJson = JSON.parse(compatibilityAnthropicText);
+    const compatibilityAnthropicStatus = (await getJson(`${anthropicMessagesPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const compatibilityAnthropicLatest = compatibilityAnthropicStatus.recent_requests?.[0];
+    const expectedAnthropicStrippedFields = [
+      'previous_response_id',
+      'include',
+      'truncation',
+      'background',
+      'conversation',
+      'context_management',
+      'prompt',
+      'moderation',
+      'max_tool_calls',
+      'text.verbosity'
+    ];
+    if (
+      compatibilityAnthropicResponse.status !== 200 ||
+      compatibilityAnthropicJson.output_text !== 'pong' ||
+      compatibilityAnthropicResponse.headers.get('x-codex-api-pool-route') !== 'responses->anthropic_messages' ||
+      compatibilityAnthropicResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(compatibilityAnthropicResponse.headers.get('x-codex-api-pool-converted') || '').includes('tools=custom,web_search_preview') ||
+      !String(compatibilityAnthropicResponse.headers.get('x-codex-api-pool-downgraded') || '').includes('tools=custom') ||
+      !String(compatibilityAnthropicResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      expectedAnthropicStrippedFields.some((field) => !String(compatibilityAnthropicResponse.headers.get('x-codex-api-pool-stripped') || '').includes(field)) ||
+      compatibilityAnthropicLatest?.compatibility?.mode !== 'adapter' ||
+      compatibilityAnthropicLatest.compatibility?.adapter !== 'responses_to_anthropic_messages' ||
+      compatibilityAnthropicLatest.compatibility?.converted?.tool_types?.join(',') !== 'custom,web_search_preview' ||
+      compatibilityAnthropicLatest.compatibility?.downgraded?.tool_types?.join(',') !== 'custom' ||
+      compatibilityAnthropicLatest.compatibility?.stripped?.tool_types?.length !== 0 ||
+      compatibilityAnthropicLatest.compatibility?.stripped?.input_types?.join(',') !== 'reasoning' ||
+      expectedAnthropicStrippedFields.some((field) => !compatibilityAnthropicLatest.compatibility?.stripped?.fields?.includes(field)) ||
+      anthropicMessagesHits !== anthropicHitsBeforeCompatibility + 1
+    ) {
+      throw new Error(`expected adapter compatibility mode to strip native-only features and route to Anthropic adapter: ${compatibilityAnthropicResponse.status} ${compatibilityAnthropicText} latest=${JSON.stringify(compatibilityAnthropicLatest)} hits=${anthropicMessagesHits - anthropicHitsBeforeCompatibility}`);
+    }
+
+    const anthropicHitsBeforeImageCompatibility = anthropicMessagesHits;
+    const compatibilityAnthropicImageBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      input: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'look at this' },
+            { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'original' }
+          ]
+        },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const compatibilityAnthropicImageResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityAnthropicImageBody))
+      },
+      body: compatibilityAnthropicImageBody
+    });
+    const compatibilityAnthropicImageText = await compatibilityAnthropicImageResponse.text();
+    const compatibilityAnthropicImageJson = JSON.parse(compatibilityAnthropicImageText);
+    if (
+      compatibilityAnthropicImageResponse.status !== 200 ||
+      compatibilityAnthropicImageJson.output_text !== 'claude-image-pong' ||
+      compatibilityAnthropicImageResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(compatibilityAnthropicImageResponse.headers.get('x-codex-api-pool-converted') || '').includes('content=input_image') ||
+      !String(compatibilityAnthropicImageResponse.headers.get('x-codex-api-pool-downgraded') || '').includes('fields=input_image.detail') ||
+      String(compatibilityAnthropicImageResponse.headers.get('x-codex-api-pool-stripped') || '').includes('content=input_image') ||
+      !String(compatibilityAnthropicImageResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      anthropicMessagesHits !== anthropicHitsBeforeImageCompatibility + 1
+    ) {
+      throw new Error(`expected adapter compatibility mode to convert Responses input_image through Anthropic adapter: ${compatibilityAnthropicImageResponse.status} ${compatibilityAnthropicImageText} hits=${anthropicMessagesHits - anthropicHitsBeforeImageCompatibility}`);
+    }
+
+    const anthropicHitsBeforeFileCompatibility = anthropicMessagesHits;
+    const compatibilityAnthropicFileBody = JSON.stringify({
+      model: 'ignored-original-model',
+      stream: false,
+      max_output_tokens: 128,
+      input: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'read this doc' },
+            { type: 'input_file', file_url: 'https://example.com/report.pdf', filename: 'report.pdf', detail: 'high' }
+          ]
+        },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ]
+    });
+    const compatibilityAnthropicFileResponse = await fetch(`${anthropicMessagesPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(compatibilityAnthropicFileBody))
+      },
+      body: compatibilityAnthropicFileBody
+    });
+    const compatibilityAnthropicFileText = await compatibilityAnthropicFileResponse.text();
+    const compatibilityAnthropicFileJson = JSON.parse(compatibilityAnthropicFileText);
+    if (
+      compatibilityAnthropicFileResponse.status !== 200 ||
+      compatibilityAnthropicFileJson.output_text !== 'claude-file-pong' ||
+      compatibilityAnthropicFileResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(compatibilityAnthropicFileResponse.headers.get('x-codex-api-pool-converted') || '').includes('content=input_file') ||
+      !String(compatibilityAnthropicFileResponse.headers.get('x-codex-api-pool-downgraded') || '').includes('fields=input_file.detail') ||
+      String(compatibilityAnthropicFileResponse.headers.get('x-codex-api-pool-stripped') || '').includes('content=input_file') ||
+      !String(compatibilityAnthropicFileResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      anthropicMessagesHits !== anthropicHitsBeforeFileCompatibility + 1
+    ) {
+      throw new Error(`expected adapter compatibility mode to convert Responses input_file through Anthropic adapter: ${compatibilityAnthropicFileResponse.status} ${compatibilityAnthropicFileText} hits=${anthropicMessagesHits - anthropicHitsBeforeFileCompatibility}`);
     }
 
     const anthropicHitsBeforeUnsupportedToolChoice = anthropicMessagesHits;
@@ -3676,6 +4457,7 @@ try {
       max_body_bytes: 1024 * 1024,
       request_timeout_ms: 5000
     },
+    model_override: 'test-model',
     retry: {
       max_attempts: 1,
       failure_threshold: 20,
@@ -3919,6 +4701,339 @@ try {
     await close(codexForwardOnlyBackend);
   }
 
+  let invalidCodexProbeForwardRequest = null;
+  const invalidCodexProbeBackend = createFakeUpstream('invalid-codex-probe', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));
+      return;
+    }
+    const hasRealCodexContext = req.headers.originator === 'Codex Desktop'
+      && req.headers['x-oai-attestation'] === 'attestation-test'
+      && /^Codex Desktop\//.test(req.headers['user-agent'] || '');
+    if (req.url.endsWith('/responses') && hasRealCodexContext) {
+      invalidCodexProbeForwardRequest = { url: req.url, headers: req.headers, body };
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'resp_invalid_codex_probe_real',
+        object: 'response',
+        output_text: 'real-ok',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'real-ok' }] }],
+        body: JSON.parse(body || '{}')
+      }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          message: 'invalid codex request (request id: test)',
+          type: 'new_api_error',
+          code: 'invalid_responses_request'
+        }
+      }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const invalidCodexProbeInfo = await listen(invalidCodexProbeBackend);
+  const invalidCodexProbePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-5.5',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'invalid-codex-probe', base_url: `${invalidCodexProbeInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const invalidCodexProbePoolInfo = await listen(invalidCodexProbePool);
+  try {
+    const probe = await postJson(`${invalidCodexProbePoolInfo.url}/pool/upstreams/invalid-codex-probe/probe`, 'pool-secret', {});
+    if (
+      probe.response.status !== 200 ||
+      probe.json.probe_ok !== false ||
+      probe.json.probe_status !== 'skipped' ||
+      probe.json.health?.state !== 'advanced_curl_required' ||
+      probe.json.health?.httpStatus !== 400 ||
+      !String(probe.json.health?.error || '').includes('真实 Codex') ||
+      !probe.json.health?.models?.includes('gpt-5.5')
+    ) {
+      throw new Error(`expected invalid-codex synthetic probe to stay dispatchable for real Codex traffic: ${probe.text}`);
+    }
+    const status = (await getJson(`${invalidCodexProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const site = status.upstreams.find((upstream) => upstream.name === 'invalid-codex-probe');
+    if (
+      site?.available !== true ||
+      site?.selection_score <= 0 ||
+      site?.capabilities?.responses?.status !== 'unknown' ||
+      site?.capabilities?.responses?.representative !== false ||
+      site?.capabilities?.responses?.http_status !== 400
+    ) {
+      throw new Error(`expected invalid-codex probe to be classified as non-representative, not unavailable: ${JSON.stringify(site)}`);
+    }
+    const realBody = JSON.stringify({ model: 'gpt-5.5', input: 'hello from real Codex', stream: false });
+    const realResponse = await fetch(`${invalidCodexProbePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(realBody)),
+        'user-agent': 'Codex Desktop/0.138.0-alpha.7',
+        originator: 'Codex Desktop',
+        'x-oai-attestation': 'attestation-test'
+      },
+      body: realBody
+    });
+    const realText = await realResponse.text();
+    const realJson = JSON.parse(realText);
+    if (
+      realResponse.status !== 200 ||
+      realResponse.headers.get('x-codex-api-pool-route') !== 'responses->responses' ||
+      realJson.output_text !== 'real-ok' ||
+      invalidCodexProbeForwardRequest?.headers?.authorization !== 'Bearer upstream-secret' ||
+      invalidCodexProbeForwardRequest?.headers?.['x-oai-attestation'] !== 'attestation-test'
+    ) {
+      throw new Error(`expected real Codex request to validate invalid-codex-probe upstream: ${realResponse.status} ${realText} forwarded=${JSON.stringify(invalidCodexProbeForwardRequest)}`);
+    }
+    const verifiedStatus = (await getJson(`${invalidCodexProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const verifiedSite = verifiedStatus.upstreams.find((upstream) => upstream.name === 'invalid-codex-probe');
+    if (
+      verifiedSite?.health?.state !== 'ok' ||
+      verifiedSite?.health?.source !== 'real_traffic' ||
+      verifiedSite?.capabilities?.responses?.source !== 'real_traffic'
+    ) {
+      throw new Error(`expected real Codex response to mark invalid-codex-probe healthy: ${JSON.stringify(verifiedSite)}`);
+    }
+  } finally {
+    await close(invalidCodexProbePool);
+    await close(invalidCodexProbeBackend);
+  }
+
+  const invalidCodexRestoreStatsPath = path.join(statsRoot, 'invalid-codex-restore.json');
+  await writeFile(invalidCodexRestoreStatsPath, `${JSON.stringify({
+    upstreams: {
+      'invalid-codex-restored': {
+        health: {
+          state: 'models_unsupported',
+          checkedAt: '2026-06-11T09:32:58.661Z',
+          latencyMs: 823,
+          httpStatus: 404,
+          error: 'responses probe unexpected_status; chat probe models_unsupported',
+          warning: '',
+          probeModel: 'gpt-5.5',
+          models: ['gpt-5.5'],
+          modelsCount: 1,
+          keyLabel: 'TEST_UPSTREAM_KEY'
+        },
+        capabilities: {
+          responses: {
+            status: 'failed',
+            source: 'probe',
+            probe_type: 'model_request',
+            representative: true,
+            checked_at: '2026-06-11T09:32:58.661Z',
+            model: 'gpt-5.5',
+            http_status: 400,
+            reason: 'responses probe returned HTTP 400'
+          },
+          chat_completions: {
+            status: 'failed',
+            source: 'probe',
+            probe_type: 'model_request',
+            representative: true,
+            checked_at: '2026-06-11T09:32:58.661Z',
+            model: 'gpt-5.5',
+            http_status: 404,
+            reason: 'chat_completions probe returned HTTP 404'
+          }
+        }
+      }
+    }
+  }, null, 2)}\n`);
+  const invalidCodexRestoredPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-5.5',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'invalid-codex-restored', base_url: 'http://127.0.0.1:1/v1', weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  }, { statsPath: invalidCodexRestoreStatsPath });
+  const invalidCodexRestoredInfo = await listen(invalidCodexRestoredPool);
+  try {
+    const restoredStatus = (await getJson(`${invalidCodexRestoredInfo.url}/pool/status`, 'pool-secret')).json;
+    const restored = restoredStatus.upstreams.find((upstream) => upstream.name === 'invalid-codex-restored');
+    if (
+      restored?.available !== true ||
+      restored?.health?.state !== 'advanced_curl_required' ||
+      restored?.health?.http_status !== 400 ||
+      restored?.capabilities?.responses?.status !== 'unknown' ||
+      restored?.capabilities?.responses?.representative !== false ||
+      restored?.capabilities?.responses?.http_status !== 400
+    ) {
+      throw new Error(`expected restored invalid-codex probe state to remain dispatchable for real traffic: ${JSON.stringify(restored)}`);
+    }
+  } finally {
+    await close(invalidCodexRestoredPool);
+  }
+
+  let declaredForwardOnlyRequest = null;
+  const declaredForwardOnlyBackend = createFakeUpstream('declared-forward-only', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses') && req.headers['x-oai-attestation'] === 'attestation-test') {
+      declaredForwardOnlyRequest = { url: req.url, headers: req.headers, body };
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'resp_declared_forward_only',
+        object: 'response',
+        output_text: 'native-ok',
+        body: JSON.parse(body || '{}')
+      }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'standard probe is not representative of Codex native traffic' } }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, output_text: 'not chat completions shape' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const declaredForwardOnlyInfo = await listen(declaredForwardOnlyBackend);
+  const declaredForwardOnlyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-5.5',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      {
+        name: 'declared-forward-only',
+        base_url: `${declaredForwardOnlyInfo.url}/v1`,
+        weight: 1,
+        keys: [{ env: 'TEST_UPSTREAM_KEY' }],
+        protocol_capabilities: { responses: 'assumed' }
+      }
+    ]
+  });
+  const declaredForwardOnlyPoolInfo = await listen(declaredForwardOnlyPool);
+  try {
+    const probe = await postJson(`${declaredForwardOnlyPoolInfo.url}/pool/upstreams/declared-forward-only/probe`, 'pool-secret', {});
+    if (
+      probe.response.status !== 200 ||
+      probe.json.probe_ok !== false ||
+      probe.json.probe_status !== 'skipped' ||
+      probe.json.health?.state !== 'codex_forward_only' ||
+      probe.json.health?.httpStatus !== 503 ||
+      !String(probe.json.health?.error || '').includes('not representative')
+    ) {
+      throw new Error(`expected declared native Responses probe failure to stay dispatchable: ${probe.text}`);
+    }
+    const status = (await getJson(`${declaredForwardOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const site = status.upstreams.find((upstream) => upstream.name === 'declared-forward-only');
+    if (
+      site?.available !== true ||
+      site?.selection_score <= 0 ||
+      site?.health?.state !== 'codex_forward_only' ||
+      site?.capabilities?.responses?.status !== 'assumed' ||
+      site?.capabilities?.responses?.source !== 'user_declared'
+    ) {
+      throw new Error(`expected user-declared native Responses capability to keep upstream selectable: ${JSON.stringify(site)}`);
+    }
+    const nativeOnlyBody = JSON.stringify({
+      model: 'gpt-5.5',
+      stream: false,
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'look at this' }] },
+        { role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ],
+      tools: [
+        { type: 'custom', name: 'native_custom' },
+        { type: 'web_search_preview', search_context_size: 'low' }
+      ]
+    });
+    const realResponse = await fetch(`${declaredForwardOnlyPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(nativeOnlyBody)),
+        'user-agent': 'Codex Desktop/0.138.0-alpha.7',
+        originator: 'Codex Desktop',
+        'x-oai-attestation': 'attestation-test'
+      },
+      body: nativeOnlyBody
+    });
+    const realText = await realResponse.text();
+    const realJson = JSON.parse(realText);
+    if (
+      realResponse.status !== 200 ||
+      realResponse.headers.get('x-codex-api-pool-route') !== 'responses->responses' ||
+      realJson.output_text !== 'native-ok' ||
+      realJson.body?.tools?.[0]?.type !== 'custom' ||
+      realJson.body?.tools?.[1]?.type !== 'web_search_preview' ||
+      !realJson.body?.input?.some((item) => item?.type === 'reasoning') ||
+      !JSON.stringify(realJson.body?.input || []).includes('input_image') ||
+      declaredForwardOnlyRequest?.headers?.authorization !== 'Bearer upstream-secret'
+    ) {
+      throw new Error(`expected native-only Responses request to dispatch through declared forward-only upstream: ${realResponse.status} ${realText} forwarded=${JSON.stringify(declaredForwardOnlyRequest)}`);
+    }
+  } finally {
+    await close(declaredForwardOnlyPool);
+    await close(declaredForwardOnlyBackend);
+  }
+
   const codexCurlDebugBackend = createFakeUpstream('codex-curl-debug', ({ req, res }) => {
     const hasCodexHeaders = req.headers.authorization === 'Bearer rawchat-secret'
       && req.headers['openai-beta'] === 'responses=experimental'
@@ -4039,6 +5154,7 @@ try {
   await close(zeroOutputUsage);
   await close(usageUpstream);
   await close(added);
+  await close(realTrafficOnly);
   await close(good);
   await close(modelError);
   await close(bad);

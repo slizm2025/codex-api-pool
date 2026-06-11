@@ -60,6 +60,19 @@ const DEFAULT_BILLING_LARGE_LIMIT_THRESHOLD = 10_000_000;
 const DEFAULT_AVAILABILITY_WINDOW_SIZE = 50;
 const DEFAULT_AVAILABILITY_MIN_SAMPLES = 10;
 const DEFAULT_GRACEFUL_SHUTDOWN_MS = 15000;
+const STRIPPABLE_RESPONSES_INPUT_ITEM_TYPES = new Set(['reasoning']);
+const RESPONSE_COMPATIBILITY_SCRUB_FIELDS = [
+  'previous_response_id',
+  'include',
+  'truncation',
+  'background',
+  'conversation',
+  'context_management',
+  'prompt',
+  'moderation',
+  'max_tool_calls'
+];
+const RESPONSE_COMPATIBILITY_CHAT_TEXT_VERBOSITY_FIELD = 'text.verbosity';
 function now() {
   return Date.now();
 }
@@ -700,6 +713,44 @@ function buildJsonRequestHeaders(targetUrl, keyValue, incomingHeaders = {}) {
   return headers;
 }
 
+function codexResponsesProbeIncomingHeaders() {
+  return {
+    accept: 'application/json',
+    'content-type': 'application/json',
+    'user-agent': CODEX_CLI_USER_AGENT,
+    originator: 'codex_cli_rs',
+    'openai-beta': 'responses=experimental'
+  };
+}
+
+function codexResponsesProbePayload(model) {
+  return {
+    model,
+    instructions: CODEX_OAUTH_TEST_INSTRUCTIONS,
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Health check: reply with exactly "ok".' }
+        ]
+      },
+      {
+        type: 'reasoning',
+        summary: [
+          { type: 'summary_text', text: 'Codex API Pool health probe.' }
+        ]
+      }
+    ],
+    stream: false,
+    max_output_tokens: 64,
+    tool_choice: 'none',
+    metadata: {
+      codex_api_pool_probe: 'health'
+    }
+  };
+}
+
 async function readJsonBody(req, maxBytes) {
   const body = await readBody(req, maxBytes);
   if (body.length === 0) return {};
@@ -795,6 +846,39 @@ function normalizeProtocolCapabilities(input = {}) {
     };
   }
   return capabilities;
+}
+
+function hasProtocolCapabilityEvidence(capability = {}) {
+  return capability.status !== 'unknown' ||
+    Boolean(capability.source) ||
+    Boolean(capability.probe_type) ||
+    capability.representative !== null ||
+    Boolean(capability.checked_at) ||
+    Boolean(capability.model) ||
+    Boolean(capability.http_status) ||
+    Boolean(capability.reason);
+}
+
+function protocolCapabilityOverridesRestored(configured = {}) {
+  if (configured.source === 'user_declared') return true;
+  if (configured.status !== 'disabled') return false;
+  return configured.reason === 'upstream disabled' ||
+    configured.reason.startsWith('configured ') ||
+    configured.reason.startsWith('Codex OAuth ');
+}
+
+function mergeRestoredProtocolCapabilities(restored = {}, configured = {}) {
+  const oldCapabilities = normalizeProtocolCapabilities(restored);
+  const configuredCapabilities = normalizeProtocolCapabilities(configured);
+  const merged = {};
+  for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
+    const oldCapability = oldCapabilities[protocol];
+    const configuredCapability = configuredCapabilities[protocol];
+    merged[protocol] = protocolCapabilityOverridesRestored(configuredCapability) || !hasProtocolCapabilityEvidence(oldCapability)
+      ? configuredCapability
+      : oldCapability;
+  }
+  return normalizeProtocolCapabilities(merged);
 }
 
 function normalizeDeclaredProtocolCapabilities(input = {}) {
@@ -1033,6 +1117,18 @@ function upstreamHasVerifiedProtocolCapability(upstream, protocol) {
   return protocolCapabilityStatus(upstream, protocol) === 'verified';
 }
 
+function upstreamHasUserDeclaredProtocolCapability(upstream, protocol, status = 'assumed') {
+  const capability = upstream?.capabilities?.[protocol];
+  return capability?.source === 'user_declared' && capability?.status === status;
+}
+
+const NON_REPRESENTATIVE_NATIVE_RESPONSES_PROBE_STATES = new Set(['unexpected_status', 'server_error', 'models_unsupported']);
+
+function upstreamHasConfiguredNativeResponses(upstream) {
+  return upstream?.requestMode === 'responses' ||
+    upstreamHasUserDeclaredProtocolCapability(upstream, 'responses');
+}
+
 function canAttemptNativeResponses(pathname, upstream, model) {
   if (pathname !== '/v1/responses') return true;
   if (shouldUseAnthropicResponsesAdapter(pathname, model)) return false;
@@ -1055,12 +1151,14 @@ function requestRouteTrace({
   requiresNativeResponses = false,
   unsupportedToolTypes = [],
   unsupportedOutputFormatTypes = [],
-  unsupportedInputTypes = []
+  unsupportedInputTypes = [],
+  unsupportedFieldTypes = []
 } = {}) {
   const nativeOnly = {};
   if (unsupportedToolTypes.length > 0) nativeOnly.tool_types = unsupportedToolTypes;
   if (unsupportedOutputFormatTypes.length > 0) nativeOnly.output_format_types = unsupportedOutputFormatTypes;
   if (unsupportedInputTypes.length > 0) nativeOnly.input_types = unsupportedInputTypes;
+  if (unsupportedFieldTypes.length > 0) nativeOnly.fields = unsupportedFieldTypes;
   if (pathname === '/v1/responses' && useAnthropicAdapter) {
     return {
       input_api: 'responses',
@@ -1190,6 +1288,326 @@ function textFromResponsesContent(content) {
   return parts.join('\n');
 }
 
+function responsesContentBlockText(block) {
+  if (typeof block === 'string') return block;
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return '';
+  if (typeof block.text === 'string') return block.text;
+  if (typeof block.input_text === 'string') return block.input_text;
+  if (typeof block.output_text === 'string') return block.output_text;
+  return '';
+}
+
+function parseDataUrl(value) {
+  const match = String(value || '').match(/^data:([^;,]+);base64,(.*)$/s);
+  if (!match) return null;
+  return {
+    mediaType: match[1],
+    data: match[2]
+  };
+}
+
+function trimmedString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function responsesFileTitle(block) {
+  return trimmedString(firstDefined(block?.filename, block?.title, block?.name));
+}
+
+function fileDataForChat(value) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  const dataUrl = parseDataUrl(value.trim());
+  return dataUrl ? dataUrl.data : value;
+}
+
+function mediaTypeFromResponsesFileBlock(block, dataUrl = null) {
+  const explicit = trimmedString(firstDefined(
+    block?.media_type,
+    block?.mime_type,
+    block?.mimeType,
+    block?.content_type,
+    block?.contentType
+  ));
+  if (explicit) return explicit.split(';')[0].trim().toLowerCase();
+  if (dataUrl?.mediaType) return dataUrl.mediaType.split(';')[0].trim().toLowerCase();
+  const title = responsesFileTitle(block).toLowerCase();
+  if (title.endsWith('.pdf')) return 'application/pdf';
+  if (/\.(txt|text|md|markdown|csv|json|jsonl|xml|html|htm|css|js|jsx|ts|tsx|yaml|yml|log)$/.test(title)) return 'text/plain';
+  return '';
+}
+
+function isTextLikeMediaType(mediaType) {
+  if (!mediaType) return false;
+  if (mediaType.startsWith('text/')) return true;
+  return [
+    'application/json',
+    'application/ld+json',
+    'application/xml',
+    'application/yaml',
+    'application/x-yaml',
+    'application/javascript',
+    'application/x-ndjson'
+  ].includes(mediaType);
+}
+
+function decodeBase64Text(data) {
+  try {
+    return Buffer.from(String(data || ''), 'base64').toString('utf8');
+  } catch {
+    return String(data || '');
+  }
+}
+
+function chatImageContentPartFromResponsesBlock(block) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return null;
+  const url = typeof block.image_url === 'string' && block.image_url.trim()
+    ? block.image_url.trim()
+    : typeof block.url === 'string' && block.url.trim()
+      ? block.url.trim()
+      : '';
+  if (url) {
+    const imageUrl = { url };
+    if (['auto', 'low', 'high'].includes(block.detail)) imageUrl.detail = block.detail;
+    return { type: 'image_url', image_url: imageUrl };
+  }
+  if (typeof block.file_id === 'string' && block.file_id.trim()) {
+    return { type: 'file', file: { file_id: block.file_id.trim() } };
+  }
+  return null;
+}
+
+function chatFileContentPartFromResponsesBlock(block) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return null;
+  const file = {};
+  const fileId = trimmedString(block.file_id);
+  if (fileId) {
+    file.file_id = fileId;
+  } else {
+    const fileData = fileDataForChat(block.file_data);
+    if (fileData) file.file_data = fileData;
+  }
+  const filename = trimmedString(block.filename);
+  if (filename) file.filename = filename;
+  return file.file_id || file.file_data ? { type: 'file', file } : null;
+}
+
+function chatContentFromResponsesContent(content, role = 'user') {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const block of content) {
+    const text = responsesContentBlockText(block);
+    if (text) {
+      parts.push({ type: 'text', text });
+      continue;
+    }
+    if (role !== 'user') continue;
+    if (block && typeof block === 'object' && !Array.isArray(block) && block.type === 'input_image') {
+      const image = chatImageContentPartFromResponsesBlock(block);
+      if (image) parts.push(image);
+    } else if (block && typeof block === 'object' && !Array.isArray(block) && block.type === 'input_file') {
+      const file = chatFileContentPartFromResponsesBlock(block);
+      if (file) parts.push(file);
+    }
+  }
+  if (parts.length === 0) return '';
+  if (parts.every((part) => part.type === 'text')) return parts.map((part) => part.text).join('\n');
+  return parts;
+}
+
+function chatContentParts(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string' && value) return [{ type: 'text', text: value }];
+  return [];
+}
+
+function mergeChatMessageContent(message, content) {
+  if (!content) return;
+  if (typeof message.content === 'string' && typeof content === 'string') {
+    message.content += `\n${content}`;
+    return;
+  }
+  message.content = [...chatContentParts(message.content), ...chatContentParts(content)];
+}
+
+function anthropicImageBlockFromResponsesBlock(block) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return null;
+  if (typeof block.file_id === 'string' && block.file_id.trim()) {
+    return { type: 'image', source: { type: 'file', file_id: block.file_id.trim() } };
+  }
+  const url = typeof block.image_url === 'string' && block.image_url.trim()
+    ? block.image_url.trim()
+    : typeof block.url === 'string' && block.url.trim()
+      ? block.url.trim()
+      : '';
+  if (!url) return null;
+  const dataUrl = parseDataUrl(url);
+  if (dataUrl) {
+    return {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: dataUrl.mediaType,
+        data: dataUrl.data
+      }
+    };
+  }
+  return { type: 'image', source: { type: 'url', url } };
+}
+
+function anthropicDocumentBlockFromResponsesBlock(block) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return null;
+  const title = responsesFileTitle(block);
+  const withTitle = (document) => {
+    if (title) document.title = title;
+    return document;
+  };
+
+  const fileUrl = trimmedString(firstDefined(block.file_url, block.url));
+  if (fileUrl) {
+    return withTitle({ type: 'document', source: { type: 'url', url: fileUrl } });
+  }
+
+  if (typeof block.file_data !== 'string' || !block.file_data.trim()) return null;
+  const rawFileData = block.file_data.trim();
+  const dataUrl = parseDataUrl(rawFileData);
+  const mediaType = mediaTypeFromResponsesFileBlock(block, dataUrl);
+  const data = dataUrl ? dataUrl.data : rawFileData;
+  if (mediaType === 'application/pdf') {
+    return withTitle({
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data }
+    });
+  }
+  if (isTextLikeMediaType(mediaType)) {
+    return withTitle({
+      type: 'document',
+      source: { type: 'text', media_type: 'text/plain', data: dataUrl ? decodeBase64Text(data) : rawFileData }
+    });
+  }
+  return null;
+}
+
+function anthropicContentBlocksFromResponsesContent(content) {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const blocks = [];
+  for (const block of content) {
+    const text = responsesContentBlockText(block);
+    if (text) {
+      blocks.push({ type: 'text', text });
+      continue;
+    }
+    if (block && typeof block === 'object' && !Array.isArray(block) && block.type === 'input_image') {
+      const image = anthropicImageBlockFromResponsesBlock(block);
+      if (image) blocks.push(image);
+    } else if (block && typeof block === 'object' && !Array.isArray(block) && block.type === 'input_file') {
+      const document = anthropicDocumentBlockFromResponsesBlock(block);
+      if (document) blocks.push(document);
+    }
+  }
+  return blocks;
+}
+
+function responsesContentBlockConvertibleForAdapter(block, adapter) {
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return false;
+  if (block.type === 'input_image') {
+    if (!adapter) {
+      return Boolean(chatImageContentPartFromResponsesBlock(block)) || Boolean(anthropicImageBlockFromResponsesBlock(block));
+    }
+    return adapter === 'anthropic_messages'
+      ? Boolean(anthropicImageBlockFromResponsesBlock(block))
+      : Boolean(chatImageContentPartFromResponsesBlock(block));
+  }
+  if (block.type === 'input_file') {
+    if (!adapter) {
+      return Boolean(chatFileContentPartFromResponsesBlock(block)) || Boolean(anthropicDocumentBlockFromResponsesBlock(block));
+    }
+    return adapter === 'anthropic_messages'
+      ? Boolean(anthropicDocumentBlockFromResponsesBlock(block))
+      : Boolean(chatFileContentPartFromResponsesBlock(block));
+  }
+  return true;
+}
+
+const RESPONSES_INPUT_IMAGE_FIELDS = ['detail', 'file_id', 'image_url', 'url'];
+const RESPONSES_INPUT_FILE_FIELDS = [
+  'detail',
+  'file_data',
+  'file_id',
+  'file_url',
+  'filename',
+  'url',
+  'title',
+  'name',
+  'media_type',
+  'mime_type',
+  'mimeType',
+  'content_type',
+  'contentType'
+];
+
+function contentFieldPresent(block, field) {
+  return block && block[field] !== undefined && block[field] !== null && block[field] !== '';
+}
+
+function firstPresentField(block, fields) {
+  return fields.find((field) => contentFieldPresent(block, field)) || '';
+}
+
+function consumedResponsesContentFieldsForAdapter(block, adapter) {
+  const consumed = new Set(['type']);
+  if (!block || typeof block !== 'object' || Array.isArray(block)) return consumed;
+  if (block.type === 'input_image') {
+    const imageUrlField = firstPresentField(block, ['image_url', 'url']);
+    if (adapter === 'anthropic_messages') {
+      if (contentFieldPresent(block, 'file_id')) consumed.add('file_id');
+      else if (imageUrlField) consumed.add(imageUrlField);
+      return consumed;
+    }
+    if (imageUrlField) {
+      consumed.add(imageUrlField);
+      if (['auto', 'low', 'high'].includes(block.detail)) consumed.add('detail');
+    } else if (contentFieldPresent(block, 'file_id')) {
+      consumed.add('file_id');
+    }
+    return consumed;
+  }
+  if (block.type === 'input_file') {
+    const titleField = firstPresentField(block, ['filename', 'title', 'name']);
+    if (adapter === 'anthropic_messages') {
+      const fileUrlField = firstPresentField(block, ['file_url', 'url']);
+      if (fileUrlField) {
+        consumed.add(fileUrlField);
+      } else if (contentFieldPresent(block, 'file_data')) {
+        consumed.add('file_data');
+        const mediaField = firstPresentField(block, ['media_type', 'mime_type', 'mimeType', 'content_type', 'contentType']);
+        if (mediaField) consumed.add(mediaField);
+      }
+      if (titleField) consumed.add(titleField);
+      return consumed;
+    }
+    if (contentFieldPresent(block, 'file_id')) consumed.add('file_id');
+    else if (contentFieldPresent(block, 'file_data')) consumed.add('file_data');
+    if (contentFieldPresent(block, 'filename')) consumed.add('filename');
+    return consumed;
+  }
+  return consumed;
+}
+
+function downgradedResponsesContentFieldsForAdapter(block, adapter) {
+  const knownFields = block?.type === 'input_image'
+    ? RESPONSES_INPUT_IMAGE_FIELDS
+    : block?.type === 'input_file'
+      ? RESPONSES_INPUT_FILE_FIELDS
+      : [];
+  if (knownFields.length === 0) return [];
+  const consumed = consumedResponsesContentFieldsForAdapter(block, adapter);
+  return knownFields
+    .filter((field) => contentFieldPresent(block, field) && !consumed.has(field))
+    .map((field) => `${block.type}.${field}`);
+}
+
 function stringFromToolOutput(value) {
   return typeof value === 'string' ? value : JSON.stringify(value ?? '');
 }
@@ -1225,6 +1643,67 @@ function responseFunctionToolParts(tool) {
     parameters: firstDefined(source.parameters, tool.parameters, source.input_schema, tool.input_schema),
     strict: firstDefined(source.strict, tool.strict)
   };
+}
+
+function safeToolName(value, fallback = 'tool') {
+  const normalized = String(value || '')
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return normalized || fallback;
+}
+
+function responseCustomToolParts(tool) {
+  if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return null;
+  if (tool.type !== 'custom') return null;
+  const source = tool.custom && typeof tool.custom === 'object' && !Array.isArray(tool.custom)
+    ? tool.custom
+    : tool;
+  const name = safeToolName(source.name || tool.name, 'custom_tool');
+  if (!name) return null;
+  const format = objectRecord(source.format)
+    ? source.format
+    : objectRecord(tool.format)
+      ? tool.format
+      : objectRecord(source.grammar)
+        ? { type: 'grammar', grammar: source.grammar }
+        : objectRecord(tool.grammar)
+          ? { type: 'grammar', grammar: tool.grammar }
+          : undefined;
+  return {
+    name,
+    description: firstDefined(source.description, tool.description),
+    format
+  };
+}
+
+function responseNamespaceToolParts(tool) {
+  if (!tool || typeof tool !== 'object' || Array.isArray(tool) || tool.type !== 'namespace') return [];
+  const namespace = safeToolName(tool.namespace || tool.name || tool.label, 'namespace');
+  if (!Array.isArray(tool.tools)) return [];
+  return tool.tools.map((child, index) => {
+    if (!child || typeof child !== 'object' || Array.isArray(child)) return null;
+    const functionParts = responseFunctionToolParts({ ...child, type: child.type || 'function' });
+    const childName = safeToolName(functionParts?.name || child.name, `tool_${index + 1}`);
+    const name = safeToolName(`${namespace}_${childName}`, childName);
+    return {
+      type: 'function',
+      name,
+      description: firstDefined(
+        functionParts?.description,
+        child.description,
+        `Tool ${childName} from namespace ${namespace}.`
+      ),
+      parameters: firstDefined(
+        functionParts?.parameters,
+        child.parameters,
+        child.input_schema,
+        { type: 'object', properties: {} }
+      ),
+      strict: firstDefined(functionParts?.strict, child.strict)
+    };
+  }).filter(Boolean);
 }
 
 function responsesToolTypeLabel(tool) {
@@ -1277,12 +1756,19 @@ function unsupportedResponsesToolTypesFromBody(req, body, options = {}) {
   return payload ? unsupportedResponsesToolTypesFromPayload(payload) : [];
 }
 
-const CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES = new Set(['message', 'function_call', 'function_call_output']);
-const CONVERTIBLE_RESPONSES_CONTENT_TYPES = new Set(['text', 'input_text', 'output_text']);
+const CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES = new Set([
+  'message',
+  'function_call',
+  'function_call_output',
+  'custom_tool_call',
+  'custom_tool_call_output'
+]);
+const CONVERTIBLE_RESPONSES_CONTENT_TYPES = new Set(['text', 'input_text', 'output_text', 'input_image', 'input_file']);
 
-function unsupportedResponsesInputTypesFromContent(content) {
+function unsupportedResponsesInputTypesFromContent(content, options = {}) {
   if (content === undefined || content === null || typeof content === 'string') return [];
   if (!Array.isArray(content)) return ['content:unknown'];
+  const adapter = options.targetAdapter || options.adapter || '';
   const types = new Set();
   for (const block of content) {
     if (typeof block === 'string') continue;
@@ -1291,12 +1777,16 @@ function unsupportedResponsesInputTypesFromContent(content) {
       continue;
     }
     const type = typeof block.type === 'string' && block.type.trim() ? block.type.trim() : '';
+    if ((type === 'input_image' || type === 'input_file') && adapter && !responsesContentBlockConvertibleForAdapter(block, adapter)) {
+      types.add(`content:${type}`);
+      continue;
+    }
     if (type && !CONVERTIBLE_RESPONSES_CONTENT_TYPES.has(type)) types.add(`content:${type}`);
   }
   return [...types];
 }
 
-function unsupportedResponsesInputTypesFromInput(input) {
+function unsupportedResponsesInputTypesFromInput(input, options = {}) {
   if (input === undefined || input === null || typeof input === 'string') return [];
   if (!Array.isArray(input)) return ['unknown'];
   const types = new Set();
@@ -1308,19 +1798,82 @@ function unsupportedResponsesInputTypesFromInput(input) {
     }
     const type = typeof item.type === 'string' && item.type.trim() ? item.type.trim() : '';
     if (type && !CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES.has(type)) types.add(type);
-    const contentTypes = unsupportedResponsesInputTypesFromContent(item.content ?? item.text ?? item.message);
+    const contentTypes = unsupportedResponsesInputTypesFromContent(item.content ?? item.text ?? item.message, options);
     for (const contentType of contentTypes) types.add(contentType);
   }
   return [...types];
 }
 
-function unsupportedResponsesInputTypesFromPayload(payload) {
-  return unsupportedResponsesInputTypesFromInput(payload?.input);
+function unsupportedResponsesInputTypesFromPayload(payload, options = {}) {
+  return unsupportedResponsesInputTypesFromInput(payload?.input, options);
 }
 
 function unsupportedResponsesInputTypesFromBody(req, body, options = {}) {
   const payload = jsonObjectFromRequestBody(req, body, options);
-  return payload ? unsupportedResponsesInputTypesFromPayload(payload) : [];
+  return payload ? unsupportedResponsesInputTypesFromPayload(payload, options) : [];
+}
+
+function unsupportedResponsesFieldTypesFromPayload(payload, options = {}) {
+  if (!objectRecord(payload)) return [];
+  const fields = new Set();
+  for (const field of RESPONSE_COMPATIBILITY_SCRUB_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(payload, field)) fields.add(field);
+  }
+  if (objectRecord(payload.text) && Object.prototype.hasOwnProperty.call(payload.text, 'verbosity')) {
+    fields.add(RESPONSE_COMPATIBILITY_CHAT_TEXT_VERBOSITY_FIELD);
+  }
+  return [...fields];
+}
+
+function unsupportedResponsesFieldTypesFromBody(req, body, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  return payload ? unsupportedResponsesFieldTypesFromPayload(payload, options) : [];
+}
+
+function responsesInputItemType(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+  return typeof item.type === 'string' && item.type.trim() ? item.type.trim() : '';
+}
+
+function stripResponsesOnlyFeaturesFromPayload(payload, diagnostics) {
+  const next = { ...payload };
+  const strippedToolTypes = [];
+  if (Array.isArray(next.tools)) {
+    const tools = [];
+    for (const tool of next.tools) {
+      if (responseFunctionToolParts(tool)) {
+        tools.push(tool);
+      } else {
+        strippedToolTypes.push(responsesToolTypeLabel(tool));
+      }
+    }
+    if (tools.length > 0) next.tools = tools;
+    else delete next.tools;
+  }
+
+  const strippedInputTypes = [];
+  if (Array.isArray(next.input)) {
+    next.input = next.input.filter((item) => {
+      const type = responsesInputItemType(item);
+      if (STRIPPABLE_RESPONSES_INPUT_ITEM_TYPES.has(type)) {
+        strippedInputTypes.push(type);
+        return false;
+      }
+      return true;
+    });
+  }
+
+  diagnostics.tool_types = [...new Set(strippedToolTypes)];
+  diagnostics.input_types = [...new Set(strippedInputTypes)];
+  diagnostics.output_format_types = [];
+  diagnostics.content_types = [];
+  return next;
+}
+
+function stripResponsesOnlyFeaturesFromBody(req, body, diagnostics, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  if (!payload) return body;
+  return Buffer.from(JSON.stringify(stripResponsesOnlyFeaturesFromPayload(payload, diagnostics)));
 }
 
 function unsupportedToolConversionMessage(types, adapterName) {
@@ -1341,6 +1894,13 @@ function assertResponsesToolsConvertible(tools, adapterName) {
 }
 
 function chatToolFromResponsesTool(tool) {
+  const customParts = responseCustomToolParts(tool);
+  if (customParts) {
+    const custom = { name: customParts.name };
+    if (customParts.description !== undefined) custom.description = String(customParts.description);
+    if (customParts.format !== undefined) custom.format = customParts.format;
+    return { type: 'custom', custom };
+  }
   const parts = responseFunctionToolParts(tool);
   if (!parts) return null;
   const fn = {
@@ -1356,11 +1916,55 @@ function chatToolFromResponsesTool(tool) {
 
 function chatToolsFromResponsesTools(tools) {
   if (!Array.isArray(tools)) return undefined;
-  const converted = tools.map(chatToolFromResponsesTool).filter(Boolean);
+  const expanded = [];
+  for (const tool of tools) {
+    if (tool?.type === 'namespace') expanded.push(...responseNamespaceToolParts(tool));
+    else expanded.push(tool);
+  }
+  const converted = expanded.map(chatToolFromResponsesTool).filter(Boolean);
   return converted.length > 0 ? converted : undefined;
 }
 
 function anthropicToolFromResponsesTool(tool) {
+  const customParts = responseCustomToolParts(tool);
+  if (customParts) {
+    const anthropicCustomTool = {
+      name: customParts.name,
+      input_schema: {
+        type: 'object',
+        properties: { input: { type: 'string' } },
+        required: ['input']
+      }
+    };
+    if (customParts.description !== undefined) anthropicCustomTool.description = String(customParts.description);
+    return anthropicCustomTool;
+  }
+  if (tool?.type === 'web_search' || tool?.type === 'web_search_preview') {
+    const webSearch = {
+      type: 'web_search_20260209',
+      name: 'web_search'
+    };
+    if (Number.isFinite(Number(tool.max_uses))) webSearch.max_uses = Math.floor(Number(tool.max_uses));
+    if (Array.isArray(tool.allowed_domains)) webSearch.allowed_domains = tool.allowed_domains.map(String);
+    if (Array.isArray(tool.blocked_domains)) webSearch.blocked_domains = tool.blocked_domains.map(String);
+    if (objectRecord(tool.user_location)) {
+      const location = tool.user_location.approximate && objectRecord(tool.user_location.approximate)
+        ? tool.user_location.approximate
+        : tool.user_location;
+      webSearch.user_location = {
+        type: 'approximate',
+        ...Object.fromEntries(
+          ['city', 'region', 'country', 'timezone']
+            .filter((key) => typeof location[key] === 'string' && location[key].trim())
+            .map((key) => [key, location[key]])
+        )
+      };
+    }
+    return webSearch;
+  }
+  if (tool?.type === 'tool_search') {
+    return { type: 'tool_search_tool_bm25_20251119', name: 'tool_search_tool_bm25' };
+  }
   const parts = responseFunctionToolParts(tool);
   if (!parts) return null;
   const anthropicTool = {
@@ -1375,7 +1979,12 @@ function anthropicToolFromResponsesTool(tool) {
 
 function anthropicToolsFromResponsesTools(tools) {
   if (!Array.isArray(tools)) return undefined;
-  const converted = tools.map(anthropicToolFromResponsesTool).filter(Boolean);
+  const expanded = [];
+  for (const tool of tools) {
+    if (tool?.type === 'namespace') expanded.push(...responseNamespaceToolParts(tool));
+    else expanded.push(tool);
+  }
+  const converted = expanded.map(anthropicToolFromResponsesTool).filter(Boolean);
   return converted.length > 0 ? converted : undefined;
 }
 
@@ -1393,8 +2002,12 @@ function chatToolChoiceFromResponsesToolChoice(choice) {
   if (choice.type === 'function' && typeof name === 'string' && name.trim()) {
     return { type: 'function', function: { name: name.trim() } };
   }
+  if (choice.type === 'custom' && typeof name === 'string' && name.trim()) {
+    return { type: 'custom', custom: { name: safeToolName(name, 'custom_tool') } };
+  }
   const type = String(choice.type || '').trim();
   if (CHAT_COMPLETIONS_TOOL_CHOICE_STRINGS.has(type) && isSimpleToolChoiceObject(choice, type)) return type;
+  if (type === 'web_search' || type === 'web_search_preview') return undefined;
   throw unsupportedToolConversionError([type || 'unknown'], 'Chat Completions adapter');
 }
 
@@ -1410,8 +2023,14 @@ function anthropicToolChoiceFromResponsesToolChoice(choice) {
   }
   const type = String(choice.type || '').trim();
   const name = choice.function?.name || choice.name;
-  if ((type === 'function' || type === 'tool') && typeof name === 'string' && name.trim()) {
-    return { type: 'tool', name: name.trim() };
+  if ((type === 'function' || type === 'custom' || type === 'tool') && typeof name === 'string' && name.trim()) {
+    return { type: 'tool', name: safeToolName(name, 'tool') };
+  }
+  if ((type === 'web_search' || type === 'web_search_preview')) {
+    return { type: 'tool', name: 'web_search' };
+  }
+  if (type === 'tool_search') {
+    return { type: 'tool', name: 'tool_search_tool_bm25' };
   }
   if (type === 'required') return { type: 'any' };
   if (type === 'any' || type === 'auto' || type === 'none') return { type };
@@ -1429,16 +2048,23 @@ function responsesInputToChatMessages(input) {
     }
     if (!item || typeof item !== 'object') continue;
 
-    // Handle function_call items → assistant message with tool_calls
-    if (item.type === 'function_call') {
+    // Handle function/custom tool calls -> assistant message with tool_calls
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
       const toolCall = {
         id: item.call_id || item.id || `call_${now().toString(36)}`,
-        type: 'function',
-        function: {
+        type: item.type === 'custom_tool_call' ? 'custom' : 'function'
+      };
+      if (item.type === 'custom_tool_call') {
+        toolCall.custom = {
+          name: safeToolName(item.name || '', 'custom_tool'),
+          input: stringFromToolOutput(firstDefined(item.input, item.arguments))
+        };
+      } else {
+        toolCall.function = {
           name: item.name || '',
           arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {})
-        }
-      };
+        };
+      }
       // Merge consecutive function_calls into the same assistant message
       const previous = messages[messages.length - 1];
       if (previous && previous.role === 'assistant' && Array.isArray(previous.tool_calls)) {
@@ -1449,8 +2075,8 @@ function responsesInputToChatMessages(input) {
       continue;
     }
 
-    // Handle function_call_output items → tool role message
-    if (item.type === 'function_call_output') {
+    // Handle function/custom tool outputs -> tool role message
+    if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
       messages.push({
         role: 'tool',
         tool_call_id: item.call_id || '',
@@ -1459,19 +2085,24 @@ function responsesInputToChatMessages(input) {
       continue;
     }
 
-    const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user';
-    const content = textFromResponsesContent(item.content ?? item.text ?? item.message);
+    const role = item.role === 'assistant'
+      ? 'assistant'
+      : item.role === 'system'
+        ? 'system'
+        : item.role === 'developer'
+          ? 'developer'
+          : 'user';
+    const content = chatContentFromResponsesContent(item.content ?? item.text ?? item.message, role);
     if (!content) continue;
     const previous = messages[messages.length - 1];
-    if (previous && previous.role === role && !previous.tool_calls) previous.content += `\n${content}`;
+    if (previous && previous.role === role && !previous.tool_calls) mergeChatMessageContent(previous, content);
     else messages.push({ role, content });
   }
   return messages;
 }
 
 function anthropicTextBlocksFromResponsesContent(content) {
-  const text = textFromResponsesContent(content);
-  return text ? [{ type: 'text', text }] : [];
+  return anthropicContentBlocksFromResponsesContent(content);
 }
 
 function mergeAnthropicMessages(messages) {
@@ -1507,19 +2138,22 @@ function responsesInputToAnthropicMessages(input) {
       continue;
     }
     if (!item || typeof item !== 'object') continue;
-    if (item.type === 'function_call') {
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const input = item.type === 'custom_tool_call'
+        ? { input: stringFromToolOutput(firstDefined(item.input, item.arguments)) }
+        : objectFromToolArguments(item.arguments);
       messages.push({
         role: 'assistant',
         content: [{
           type: 'tool_use',
           id: item.call_id || item.id || `toolu_pool_${now().toString(36)}`,
-          name: item.name || '',
-          input: objectFromToolArguments(item.arguments)
+          name: safeToolName(item.name || '', 'tool'),
+          input
         }]
       });
       continue;
     }
-    if (item.type === 'function_call_output') {
+    if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
       messages.push({
         role: 'user',
         content: [{
@@ -1528,6 +2162,10 @@ function responsesInputToAnthropicMessages(input) {
           content: stringFromToolOutput(item.output)
         }]
       });
+      continue;
+    }
+    if (item.type === 'thinking' || item.type === 'redacted_thinking') {
+      messages.push({ role: 'assistant', content: [item] });
       continue;
     }
     const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user';
@@ -1564,13 +2202,24 @@ const CHAT_COMPLETIONS_PASSTHROUGH_FIELDS = [
   'response_format',
   'seed',
   'user',
+  'store',
+  'metadata',
   'service_tier',
   'stream_options',
-  'parallel_tool_calls'
+  'parallel_tool_calls',
+  'modalities',
+  'audio',
+  'prediction',
+  'prompt_cache_key',
+  'prompt_cache_retention',
+  'reasoning_effort',
+  'safety_identifier',
+  'verbosity',
+  'web_search_options'
 ];
 
 const CHAT_COMPLETIONS_RESPONSES_TEXT_FORMAT_TYPES = new Set(['text', 'json_object', 'json_schema']);
-const ANTHROPIC_RESPONSES_TEXT_FORMAT_TYPES = new Set(['text']);
+const ANTHROPIC_RESPONSES_TEXT_FORMAT_TYPES = new Set(['text', 'json_object', 'json_schema']);
 
 function copyPayloadFields(target, source, fields) {
   for (const field of fields) {
@@ -1642,69 +2291,83 @@ function unsupportedInputConversionMessage(types, adapterName) {
   return `unsupported Responses input item/content types for ${adapterName}: ${list}; route this request to a native /v1/responses upstream or use text/function-call inputs`;
 }
 
-function unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes) {
+function unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes, fieldTypes = []) {
   const parts = [];
   if (toolTypes.length > 0) parts.push('tool types');
   if (outputFormatTypes.length > 0) parts.push('text.format types');
   if (inputTypes.length > 0) parts.push('input item/content types');
+  if (fieldTypes.length > 0) parts.push('fields');
   return parts.length ? parts.join('/') : 'tools/output formats/inputs';
 }
 
-function unsupportedChatAdapterConversionMessage(toolTypes, outputFormatTypes, inputTypes = []) {
-  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+function unsupportedChatAdapterConversionMessage(toolTypes, outputFormatTypes, inputTypes = [], fieldTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return unsupportedToolConversionMessage(toolTypes, 'Chat Completions adapter');
   }
-  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return unsupportedOutputFormatConversionMessage(outputFormatTypes, 'Chat Completions adapter');
   }
-  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && fieldTypes.length === 0) {
     return unsupportedInputConversionMessage(inputTypes, 'Chat Completions adapter');
+  }
+  if (fieldTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return `unsupported Responses fields for Chat Completions adapter: ${fieldTypes.join(', ')}; route this request to a native /v1/responses upstream or enable adapter compatibility mode`;
   }
   const toolList = toolTypes.length ? toolTypes.join(', ') : 'none';
   const outputList = outputFormatTypes.length ? outputFormatTypes.join(', ') : 'none';
   const inputList = inputTypes.length ? inputTypes.join(', ') : 'none';
-  return `unsupported Responses features for Chat Completions adapter: tool types=${toolList}; text.format types=${outputList}; input item/content types=${inputList}; route this request to a native /v1/responses upstream or use convertible function tools/output formats/inputs`;
+  const fieldList = fieldTypes.length ? fieldTypes.join(', ') : 'none';
+  return `unsupported Responses features for Chat Completions adapter: tool types=${toolList}; text.format types=${outputList}; input item/content types=${inputList}; fields=${fieldList}; route this request to a native /v1/responses upstream or use convertible function tools/output formats/inputs`;
 }
 
-function unavailableNativeResponsesConversionMessage(toolTypes, outputFormatTypes, inputTypes = []) {
-  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+function unavailableNativeResponsesConversionMessage(toolTypes, outputFormatTypes, inputTypes = [], fieldTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses tool types cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use function tools';
   }
-  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses text.format types cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use a convertible output format';
   }
-  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses input item/content types cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use text/function-call inputs';
   }
-  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes);
+  if (fieldTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses fields cannot be converted by available upstreams; route this request to a native /v1/responses upstream or enable adapter compatibility mode';
+  }
+  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes, fieldTypes);
   return `unsupported Responses ${summary} cannot be converted by available upstreams; route this request to a native /v1/responses upstream or use convertible function tools/output formats/inputs`;
 }
 
-function nativeResponsesRequiredFailureMessage(toolTypes, outputFormatTypes, inputTypes = []) {
-  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+function nativeResponsesRequiredFailureMessage(toolTypes, outputFormatTypes, inputTypes = [], fieldTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses tool types cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
   }
-  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses text.format types cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
   }
-  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses input item/content types cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
   }
-  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes);
+  if (fieldTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses fields cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled';
+  }
+  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes, fieldTypes);
   return `unsupported Responses ${summary} cannot be converted by available upstreams; native /v1/responses attempts failed and Chat Completions fallback is disabled`;
 }
 
-function noNativeResponsesCandidateMessage(toolTypes, outputFormatTypes, inputTypes = []) {
-  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+function noNativeResponsesCandidateMessage(toolTypes, outputFormatTypes, inputTypes = [], fieldTypes = []) {
+  if (toolTypes.length > 0 && outputFormatTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses tool types require a native /v1/responses upstream; no compatible upstream candidate is currently available';
   }
-  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0) {
+  if (outputFormatTypes.length > 0 && toolTypes.length === 0 && inputTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses text.format types require a native /v1/responses upstream; no compatible upstream candidate is currently available';
   }
-  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0) {
+  if (inputTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && fieldTypes.length === 0) {
     return 'unsupported Responses input item/content types require a native /v1/responses upstream; no compatible upstream candidate is currently available';
   }
-  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes);
+  if (fieldTypes.length > 0 && toolTypes.length === 0 && outputFormatTypes.length === 0 && inputTypes.length === 0) {
+    return 'unsupported Responses fields require a native /v1/responses upstream; no compatible upstream candidate is currently available';
+  }
+  const summary = unsupportedResponsesFeatureSummary(toolTypes, outputFormatTypes, inputTypes, fieldTypes);
   return `unsupported Responses ${summary} require a native /v1/responses upstream; no compatible upstream candidate is currently available`;
 }
 
@@ -1712,6 +2375,304 @@ function retryableStatusWithNativeResponsesUnsupported(baseRetryableStatus) {
   const retryableStatus = new Set(baseRetryableStatus);
   for (const status of NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS) retryableStatus.add(status);
   return retryableStatus;
+}
+
+function compatibilityAdapterAllowed(state, model) {
+  const mode = state.compatibility?.adapterMode;
+  if (!mode?.stripResponsesOnlyFeatures) return false;
+  return isClaudeModel(model)
+    ? mode.adapters?.anthropicMessages === true
+    : mode.adapters?.chatCompletions === true;
+}
+
+function emptyCompatibilityBucket() {
+  return {
+    tool_types: [],
+    input_types: [],
+    output_format_types: [],
+    content_types: [],
+    fields: []
+  };
+}
+
+function addCompatibilityDiagnostic(bucket, key, value) {
+  if (!value) return;
+  if (!Array.isArray(bucket[key])) bucket[key] = [];
+  if (!bucket[key].includes(value)) bucket[key].push(value);
+}
+
+function createCompatibilityDiagnostics() {
+  return {
+    converted: emptyCompatibilityBucket(),
+    downgraded: emptyCompatibilityBucket(),
+    stripped: emptyCompatibilityBucket()
+  };
+}
+
+function stripCompatibilityField(payload, diagnostics, field) {
+  if (!Object.prototype.hasOwnProperty.call(payload, field)) return;
+  delete payload[field];
+  addCompatibilityDiagnostic(diagnostics.stripped, 'fields', field);
+}
+
+function sanitizeCompatibilityText(payload, adapter, diagnostics) {
+  if (!objectRecord(payload.text)) return;
+  if (!Object.prototype.hasOwnProperty.call(payload.text, 'verbosity')) return;
+  const text = { ...payload.text };
+  if (adapter === 'chat_completions') {
+    if (payload.verbosity === undefined) {
+      payload.verbosity = text.verbosity;
+      addCompatibilityDiagnostic(diagnostics.converted, 'fields', 'text.verbosity->verbosity');
+    } else {
+      addCompatibilityDiagnostic(diagnostics.downgraded, 'fields', RESPONSE_COMPATIBILITY_CHAT_TEXT_VERBOSITY_FIELD);
+    }
+  } else {
+    addCompatibilityDiagnostic(diagnostics.stripped, 'fields', RESPONSE_COMPATIBILITY_CHAT_TEXT_VERBOSITY_FIELD);
+  }
+  delete text.verbosity;
+  if (Object.keys(text).length > 0) payload.text = text;
+  else delete payload.text;
+}
+
+function compatibilityToolsForAdapter(tool, adapter, payload, diagnostics) {
+  const type = responsesToolTypeLabel(tool);
+  if (responseFunctionToolParts(tool)) return [tool];
+  if (responseCustomToolParts(tool)) {
+    addCompatibilityDiagnostic(diagnostics.converted, 'tool_types', 'custom');
+    if (adapter === 'anthropic_messages') addCompatibilityDiagnostic(diagnostics.downgraded, 'tool_types', 'custom');
+    return [tool];
+  }
+  if (type === 'namespace') {
+    const tools = responseNamespaceToolParts(tool);
+    if (tools.length > 0) {
+      addCompatibilityDiagnostic(diagnostics.downgraded, 'tool_types', 'namespace');
+      return tools;
+    }
+    addCompatibilityDiagnostic(diagnostics.stripped, 'tool_types', 'namespace');
+    return [];
+  }
+  if (type === 'web_search' || type === 'web_search_preview') {
+    if (adapter === 'chat_completions') {
+      const webSearchOptions = webSearchOptionsFromResponsesTools([tool]);
+      if (webSearchOptions && payload.web_search_options === undefined) payload.web_search_options = webSearchOptions;
+      addCompatibilityDiagnostic(diagnostics.converted, 'tool_types', type);
+      addCompatibilityDiagnostic(diagnostics.downgraded, 'tool_types', type);
+      return [];
+    }
+    addCompatibilityDiagnostic(diagnostics.converted, 'tool_types', type);
+    return [tool];
+  }
+  if (type === 'tool_search') {
+    if (adapter === 'anthropic_messages') {
+      addCompatibilityDiagnostic(diagnostics.converted, 'tool_types', 'tool_search');
+      addCompatibilityDiagnostic(diagnostics.downgraded, 'tool_types', 'tool_search');
+      return [tool];
+    }
+    addCompatibilityDiagnostic(diagnostics.stripped, 'tool_types', 'tool_search');
+    return [];
+  }
+  addCompatibilityDiagnostic(diagnostics.stripped, 'tool_types', type);
+  return [];
+}
+
+function sanitizeCompatibilityToolChoice(payload, adapter, diagnostics) {
+  const choice = payload.tool_choice;
+  if (choice === undefined) return;
+  const type = typeof choice === 'string' ? choice.trim() : String(choice?.type || '').trim();
+  if (!type || ['auto', 'none', 'required', 'any'].includes(type)) return;
+  if (type === 'function' || type === 'custom') return;
+  if ((type === 'web_search' || type === 'web_search_preview') && adapter === 'anthropic_messages') return;
+  if (type === 'tool_search' && adapter === 'anthropic_messages') return;
+  if ((type === 'web_search' || type === 'web_search_preview') && adapter === 'chat_completions') {
+    delete payload.tool_choice;
+    addCompatibilityDiagnostic(diagnostics.downgraded, 'fields', `tool_choice:${type}`);
+    return;
+  }
+  payload.tool_choice = 'auto';
+  addCompatibilityDiagnostic(diagnostics.downgraded, 'fields', `tool_choice:${type}`);
+}
+
+function sanitizeCompatibilityContent(content, adapter, diagnostics) {
+  if (!Array.isArray(content)) return content;
+  const next = [];
+  for (const block of content) {
+    if (typeof block === 'string') {
+      next.push(block);
+      continue;
+    }
+    if (!block || typeof block !== 'object' || Array.isArray(block)) {
+      addCompatibilityDiagnostic(diagnostics.stripped, 'content_types', 'unknown');
+      continue;
+    }
+    const type = typeof block.type === 'string' && block.type.trim() ? block.type.trim() : '';
+    if (type === 'input_image' || type === 'input_file') {
+      if (responsesContentBlockConvertibleForAdapter(block, adapter)) {
+        addCompatibilityDiagnostic(diagnostics.converted, 'content_types', type);
+        for (const field of downgradedResponsesContentFieldsForAdapter(block, adapter)) {
+          addCompatibilityDiagnostic(diagnostics.downgraded, 'fields', field);
+        }
+        next.push(block);
+      } else {
+        addCompatibilityDiagnostic(diagnostics.stripped, 'content_types', type);
+      }
+      continue;
+    }
+    if (type && !CONVERTIBLE_RESPONSES_CONTENT_TYPES.has(type)) {
+      addCompatibilityDiagnostic(diagnostics.stripped, 'content_types', type);
+      continue;
+    }
+    next.push(block);
+  }
+  return next;
+}
+
+function sanitizeCompatibilityInput(input, adapter, diagnostics) {
+  if (!Array.isArray(input)) return input;
+  const next = [];
+  for (const item of input) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      next.push(item);
+      continue;
+    }
+    const type = responsesInputItemType(item);
+    if (type === 'reasoning') {
+      addCompatibilityDiagnostic(diagnostics.stripped, 'input_types', 'reasoning');
+      continue;
+    }
+    if (type === 'custom_tool_call' || type === 'custom_tool_call_output') {
+      addCompatibilityDiagnostic(diagnostics.converted, 'input_types', type);
+    } else if (type && !CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES.has(type)) {
+      addCompatibilityDiagnostic(diagnostics.stripped, 'input_types', type);
+      continue;
+    }
+
+    const contentKey = item.content !== undefined
+      ? 'content'
+      : item.text !== undefined
+        ? 'text'
+        : item.message !== undefined
+          ? 'message'
+          : '';
+    const content = contentKey ? item[contentKey] : undefined;
+    let nextItem = item;
+    if (Array.isArray(content)) {
+      nextItem = { ...item, [contentKey]: sanitizeCompatibilityContent(content, adapter, diagnostics) };
+    }
+    next.push(nextItem);
+  }
+  return next;
+}
+
+function sanitizePayloadForAdapterCompatibility(payload, adapter, diagnostics) {
+  const next = { ...payload };
+  for (const field of RESPONSE_COMPATIBILITY_SCRUB_FIELDS) stripCompatibilityField(next, diagnostics, field);
+  sanitizeCompatibilityText(next, adapter, diagnostics);
+
+  if (objectRecord(next.reasoning)) {
+    if (typeof next.reasoning.effort === 'string' && next.reasoning.effort.trim()) {
+      if (adapter === 'chat_completions' && next.reasoning_effort === undefined) {
+        next.reasoning_effort = next.reasoning.effort.trim();
+        addCompatibilityDiagnostic(diagnostics.converted, 'fields', 'reasoning.effort->reasoning_effort');
+      } else if (adapter === 'anthropic_messages') {
+        next.output_config = objectRecord(next.output_config) ? { ...next.output_config } : {};
+        if (next.output_config.effort === undefined) next.output_config.effort = next.reasoning.effort.trim();
+        addCompatibilityDiagnostic(diagnostics.converted, 'fields', 'reasoning.effort->output_config.effort');
+      }
+    }
+    delete next.reasoning;
+    addCompatibilityDiagnostic(diagnostics.stripped, 'fields', 'reasoning');
+  }
+
+  const format = responsesTextFormatFromPayload(next);
+  const formatType = responsesTextFormatTypeLabel(format);
+  if (format && formatType === 'grammar') {
+    delete next.text;
+    addCompatibilityDiagnostic(diagnostics.stripped, 'output_format_types', 'grammar');
+  } else if (format && formatType === 'json_schema') {
+    addCompatibilityDiagnostic(diagnostics.converted, 'output_format_types', 'json_schema');
+  } else if (format && formatType === 'json_object') {
+    addCompatibilityDiagnostic(diagnostics.converted, 'output_format_types', 'json_object');
+    if (adapter === 'anthropic_messages') addCompatibilityDiagnostic(diagnostics.downgraded, 'output_format_types', 'json_object');
+  }
+
+  if (Array.isArray(next.tools)) {
+    const compatibleTools = [];
+    for (const tool of next.tools) {
+      compatibleTools.push(...compatibilityToolsForAdapter(tool, adapter, next, diagnostics));
+    }
+    if (compatibleTools.length > 0) next.tools = compatibleTools;
+    else delete next.tools;
+  }
+
+  sanitizeCompatibilityToolChoice(next, adapter, diagnostics);
+  if (Array.isArray(next.input)) next.input = sanitizeCompatibilityInput(next.input, adapter, diagnostics);
+  return next;
+}
+
+function buildAdapterCompatibilityPlan({ req, body, model, state, options = {}, trigger = 'no_native_responses_candidate' } = {}) {
+  if (!compatibilityAdapterAllowed(state, model)) return null;
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  if (!payload) return null;
+  const adapter = isClaudeModel(model) ? 'anthropic_messages' : 'chat_completions';
+  const toolDeclarationTypes = unsupportedResponsesToolTypesFromTools(payload.tools);
+  const toolChoiceTypes = unsupportedResponsesToolChoiceTypesFromChoice(payload.tool_choice);
+  const inputTypes = unsupportedResponsesInputTypesFromPayload(payload, { targetAdapter: adapter });
+  const outputFormatTypes = unsupportedResponsesOutputFormatTypesFromPayload(
+    payload,
+    adapter === 'anthropic_messages' ? ANTHROPIC_RESPONSES_TEXT_FORMAT_TYPES : CHAT_COMPLETIONS_RESPONSES_TEXT_FORMAT_TYPES
+  );
+  const fieldTypes = unsupportedResponsesFieldTypesFromPayload(payload, { targetAdapter: adapter });
+  if (
+    toolDeclarationTypes.length === 0 &&
+    toolChoiceTypes.length === 0 &&
+    inputTypes.length === 0 &&
+    outputFormatTypes.length === 0 &&
+    fieldTypes.length === 0
+  ) return null;
+  const diagnostics = createCompatibilityDiagnostics();
+  const compatiblePayload = sanitizePayloadForAdapterCompatibility(payload, adapter, diagnostics);
+  return {
+    mode: 'adapter',
+    trigger,
+    target_adapter: adapter,
+    converted: diagnostics.converted,
+    downgraded: diagnostics.downgraded,
+    stripped: diagnostics.stripped,
+    strippedBody: Buffer.from(JSON.stringify(compatiblePayload))
+  };
+}
+
+function compatibilitySummary(plan, routeTrace = null) {
+  if (!plan) return null;
+  const bucket = (value = {}) => ({
+    tool_types: value.tool_types || [],
+    input_types: value.input_types || [],
+    output_format_types: value.output_format_types || [],
+    content_types: value.content_types || [],
+    fields: value.fields || []
+  });
+  return {
+    mode: plan.mode,
+    trigger: plan.trigger,
+    target_adapter: plan.target_adapter || '',
+    adapter: routeTrace?.adapter || '',
+    converted: bucket(plan.converted),
+    downgraded: bucket(plan.downgraded),
+    stripped: bucket(plan.stripped)
+  };
+}
+
+function compatibilityBucketHeader(bucket = {}) {
+  const tools = (bucket.tool_types || []).join(',');
+  const inputs = (bucket.input_types || []).join(',');
+  const outputs = (bucket.output_format_types || []).join(',');
+  const content = (bucket.content_types || []).join(',');
+  const fields = (bucket.fields || []).join(',');
+  return `tools=${tools}; inputs=${inputs}; outputs=${outputs}; content=${content}; fields=${fields}`;
+}
+
+function compatibilityStrippedHeader(stripped = {}) {
+  return compatibilityBucketHeader(stripped);
 }
 
 function chatResponseFormatFromResponsesTextFormat(format) {
@@ -1739,6 +2700,73 @@ function chatResponseFormatFromResponsesTextFormat(format) {
   return { type: 'json_schema', json_schema: jsonSchema };
 }
 
+function anthropicJsonSchemaFromResponsesTextFormat(format) {
+  if (!format) return undefined;
+  const type = responsesTextFormatTypeLabel(format);
+  if (type === 'text') return undefined;
+  if (type === 'json_object') {
+    return { type: 'json_schema', schema: { type: 'object' } };
+  }
+  if (type !== 'json_schema') throw unsupportedOutputFormatConversionError([type], 'Anthropic Messages adapter');
+  if (objectRecord(format.json_schema?.schema)) {
+    return { type: 'json_schema', schema: format.json_schema.schema };
+  }
+  if (objectRecord(format.schema)) {
+    return { type: 'json_schema', schema: format.schema };
+  }
+  throw unsupportedOutputFormatConversionError(['json_schema'], 'Anthropic Messages adapter');
+}
+
+function applyReasoningEffort(target, payload, adapterName) {
+  const effort = payload?.reasoning && typeof payload.reasoning === 'object' && !Array.isArray(payload.reasoning)
+    ? payload.reasoning.effort
+    : undefined;
+  if (typeof effort !== 'string' || !effort.trim()) return;
+  if (adapterName === 'chat') {
+    if (target.reasoning_effort === undefined) target.reasoning_effort = effort.trim();
+    return;
+  }
+  if (!objectRecord(target.output_config)) target.output_config = {};
+  if (target.output_config.effort === undefined) target.output_config.effort = effort.trim();
+}
+
+function applyAnthropicOutputConfig(target, payload) {
+  const outputConfig = objectRecord(payload.output_config) ? { ...payload.output_config } : {};
+  const format = anthropicJsonSchemaFromResponsesTextFormat(responsesTextFormatFromPayload(payload));
+  if (format && outputConfig.format === undefined) outputConfig.format = format;
+  const effort = payload?.reasoning && typeof payload.reasoning === 'object' && !Array.isArray(payload.reasoning)
+    ? payload.reasoning.effort
+    : undefined;
+  if (typeof effort === 'string' && effort.trim() && outputConfig.effort === undefined) {
+    outputConfig.effort = effort.trim();
+  }
+  if (Object.keys(outputConfig).length > 0) target.output_config = outputConfig;
+}
+
+function webSearchOptionsFromResponsesTools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const searchTool = tools.find((tool) => tool?.type === 'web_search' || tool?.type === 'web_search_preview');
+  if (!searchTool) return undefined;
+  const options = {};
+  if (['low', 'medium', 'high'].includes(searchTool.search_context_size)) {
+    options.search_context_size = searchTool.search_context_size;
+  }
+  if (objectRecord(searchTool.user_location)) {
+    const approximate = searchTool.user_location.approximate && objectRecord(searchTool.user_location.approximate)
+      ? searchTool.user_location.approximate
+      : searchTool.user_location;
+    const location = Object.fromEntries(
+      ['city', 'country', 'region', 'timezone']
+        .filter((key) => typeof approximate[key] === 'string' && approximate[key].trim())
+        .map((key) => [key, approximate[key]])
+    );
+    if (Object.keys(location).length > 0) {
+      options.user_location = { type: 'approximate', approximate: location };
+    }
+  }
+  return Object.keys(options).length > 0 ? options : {};
+}
+
 function buildAnthropicMessagesPayload(body, model) {
   let payload;
   try {
@@ -1748,9 +2776,6 @@ function buildAnthropicMessagesPayload(body, model) {
     err.statusCode = 400;
     throw err;
   }
-
-  assertResponsesOutputFormatConvertible(payload, ANTHROPIC_RESPONSES_TEXT_FORMAT_TYPES, 'Anthropic Messages adapter');
-  assertResponsesToolsConvertible(payload.tools, 'Anthropic Messages adapter');
 
   const { messages, system } = responsesInputToAnthropicMessages(payload.input);
   const finalMessages = messages.length > 0
@@ -1762,6 +2787,7 @@ function buildAnthropicMessagesPayload(body, model) {
     messages: finalMessages,
     stream: Boolean(payload.stream)
   };
+  applyAnthropicOutputConfig(anthropic, payload);
 
   const systemText = [payload.instructions, system]
     .filter((value) => typeof value === 'string' && value.trim())
@@ -1780,9 +2806,19 @@ function buildAnthropicMessagesPayload(body, model) {
   if (anthropicToolChoice && anthropicTools) {
     if (payload.parallel_tool_calls === false) anthropicToolChoice.disable_parallel_tool_use = true;
     anthropic.tool_choice = anthropicToolChoice;
+  } else if (payload.parallel_tool_calls === false && anthropicTools) {
+    anthropic.tool_choice = { type: 'auto', disable_parallel_tool_use: true };
   } else {
     delete anthropic.tool_choice;
   }
+
+  if (typeof payload.safety_identifier === 'string' && payload.safety_identifier.trim()) {
+    anthropic.metadata = { user_id: payload.safety_identifier.trim() };
+  } else if (objectRecord(payload.metadata) && typeof payload.metadata.user_id === 'string' && payload.metadata.user_id.trim()) {
+    anthropic.metadata = { user_id: payload.metadata.user_id.trim() };
+  }
+  if (payload.service_tier === 'auto') anthropic.service_tier = 'auto';
+  else if (payload.service_tier === 'default' || payload.service_tier === 'standard_only') anthropic.service_tier = 'standard_only';
 
   const temperature = numberOption(payload.temperature);
   if (temperature !== undefined) anthropic.temperature = temperature;
@@ -1818,10 +2854,15 @@ function buildChatCompletionsPayload(body, model) {
     messages: finalMessages,
     stream: Boolean(payload.stream)
   };
+  applyReasoningEffort(chat, payload, 'chat');
   copyPayloadFields(chat, payload, CHAT_COMPLETIONS_PASSTHROUGH_FIELDS);
   if (chat.response_format === undefined) {
     const responseFormat = chatResponseFormatFromResponsesTextFormat(responsesTextFormatFromPayload(payload));
     if (responseFormat) chat.response_format = responseFormat;
+  }
+  if (chat.web_search_options === undefined) {
+    const webSearchOptions = webSearchOptionsFromResponsesTools(payload.tools);
+    if (webSearchOptions) chat.web_search_options = webSearchOptions;
   }
 
   if (chat.stream && !chat.stream_options) {
@@ -1833,7 +2874,7 @@ function buildChatCompletionsPayload(body, model) {
   if (chatToolChoice !== undefined) chat.tool_choice = chatToolChoice;
 
   const maxTokenInput = firstDefined(payload.max_output_tokens, payload.max_tokens, payload.max_completion_tokens);
-  if (maxTokenInput !== undefined) chat.max_tokens = normalizeMaxTokens(maxTokenInput);
+  if (maxTokenInput !== undefined) chat.max_completion_tokens = normalizeMaxTokens(maxTokenInput);
   const temperature = numberOption(payload.temperature);
   if (temperature !== undefined) chat.temperature = temperature;
   const topP = numberOption(payload.top_p);
@@ -2095,6 +3136,7 @@ function buildState(config) {
     )
   };
   const availability = normalizeAvailabilityConfig(config.availability);
+  const compatibility = normalizeCompatibilityConfig(config.compatibility);
 
   const upstreams = (config.upstreams || [])
     .map((upstream, index) => createUpstreamState(upstream, index));
@@ -2102,6 +3144,7 @@ function buildState(config) {
   return {
     retry,
     availability,
+    compatibility,
     upstreams,
     probing: false,
     probingPromise: null,
@@ -2111,6 +3154,25 @@ function buildState(config) {
     modelOverride: typeof config.model_override === 'string' ? config.model_override : '',
     recentRequests: [],
     statsPersistTimer: null
+  };
+}
+
+function normalizeCompatibilityConfig(input = {}) {
+  const adapterMode = input?.adapter_mode && typeof input.adapter_mode === 'object' && !Array.isArray(input.adapter_mode)
+    ? input.adapter_mode
+    : {};
+  const enabled = booleanOption(adapterMode.strip_responses_only_features, false);
+  const adapters = adapterMode.adapters && typeof adapterMode.adapters === 'object' && !Array.isArray(adapterMode.adapters)
+    ? adapterMode.adapters
+    : {};
+  return {
+    adapterMode: {
+      stripResponsesOnlyFeatures: enabled,
+      adapters: {
+        anthropicMessages: adapters.anthropic_messages === undefined ? enabled : booleanOption(adapters.anthropic_messages, false),
+        chatCompletions: adapters.chat_completions === undefined ? enabled : booleanOption(adapters.chat_completions, false)
+      }
+    }
   };
 }
 
@@ -2126,6 +3188,7 @@ function statsSnapshot(state) {
       billing: upstream.billing,
       health: {
         state: upstream.health.state,
+        source: upstream.health.source || '',
         checkedAt: upstream.health.checkedAt,
         latencyMs: upstream.health.latencyMs,
         httpStatus: upstream.health.httpStatus,
@@ -2302,6 +3365,64 @@ function recordAvailability(upstream, key, succeeded, availabilityConfig) {
   }
 }
 
+function shouldRestoreNativeResponsesForwardOnly(upstream) {
+  return upstreamHasConfiguredNativeResponses(upstream) &&
+    NON_REPRESENTATIVE_NATIVE_RESPONSES_PROBE_STATES.has(upstream?.health?.state);
+}
+
+function shouldRestoreInvalidCodexProbeHealth(upstream) {
+  const health = upstream?.health || {};
+  if (health.state !== 'models_unsupported') return false;
+  const capabilities = normalizeProtocolCapabilities(upstream?.capabilities);
+  const responses = capabilities.responses;
+  const chat = capabilities.chat_completions;
+  const previousEvidence = `${health.error || ''} ${responses.reason || ''}`.toLowerCase();
+  return responses.source === 'probe' &&
+    responses.status === 'failed' &&
+    Number(responses.http_status || 0) === 400 &&
+    chat.source === 'probe' &&
+    Number(chat.http_status || 0) === 404 &&
+    /responses probe unexpected_status; chat probe models_unsupported|responses probe returned http 400/.test(previousEvidence);
+}
+
+function restoreNativeResponsesForwardOnlyHealth(upstream) {
+  const restoreConfiguredNative = shouldRestoreNativeResponsesForwardOnly(upstream);
+  const restoreInvalidCodexProbe = shouldRestoreInvalidCodexProbeHealth(upstream);
+  if (!restoreConfiguredNative && !restoreInvalidCodexProbe) return;
+  const previousState = upstream.health?.state || 'unknown';
+  const previousError = upstream.health?.error || `restored Health State ${previousState}`;
+  const state = restoreInvalidCodexProbe ? 'advanced_curl_required' : 'codex_forward_only';
+  const error = restoreInvalidCodexProbe
+    ? `restored Health Probe state was produced by a non-representative synthetic Codex request: ${previousError}; rerun Health Probe or send real Codex traffic to verify availability`
+    : `native Responses capability is user-declared or configured, but the restored Health Probe state is not representative of real Codex traffic: ${previousError}`;
+  const restoredHttpStatus = restoreInvalidCodexProbe
+    ? Number(normalizeProtocolCapabilities(upstream.capabilities).responses.http_status || 0)
+    : 0;
+  upstream.health = {
+    ...upstream.health,
+    state,
+    ...(restoredHttpStatus ? { httpStatus: restoredHttpStatus } : {}),
+    error
+  };
+  if (restoreInvalidCodexProbe) {
+    upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+    upstream.capabilities.responses = {
+      ...upstream.capabilities.responses,
+      status: 'unknown',
+      representative: false,
+      reason: error
+    };
+  }
+  for (const key of upstream.keys || []) {
+    key.health = {
+      ...key.health,
+      state,
+      ...(restoredHttpStatus ? { httpStatus: restoredHttpStatus } : {}),
+      error
+    };
+  }
+}
+
 function restoreStats(state, statsPath) {
   if (!statsPath || !existsSync(statsPath)) return;
   try {
@@ -2316,7 +3437,7 @@ function restoreStats(state, statsPath) {
       ensureTokenUsage(upstream.stats);
       ensureAvailability(upstream.stats, state.availability);
       upstream.quota = { ...upstream.quota, ...(old.quota || {}) };
-      upstream.capabilities = normalizeProtocolCapabilities(old.capabilities || upstream.capabilities);
+      upstream.capabilities = mergeRestoredProtocolCapabilities(old.capabilities, upstream.capabilities);
       if (old.billing) upstream.billing = { ...upstream.billing, ...old.billing };
       if (old.health?.models?.length) {
         upstream.health = {
@@ -2334,6 +3455,7 @@ function restoreStats(state, statsPath) {
         key.quota = { ...key.quota, ...(oldKey.quota || {}) };
         if (oldKey.health) key.health = { ...key.health, ...oldKey.health };
       }
+      restoreNativeResponsesForwardOnlyHealth(upstream);
       if (!upstream.enabled) {
         upstream.cooldownUntil = 0;
         upstream.health = {
@@ -2622,6 +3744,7 @@ function hasConcreteOutputFromJson(value) {
   if (typeof value.partial_json === 'string' && value.partial_json.trim()) return true;
 
   if (value.type === 'function_call' && (String(value.name || '').trim() || String(value.arguments || '').trim())) return true;
+  if (value.type === 'custom_tool_call' && (String(value.name || '').trim() || String(value.input || '').trim())) return true;
   if (value.type === 'function' && value.function && typeof value.function === 'object') {
     if (String(value.function.name || '').trim() || String(value.function.arguments || '').trim()) return true;
   }
@@ -3057,6 +4180,30 @@ function chatUsageToResponsesUsage(usage = {}) {
   };
 }
 
+function chatToolCallToResponsesItem(tc, responseId, index = 0, status = 'completed') {
+  const type = tc?.type === 'custom' ? 'custom' : 'function';
+  if (type === 'custom') {
+    return {
+      id: `ctc_${responseId || now().toString(36)}_${index}`,
+      type: 'custom_tool_call',
+      status,
+      name: tc.custom?.name || '',
+      call_id: tc.id || `call_pool_${now().toString(36)}`,
+      input: typeof tc.custom?.input === 'string' ? tc.custom.input : stringFromToolOutput(tc.custom?.input)
+    };
+  }
+  return {
+    id: `fc_${responseId || now().toString(36)}_${index}`,
+    type: 'function_call',
+    status,
+    name: tc?.function?.name || '',
+    call_id: tc?.id || `call_pool_${now().toString(36)}`,
+    arguments: typeof tc?.function?.arguments === 'string'
+      ? tc.function.arguments
+      : JSON.stringify(tc?.function?.arguments || {})
+  };
+}
+
 function createChatResponsesStreamAdapter(res, model) {
   let buffer = '';
   let completed = false;
@@ -3119,14 +4266,23 @@ function createChatResponsesStreamAdapter(res, model) {
   }
 
   function functionCallItem(tc, status = 'in_progress') {
-    return {
-      id: tc.itemId,
-      type: 'function_call',
-      status,
-      name: tc.name,
-      call_id: tc.callId,
-      arguments: tc.arguments
-    };
+    return tc.type === 'custom'
+      ? {
+          id: tc.itemId,
+          type: 'custom_tool_call',
+          status,
+          name: tc.name,
+          call_id: tc.callId,
+          input: tc.arguments
+        }
+      : {
+          id: tc.itemId,
+          type: 'function_call',
+          status,
+          name: tc.name,
+          call_id: tc.callId,
+          arguments: tc.arguments
+        };
   }
 
   function ensureStarted() {
@@ -3231,10 +4387,12 @@ function createChatResponsesStreamAdapter(res, model) {
     if (!toolCalls.has(index)) {
       // First chunk for this tool call: contains id, function.name, and possibly first argument fragment
       const callId = tcDelta.id || `call_pool_${now().toString(36)}_${index}`;
-      const name = tcDelta.function?.name || '';
+      const callType = tcDelta.type === 'custom' ? 'custom' : 'function';
+      const name = callType === 'custom' ? tcDelta.custom?.name || '' : tcDelta.function?.name || '';
       const outputIndex = nextToolOutputIndex++;
-      const tcItemId = `fc_${responseId || now().toString(36)}_${index}`;
+      const tcItemId = `${callType === 'custom' ? 'ctc' : 'fc'}_${responseId || now().toString(36)}_${index}`;
       const tc = {
+        type: callType,
         callId,
         name,
         arguments: '',
@@ -3251,12 +4409,16 @@ function createChatResponsesStreamAdapter(res, model) {
     const tc = toolCalls.get(index);
 
     // Update name if it appears in a later chunk (some providers split it)
-    if (tcDelta.function?.name && !tc.name) {
+    if (tcDelta.custom?.name && !tc.name) {
+      tc.name = tcDelta.custom.name;
+    } else if (tcDelta.function?.name && !tc.name) {
       tc.name = tcDelta.function.name;
     }
 
     // Accumulate argument fragments
-    const argDelta = tcDelta.function?.arguments || '';
+    const argDelta = tc.type === 'custom'
+      ? tcDelta.custom?.input || ''
+      : tcDelta.function?.arguments || '';
     if (argDelta) {
       tc.arguments += argDelta;
       // Emit response.function_call_arguments.delta
@@ -3656,16 +4818,7 @@ function chatCompletionToResponsesJson(body, model) {
   const toolCalls = choice?.message?.tool_calls || choice?.delta?.tool_calls;
   if (Array.isArray(toolCalls)) {
     for (const tc of toolCalls) {
-      output.push({
-        id: `fc_${responseId}_${tc.index ?? output.length}`,
-        type: 'function_call',
-        status: 'completed',
-        name: tc.function?.name || '',
-        call_id: tc.id || `call_pool_${now().toString(36)}`,
-        arguments: typeof tc.function?.arguments === 'string'
-          ? tc.function.arguments
-          : JSON.stringify(tc.function?.arguments || {})
-      });
+      output.push(chatToolCallToResponsesItem(tc, responseId, tc.index ?? output.length, 'completed'));
     }
   }
 
@@ -4215,7 +5368,7 @@ function recordFailure(state, upstream, key, reason, statusCode, retryAfter) {
   }
 }
 
-function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, statsPath }) {
+function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
   recordAttemptOutcome(state, upstream, key, succeeded);
   const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
   const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
@@ -4238,6 +5391,7 @@ function finishResponseAttempt({ state, upstream, key, method, pathname, incomin
     outcome: succeeded ? 'ok' : 'error',
     reason: succeeded ? '' : failureReason,
     route: routeTrace,
+    ...(compatibility ? { compatibility } : {}),
     tokens: recordedTokens.totalTokens,
     inputTokens: recordedTokens.inputTokens,
     outputTokens: recordedTokens.outputTokens
@@ -4267,7 +5421,8 @@ function parseJsonBody(body) {
 }
 
 function advancedCurlRequiredProbeError(result) {
-  if (![401, 403].includes(Number(result?.statusCode || 0))) return '';
+  const statusCode = Number(result?.statusCode || 0);
+  if (![400, 401, 403].includes(statusCode)) return '';
   const json = parseJsonBody(result?.body);
   const error = json && typeof json === 'object' ? json.error : null;
   const code = String(
@@ -4283,6 +5438,13 @@ function advancedCurlRequiredProbeError(result) {
         : json?.message || result?.body || ''
   ).trim();
   const body = `${code} ${message}`.toLowerCase();
+  if (
+    statusCode === 400 &&
+    (code === 'invalid_responses_request' || /invalid_responses_request/i.test(body)) &&
+    /invalid codex request/i.test(body)
+  ) {
+    return '该上游要求真实 Codex 对话转发中的客户端上下文（例如 attestation、turn metadata 或等价签名）。标准 Health Probe 不能伪造完整旧版对话请求形态；请用真实 Codex 请求转发的响应结果验证可用性。';
+  }
   if (code === 'codex_access_restricted' || /codex_access_restricted|请使用最新版的codex客户端或codex cli调用|use latest codex client|please use .*codex.*(?:client|cli)/i.test(body)) {
     return '该上游要求比标准 Curl 更完整的请求形态（例如真实 Codex 客户端上下文、签名或额外头），当前测试请求无法单独验证；请使用匹配上游要求的高级 Curl profile 或真实 Codex 请求转发验证。';
   }
@@ -4376,6 +5538,17 @@ function classifyModelProbe(result, protocol) {
     : { state: 'ok', error: '' };
 }
 
+function shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification) {
+  return upstreamHasConfiguredNativeResponses(upstream) &&
+    NON_REPRESENTATIVE_NATIVE_RESPONSES_PROBE_STATES.has(responsesClassification?.state);
+}
+
+function codexForwardOnlyProbeError(responsesClassification, chatClassification) {
+  const responsesError = responsesClassification?.error || `responses probe ${responsesClassification?.state || 'unknown'}`;
+  const chatError = chatClassification?.error || `chat probe ${chatClassification?.state || 'unknown'}`;
+  return `native Responses capability is user-declared or configured, but the standard Health Probe is not representative of real Codex traffic: ${responsesError}; ${chatError}`;
+}
+
 function protocolCapabilityStatusFromProbeState(state) {
   if (state === 'ok') return 'verified';
   if (state === 'advanced_curl_required' || state === 'codex_forward_only') return 'unknown';
@@ -4398,7 +5571,18 @@ function recordProtocolCapabilityProbe(upstream, protocol, result, classified, {
   representative = true
 } = {}) {
   if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
+  if (upstreamHasUserDeclaredProtocolCapability(upstream, protocol)) return;
   const state = classified?.state || classifyModelProbe(result || {}, protocol).state;
+  const existing = upstream.capabilities?.[protocol];
+  if (
+    state !== 'ok' &&
+    existing?.status === 'verified' &&
+    existing?.source === 'real_traffic' &&
+    existing?.representative === true &&
+    String(existing?.model || '').trim() === String(model || '').trim()
+  ) {
+    return;
+  }
   upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
   upstream.capabilities[protocol] = {
     status: protocolCapabilityStatusFromProbeState(state),
@@ -4432,8 +5616,66 @@ function recordProtocolCapabilityRealTraffic(upstream, protocol, {
   };
 }
 
+function updateHealthFromRealTraffic(upstream, key, {
+  checkedAt = new Date().toISOString(),
+  model = '',
+  httpStatus = 0,
+  latencyMs = 0,
+  protocol = ''
+} = {}) {
+  if (!upstream) return;
+  const models = upstream.health?.models || [];
+  const health = {
+    ...upstream.health,
+    state: 'ok',
+    source: 'real_traffic',
+    checkedAt,
+    latencyMs: Number(latencyMs || 0) || upstream.health?.latencyMs || 0,
+    httpStatus: Number(httpStatus || 0) || 200,
+    error: '',
+    warning: protocol ? `verified by real ${protocol} traffic` : 'verified by real traffic',
+    models,
+    modelsCount: upstream.health?.modelsCount ?? models.length,
+    keyLabel: key?.label || upstream.health?.keyLabel || null,
+    probeModel: String(model || '')
+  };
+  upstream.health = health;
+  if (key) {
+    key.health = {
+      ...key.health,
+      state: 'ok',
+      source: 'real_traffic',
+      checkedAt,
+      latencyMs: health.latencyMs,
+      httpStatus: health.httpStatus,
+      error: '',
+      warning: health.warning,
+      probeModel: health.probeModel
+    };
+  }
+}
+
+function verifiedRealTrafficProtocolForModel(upstream, model) {
+  const expectedModel = String(model || '').trim();
+  if (!expectedModel) return '';
+  const capabilities = normalizeProtocolCapabilities(upstream?.capabilities);
+  for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
+    const capability = capabilities[protocol];
+    if (
+      capability.status === 'verified' &&
+      capability.source === 'real_traffic' &&
+      capability.representative === true &&
+      String(capability.model || '').trim() === expectedModel
+    ) {
+      return protocol;
+    }
+  }
+  return '';
+}
+
 function healthProbeEffectiveState(health, expectedModel) {
   const state = health?.state || 'unknown';
+  if (state === 'ok' && health?.source === 'real_traffic') return 'ok';
   if (state !== 'ok' || expectedModel === undefined) return state;
   const expected = normalizeProbeModel(expectedModel);
   if (!expected) return 'missing_model_override';
@@ -5057,14 +6299,11 @@ function probeResponsesUpstream(upstream, key, config, model) {
     const timeoutMs = Number(config.health?.timeout_ms || 10000);
     const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
     const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
-    const body = Buffer.from(JSON.stringify({
-      model,
-      input: 'hi',
-      stream: false,
-      max_output_tokens: 1
-    }));
-    const headers = buildProbeHeaders(targetUrl, key.value, upstream.probeAuth, upstream.probeHeaders);
-    headers['content-type'] = 'application/json';
+    const body = Buffer.from(JSON.stringify(codexResponsesProbePayload(model)));
+    const headers = buildJsonRequestHeaders(targetUrl, key.value, {
+      ...codexResponsesProbeIncomingHeaders(),
+      ...(upstream.probeHeaders || {})
+    });
     headers['content-length'] = body.length;
     const startedAt = now();
     let settled = false;
@@ -5701,19 +6940,30 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
           healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
           resolvedMode = 'chat_completions';
         } else {
-          // Both real probes failed; /models is only supplementary and cannot mark Health ok.
-          if (responsesState === 'advanced_curl_required' || responsesState === 'codex_forward_only') {
-            stateName = responsesState;
+          const verifiedRealTrafficProtocol = verifiedRealTrafficProtocolForModel(upstream, probeModel);
+          if (verifiedRealTrafficProtocol) {
+            stateName = 'codex_forward_only';
             healthResult = responsesResult;
-            healthError = responsesClassification.error;
-          } else if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only') {
-            stateName = chatState;
-            healthResult = chatResult;
-            healthError = chatClassification.error;
+            healthError = `real ${verifiedRealTrafficProtocol} traffic has succeeded for ${probeModel}, but the standard Health Probe is not representative of real Codex traffic: ${codexForwardOnlyProbeError(responsesClassification, chatClassification)}`;
+          } else if (shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification)) {
+            stateName = 'codex_forward_only';
+            healthResult = responsesResult;
+            healthError = codexForwardOnlyProbeError(responsesClassification, chatClassification);
           } else {
-            stateName = responsesState === 'auth_error' ? responsesState : chatState;
-            healthResult = responsesState === 'auth_error' ? responsesResult : chatResult;
-            healthError = responsesClassification.error || chatClassification.error || responsesResult.error || chatResult.error || `responses probe ${responsesState}; chat probe ${chatState}`;
+            // Both real probes failed; /models is only supplementary and cannot mark Health ok.
+            if (responsesState === 'advanced_curl_required' || responsesState === 'codex_forward_only') {
+              stateName = responsesState;
+              healthResult = responsesResult;
+              healthError = responsesClassification.error;
+            } else if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only') {
+              stateName = chatState;
+              healthResult = chatResult;
+              healthError = chatClassification.error;
+            } else {
+              stateName = responsesState === 'auth_error' ? responsesState : chatState;
+              healthResult = responsesState === 'auth_error' ? responsesResult : chatResult;
+              healthError = responsesClassification.error || chatClassification.error || responsesResult.error || chatResult.error || `responses probe ${responsesState}; chat probe ${chatState}`;
+            }
           }
         }
       }
@@ -6286,7 +7536,7 @@ function dashboardHtml() {
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     .toggle-field input { width: 38px; justify-self: start; accent-color: var(--accent); }
     .token-input { width: 180px; }
-    .model-panel { padding: 14px; display: grid; grid-template-columns: minmax(220px, .8fr) 1.2fr auto; gap: 14px; align-items: end; }
+    .model-panel { padding: 14px; display: grid; grid-template-columns: minmax(220px, .8fr) minmax(180px, 1fr) repeat(3, minmax(110px, auto)) auto; gap: 14px; align-items: end; }
     .model-readout { color: var(--muted); font-size: 13px; line-height: 1.45; }
     .curl-panel { padding: 16px; display: grid; grid-template-columns: minmax(210px, .8fr) minmax(150px, .42fr) minmax(150px, .42fr) minmax(150px, .42fr); gap: 10px; align-items: end; }
     .curl-panel .section-head, .curl-wide, .curl-result { grid-column: 1 / -1; }
@@ -6327,7 +7577,7 @@ function dashboardHtml() {
     .requests-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 12px; }
     .requests-head h2 { margin: 0; font-family: Didot, Bodoni 72, Georgia, serif; font-size: 28px; letter-spacing: 0; }
     .request-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
-    .request-row { display: grid; grid-template-columns: 1.2fr 1fr 1fr .6fr; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: rgba(255,255,255,.48); font-size: 12px; }
+    .request-row { display: grid; grid-template-columns: 1.1fr .9fr 1.2fr 1.2fr .6fr; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: rgba(255,255,255,.48); font-size: 12px; }
     .request-row strong { font-size: 13px; overflow-wrap: anywhere; }
     .request-row small { color: var(--muted); display: block; letter-spacing: .08em; text-transform: uppercase; }
     .models { display: flex; gap: 7px; flex-wrap: wrap; max-height: 142px; overflow: auto; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.42); }
@@ -6421,7 +7671,11 @@ function dashboardHtml() {
       <div class="model-panel panel">
         <label>当前模型<select id="modelSelect"><option value="">跟随 Codex 请求</option></select></label>
         <div class="model-readout" id="modelReadout">尚未完成模型探测。</div>
+        <label class="toggle-field">Adapter 兼容<input id="compatStrip" type="checkbox" /></label>
+        <label class="toggle-field">Anthropic<input id="compatAnthropic" type="checkbox" /></label>
+        <label class="toggle-field">Chat<input id="compatChat" type="checkbox" /></label>
         <button class="ghost" id="clearModel" type="button" data-icon="x">清空覆盖</button>
+        <div class="model-readout" id="compatReadout">兼容模式未加载。</div>
       </div>
       <section class="curl-panel panel dashboard-region" data-dashboard-region="curl-debugger" aria-labelledby="curl-debugger-title">
         <div class="section-head">
@@ -6557,6 +7811,10 @@ function dashboardHtml() {
     const lastRefresh = document.querySelector('#lastRefresh');
     const modelSelect = document.querySelector('#modelSelect');
     const modelReadout = document.querySelector('#modelReadout');
+    const compatStrip = document.querySelector('#compatStrip');
+    const compatAnthropic = document.querySelector('#compatAnthropic');
+    const compatChat = document.querySelector('#compatChat');
+    const compatReadout = document.querySelector('#compatReadout');
     const requestList = document.querySelector('#requestList');
     const dailyUsageList = document.querySelector('#dailyUsageList');
     const adminTokenInput = document.querySelector('#adminToken');
@@ -7548,11 +8806,33 @@ function dashboardHtml() {
       }
     }
     function renderRecentRequests(items) {
+      const compatibilityText = (compatibility) => {
+        if (!compatibility) return 'none';
+        const bucketParts = (label, bucket = {}) => {
+          const parts = [];
+          if (bucket.tool_types?.length) parts.push('tools=' + bucket.tool_types.join(','));
+          if (bucket.input_types?.length) parts.push('inputs=' + bucket.input_types.join(','));
+          if (bucket.output_format_types?.length) parts.push('outputs=' + bucket.output_format_types.join(','));
+          if (bucket.content_types?.length) parts.push('content=' + bucket.content_types.join(','));
+          if (bucket.fields?.length) parts.push('fields=' + bucket.fields.join(','));
+          return parts.length ? label + ':' + parts.join(';') : '';
+        };
+        const parts = [];
+        for (const text of [
+          bucketParts('converted', compatibility.converted),
+          bucketParts('downgraded', compatibility.downgraded),
+          bucketParts('stripped', compatibility.stripped)
+        ]) {
+          if (text) parts.push(text);
+        }
+        return \`\${compatibility.mode || 'adapter'} · \${compatibility.adapter || 'adapter'} · \${parts.join(' | ') || 'no changes'}\`;
+      };
       requestList.innerHTML = items.length ? items.map((item) => \`
         <div class="request-row">
           <div><small>Model</small><strong>\${esc(item.originalModel || 'none')} -> \${esc(item.actualModel || 'none')}</strong></div>
           <div><small>Upstream</small><strong>\${esc(item.upstream || 'unknown')}</strong></div>
           <div><small>Status</small><strong title="\${esc(\`Tokens \${fullToken(item.tokens ?? 0)} · Input \${fullToken(item.inputTokens ?? 0)} · Output \${fullToken(item.outputTokens ?? 0)}\`)}">\${esc(item.outcome || '')} · \${esc(item.status ?? 0)} · \${esc(item.durationMs ?? 0)}ms · \${esc(fmtToken(item.tokens ?? 0))} tok · in \${esc(fmtToken(item.inputTokens ?? 0))} / out \${esc(fmtToken(item.outputTokens ?? 0))}</strong></div>
+          <div><small>Compatibility</small><strong title="\${esc(compatibilityText(item.compatibility))}">\${esc(compatibilityText(item.compatibility))}</strong></div>
           <div><small>When</small><strong>\${new Date(item.at).toLocaleTimeString()}</strong></div>
         </div>\`).join('') : '<div class="empty">暂无请求记录。</div>';
     }
@@ -7623,6 +8903,26 @@ function dashboardHtml() {
       setToast(response.ok ? (model ? \`已切换模型：\${model}\` : '已清空模型覆盖') : \`切换失败：\${result.error}\`);
       await load();
     }
+    async function setCompatibilityFromControls() {
+      const enabled = compatStrip.checked;
+      const payload = {
+        strip_responses_only_features: enabled,
+        adapters: {
+          anthropic_messages: enabled && compatAnthropic.checked,
+          chat_completions: enabled && compatChat.checked
+        }
+      };
+      const response = await fetch('/pool/compatibility', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      setToast(response.ok
+        ? (enabled ? 'Adapter 兼容模式已更新。' : 'Adapter 兼容模式已关闭。')
+        : \`兼容模式更新失败：\${result.error || response.status}\`);
+      await load();
+    }
     async function load() {
       const response = await fetch('/pool/status', { headers: authHeaders() });
       if (response.status === 401) {
@@ -7656,6 +8956,16 @@ function dashboardHtml() {
       modelReadout.textContent = activeModel
         ? \`代理会把后续 JSON 请求中的 model 改写为 \${activeModel}。已探测到 \${knownModels.length} 个模型。\`
         : \`未设置模型覆盖；后续请求将使用 Codex 原始 model。已探测到 \${knownModels.length} 个模型。\`;
+      const compatibility = data.compatibility?.adapter_mode || {};
+      const compatEnabled = compatibility.strip_responses_only_features === true;
+      compatStrip.checked = compatEnabled;
+      compatAnthropic.checked = compatibility.adapters?.anthropic_messages === true;
+      compatChat.checked = compatibility.adapters?.chat_completions === true;
+      compatAnthropic.disabled = !compatEnabled;
+      compatChat.disabled = !compatEnabled;
+      compatReadout.textContent = compatEnabled
+        ? \`非原生 adapter 可在无 Native Responses Route 时剔除 Responses-only Features；Anthropic \${compatAnthropic.checked ? '开' : '关'}，Chat \${compatChat.checked ? '开' : '关'}。\`
+        : '严格模式：含 Responses-only Features 的请求需要 Native Responses Route。';
       renderRecentRequests(data.recent_requests || []);
       const nextCardsSignature = cardSignature(ups, activeModel);
       if (nextCardsSignature !== cardsSignature) {
@@ -8041,6 +9351,15 @@ function dashboardHtml() {
       load();
     });
     modelSelect.addEventListener('change', () => setModel(modelSelect.value));
+    compatStrip.addEventListener('change', () => {
+      if (compatStrip.checked && !compatAnthropic.checked && !compatChat.checked) {
+        compatAnthropic.checked = true;
+        compatChat.checked = true;
+      }
+      setCompatibilityFromControls();
+    });
+    compatAnthropic.addEventListener('change', setCompatibilityFromControls);
+    compatChat.addEventListener('change', setCompatibilityFromControls);
     document.querySelector('#clearModel').addEventListener('click', () => setModel(''));
     cards.addEventListener('click', (event) => {
       const toggleButton = event.target.closest('[data-toggle]');
@@ -8152,6 +9471,15 @@ function createStatusPayload(config, state) {
       override: state.modelOverride,
       known: knownModels(state)
     },
+    compatibility: {
+      adapter_mode: {
+        strip_responses_only_features: state.compatibility?.adapterMode?.stripResponsesOnlyFeatures === true,
+        adapters: {
+          anthropic_messages: state.compatibility?.adapterMode?.adapters?.anthropicMessages === true,
+          chat_completions: state.compatibility?.adapterMode?.adapters?.chatCompletions === true
+        }
+      }
+    },
     recent_requests: config.debug?.capture_request_headers === true
       ? state.recentRequests
       : stripRequestDebugFields(state.recentRequests),
@@ -8218,6 +9546,7 @@ function createStatusPayload(config, state) {
         health: {
           state: effectiveHealthState,
           raw_state: upstream.health.state,
+          source: upstream.health.source || '',
           checked_at: upstream.health.checkedAt,
           latency_ms: upstream.health.latencyMs,
           http_status: upstream.health.httpStatus,
@@ -8238,9 +9567,10 @@ function createStatusPayload(config, state) {
           stats: key.stats,
           availability: availabilitySummary(key.stats, state.availability),
           quota: key.quota,
-          health: {
-            state: key.health.state,
-            checked_at: key.health.checkedAt,
+            health: {
+              state: key.health.state,
+              source: key.health.source || '',
+              checked_at: key.health.checkedAt,
             latency_ms: key.health.latencyMs,
             http_status: key.health.httpStatus,
             error: key.health.error,
@@ -8973,6 +10303,34 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     return jsonResponse(res, 200, { ok: true, model_override: model });
   }
 
+  if (req.method === 'POST' && pathname === '/pool/compatibility') {
+    const payload = await readJsonBody(req, maxBodyBytes);
+    if (!config.compatibility || typeof config.compatibility !== 'object' || Array.isArray(config.compatibility)) {
+      config.compatibility = {};
+    }
+    if (!config.compatibility.adapter_mode || typeof config.compatibility.adapter_mode !== 'object' || Array.isArray(config.compatibility.adapter_mode)) {
+      config.compatibility.adapter_mode = {};
+    }
+    const adapterMode = config.compatibility.adapter_mode;
+    if (Object.prototype.hasOwnProperty.call(payload, 'strip_responses_only_features')) {
+      adapterMode.strip_responses_only_features = booleanOption(payload.strip_responses_only_features, false);
+    }
+    if (payload.adapters && typeof payload.adapters === 'object' && !Array.isArray(payload.adapters)) {
+      adapterMode.adapters = {
+        ...(adapterMode.adapters && typeof adapterMode.adapters === 'object' && !Array.isArray(adapterMode.adapters) ? adapterMode.adapters : {}),
+        ...(Object.prototype.hasOwnProperty.call(payload.adapters, 'anthropic_messages')
+          ? { anthropic_messages: booleanOption(payload.adapters.anthropic_messages, false) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(payload.adapters, 'chat_completions')
+          ? { chat_completions: booleanOption(payload.adapters.chat_completions, false) }
+          : {})
+      };
+    }
+    state.compatibility = normalizeCompatibilityConfig(config.compatibility);
+    await saveConfig(config, options.configPath);
+    return jsonResponse(res, 200, { ok: true, compatibility: createStatusPayload(config, state).compatibility });
+  }
+
   if (req.method === 'POST' && pathname === '/pool/codex-oauth/import') {
     const payload = await readJsonBody(req, maxBodyBytes);
     const importResult = importCodexOAuthAccountsIntoConfig(payload, config, runtime.secrets || {}, {
@@ -9301,6 +10659,7 @@ export function createPoolServer(config, options = {}) {
       const requestedModel = isClaudeModel(originalModel)
         ? originalModel
         : state.modelOverride || originalModel;
+      const requestedAdapter = isClaudeModel(requestedModel) ? 'anthropic_messages' : 'chat_completions';
       const tried = new Set();
       const attempts = [];
       const maxAttempts = Math.max(1, state.retry.maxAttempts);
@@ -9313,10 +10672,17 @@ export function createPoolServer(config, options = {}) {
         : [];
       const hasUnsupportedChatOutputFormat = unsupportedChatOutputFormatTypes.length > 0;
       const unsupportedInputTypes = pathname === '/v1/responses'
-        ? unsupportedResponsesInputTypesFromBody(req, originalBody, responsesJsonOptions)
+        ? unsupportedResponsesInputTypesFromBody(req, originalBody, { ...responsesJsonOptions, targetAdapter: requestedAdapter })
         : [];
       const hasUnsupportedInputTypes = unsupportedInputTypes.length > 0;
-      const requiresNativeResponses = hasUnsupportedResponsesTools || hasUnsupportedChatOutputFormat || hasUnsupportedInputTypes;
+      const unsupportedFieldTypes = pathname === '/v1/responses'
+        ? unsupportedResponsesFieldTypesFromBody(req, originalBody, { ...responsesJsonOptions, targetAdapter: requestedAdapter })
+        : [];
+      const hasUnsupportedFieldTypes = unsupportedFieldTypes.length > 0;
+      const requiresNativeResponses = hasUnsupportedResponsesTools || hasUnsupportedChatOutputFormat || hasUnsupportedInputTypes || hasUnsupportedFieldTypes;
+      let activeRequiresNativeResponses = requiresNativeResponses;
+      let activeBody = originalBody;
+      let compatibilityPlan = null;
       const originalBodyIsJson = Boolean(jsonObjectFromRequestBody(req, originalBody, responsesJsonOptions));
       const modelInteractionRequest = isModelInteractionRequest(req.method, pathname);
 
@@ -9326,16 +10692,31 @@ export function createPoolServer(config, options = {}) {
         const candidate = chooseCandidate(state, tried, {
           preferredModel: requestedModel,
           allowUnknownModelFallback: networkAttempt > 1,
-          candidateFilter: requiresNativeResponses
+          candidateFilter: activeRequiresNativeResponses
             ? (upstream) => canAttemptNativeResponses(pathname, upstream, requestedModel)
             : null
         });
+        if (!candidate && activeRequiresNativeResponses && !compatibilityPlan && pathname === '/v1/responses') {
+          compatibilityPlan = buildAdapterCompatibilityPlan({
+            req,
+            body: originalBody,
+            model: requestedModel,
+            state,
+            options: responsesJsonOptions
+          });
+          if (compatibilityPlan) {
+            activeRequiresNativeResponses = false;
+            activeBody = compatibilityPlan.strippedBody;
+            tried.clear();
+            continue;
+          }
+        }
         if (!candidate) break;
 
         const { upstream, key } = candidate;
         tried.add(`${upstream.name}:${key.index}`);
         const attemptedModel = requestedModel;
-        const routePlan = planProtocolRoute({ pathname, upstream, model: attemptedModel, requiresNativeResponses });
+        const routePlan = planProtocolRoute({ pathname, upstream, model: attemptedModel, requiresNativeResponses: activeRequiresNativeResponses });
         const { useAnthropicAdapter, canUseChatAdapter, allowChatCompletionsAdapter, useCodexOAuth } = routePlan;
         let { useChatCompletionsAdapter } = routePlan;
 
@@ -9350,10 +10731,10 @@ export function createPoolServer(config, options = {}) {
             ? codexOAuthTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix)
             : joinTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix);
         let body = useAnthropicAdapter
-          ? buildAnthropicMessagesPayload(rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions), attemptedModel)
+          ? buildAnthropicMessagesPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel)
           : useChatCompletionsAdapter
-            ? buildChatCompletionsPayload(rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions), attemptedModel)
-          : rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions);
+            ? buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel)
+          : rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions);
         const requestHeaders = useAnthropicAdapter
           ? buildAnthropicRequestHeaders(targetUrl, key.value, req.headers, upstream.probeHeaders)
           : useCodexOAuth
@@ -9366,11 +10747,13 @@ export function createPoolServer(config, options = {}) {
           useAnthropicAdapter,
           useChatCompletionsAdapter,
           useCodexOAuth,
-          requiresNativeResponses,
+          requiresNativeResponses: activeRequiresNativeResponses,
           unsupportedToolTypes,
           unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
-          unsupportedInputTypes
+          unsupportedInputTypes,
+          unsupportedFieldTypes
         });
+        const compatibility = compatibilitySummary(compatibilityPlan, routeTrace);
         let requestHeadersForAttempt = requestHeaders;
         let requestMethod = useAnthropicAdapter || useChatCompletionsAdapter ? 'POST' : req.method;
         let attemptTimeoutMs = timeoutMs;
@@ -9385,7 +10768,7 @@ export function createPoolServer(config, options = {}) {
         const chatFallbackAutoRetry = allowChatCompletionsAdapter &&
           !useChatCompletionsAdapter &&
           upstream.requestMode === 'auto';
-        const retryableStatusForAttempt = requiresNativeResponses
+        const retryableStatusForAttempt = activeRequiresNativeResponses
           ? retryableStatusWithNativeResponsesUnsupported(state.retry.retryableStatus)
           : state.retry.retryableStatus;
         if (modelInteractionRequest) recordAttempt(upstream, key);
@@ -9397,7 +10780,7 @@ export function createPoolServer(config, options = {}) {
           upstream,
           key,
           timeoutMs: attemptTimeoutMs,
-          allowRetry: allowRetry || chatFallbackAutoRetry || requiresNativeResponses,
+          allowRetry: allowRetry || chatFallbackAutoRetry || activeRequiresNativeResponses,
           retryableStatus: retryableStatusForAttempt,
           method: requestMethod,
           headers: requestHeadersForAttempt
@@ -9410,16 +10793,17 @@ export function createPoolServer(config, options = {}) {
         ) {
           useChatCompletionsAdapter = true;
           targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
-          body = buildChatCompletionsPayload(rewriteModelInBody(req, originalBody, attemptedModel, responsesJsonOptions), attemptedModel);
+          body = buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel);
           requestHeadersForAttempt = buildJsonRequestHeaders(targetUrl, key.value, req.headers);
           requestMethod = 'POST';
           Object.assign(routeTrace, requestRouteTrace({
             pathname,
             useChatCompletionsAdapter: true,
-            requiresNativeResponses,
+            requiresNativeResponses: activeRequiresNativeResponses,
             unsupportedToolTypes,
             unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
-            unsupportedInputTypes
+            unsupportedInputTypes,
+            unsupportedFieldTypes
           }));
           result = await requestTrackedUpstream({
             req,
@@ -9471,6 +10855,13 @@ export function createPoolServer(config, options = {}) {
           if (adaptChatStream) headers['content-type'] = 'text/event-stream; charset=utf-8';
           if (adaptChatJson) headers['content-type'] = 'application/json; charset=utf-8';
           addRouteTraceHeaders(headers, routeTrace);
+          if (compatibility) {
+            headers['x-codex-api-pool-compatibility'] = compatibility.mode;
+            headers['x-codex-api-pool-compatibility-trigger'] = compatibility.trigger;
+            headers['x-codex-api-pool-stripped'] = compatibilityStrippedHeader(compatibility.stripped);
+            headers['x-codex-api-pool-converted'] = compatibilityBucketHeader(compatibility.converted);
+            headers['x-codex-api-pool-downgraded'] = compatibilityBucketHeader(compatibility.downgraded);
+          }
           res.writeHead(result.statusCode, headers);
           const anthropicStreamAdapter = adaptAnthropicStream
             ? createAnthropicResponsesStreamAdapter(res, attemptedModel)
@@ -9510,7 +10901,8 @@ export function createPoolServer(config, options = {}) {
                   retried: attempt > 1,
                   outcome: 'client_aborted',
                   reason: 'client disconnected before upstream stream completed',
-                  route: routeTrace
+                  route: routeTrace,
+                  ...(compatibility ? { compatibility } : {})
                 });
               }
               persistStats(state, statsPath);
@@ -9533,7 +10925,8 @@ export function createPoolServer(config, options = {}) {
                 retried: attempt > 1,
                 outcome: 'stream_error',
                 reason,
-                route: routeTrace
+                route: routeTrace,
+                ...(compatibility ? { compatibility } : {})
               });
             }
             persistStats(state, statsPath);
@@ -9578,10 +10971,18 @@ export function createPoolServer(config, options = {}) {
                     ? 'responses'
                     : '';
               if (protocol) {
+                const checkedAt = new Date().toISOString();
                 recordProtocolCapabilityRealTraffic(upstream, protocol, {
-                  checkedAt: new Date().toISOString(),
+                  checkedAt,
                   model: attemptedModel,
                   httpStatus: result.statusCode
+                });
+                updateHealthFromRealTraffic(upstream, key, {
+                  checkedAt,
+                  model: attemptedModel,
+                  httpStatus: result.statusCode,
+                  latencyMs: now() - result.startedAt,
+                  protocol
                 });
               }
             }
@@ -9609,6 +11010,7 @@ export function createPoolServer(config, options = {}) {
                 tokenCount: capturedUsage.tokens,
                 succeeded: responseSucceeded,
                 routeTrace,
+                compatibility,
                 statsPath
               });
             } else {
@@ -9634,7 +11036,7 @@ export function createPoolServer(config, options = {}) {
           recordAttemptOutcome(state, upstream, key, false);
         }
         persistStats(state, statsPath);
-        const nativeResponsesUnsupported = requiresNativeResponses && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(result.statusCode);
+        const nativeResponsesUnsupported = activeRequiresNativeResponses && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(result.statusCode);
         if (modelInteractionRequest && !nativeResponsesUnsupported) {
           recordFailure(state, upstream, key, result.reason, result.statusCode, result.retryAfter);
         }
@@ -9652,7 +11054,8 @@ export function createPoolServer(config, options = {}) {
             retried: true,
             outcome: 'retry',
             reason: result.reason,
-            route: routeTrace
+            route: routeTrace,
+            ...(compatibility ? { compatibility } : {})
           });
           persistStats(state, statsPath);
         }
@@ -9662,7 +11065,8 @@ export function createPoolServer(config, options = {}) {
           model: attemptedModel || null,
           status: result.statusCode,
           reason: result.reason,
-          route: routeTrace
+          route: routeTrace,
+          ...(compatibility ? { compatibility } : {})
         });
 
         const smallBackoff = Math.min(1000, 100 * attempt);
@@ -9670,21 +11074,22 @@ export function createPoolServer(config, options = {}) {
       }
 
       const lastAttempt = attempts[attempts.length - 1] || null;
-      const nativeResponsesFailure = requiresNativeResponses && pathname === '/v1/responses';
+      const nativeResponsesFailure = activeRequiresNativeResponses && pathname === '/v1/responses';
       const failureStatus = nativeResponsesFailure ? 422 : 502;
       const failureReason = nativeResponsesFailure
           ? attempts.length
-          ? nativeResponsesRequiredFailureMessage(unsupportedToolTypes, unsupportedChatOutputFormatTypes, unsupportedInputTypes)
-          : noNativeResponsesCandidateMessage(unsupportedToolTypes, unsupportedChatOutputFormatTypes, unsupportedInputTypes)
+          ? nativeResponsesRequiredFailureMessage(unsupportedToolTypes, unsupportedChatOutputFormatTypes, unsupportedInputTypes, unsupportedFieldTypes)
+          : noNativeResponsesCandidateMessage(unsupportedToolTypes, unsupportedChatOutputFormatTypes, unsupportedInputTypes, unsupportedFieldTypes)
         : attempts.length
           ? 'all upstream attempts failed'
           : 'no available upstream candidate';
       const failureRouteTrace = requestRouteTrace({
         pathname,
-        requiresNativeResponses,
+        requiresNativeResponses: activeRequiresNativeResponses,
         unsupportedToolTypes,
         unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
-        unsupportedInputTypes
+        unsupportedInputTypes,
+        unsupportedFieldTypes
       });
       if (modelInteractionRequest) {
         rememberRequest(state, {
@@ -9700,7 +11105,8 @@ export function createPoolServer(config, options = {}) {
           retried: attempts.length > 1,
           outcome: 'failed',
           reason: failureReason,
-          route: failureRouteTrace
+          route: failureRouteTrace,
+          ...(compatibilityPlan ? { compatibility: compatibilitySummary(compatibilityPlan, failureRouteTrace) } : {})
         });
         persistStats(state, statsPath);
       }
@@ -9713,6 +11119,7 @@ export function createPoolServer(config, options = {}) {
         if (unsupportedToolTypes.length > 0) failurePayload.unsupported_tool_types = unsupportedToolTypes;
         if (unsupportedChatOutputFormatTypes.length > 0) failurePayload.unsupported_output_format_types = unsupportedChatOutputFormatTypes;
         if (unsupportedInputTypes.length > 0) failurePayload.unsupported_input_types = unsupportedInputTypes;
+        if (unsupportedFieldTypes.length > 0) failurePayload.unsupported_field_types = unsupportedFieldTypes;
         failurePayload.incompatible_upstreams = nativeResponsesCandidateDiagnostics(state, pathname, requestedModel, tried);
         failurePayload.route = failureRouteTrace;
       }

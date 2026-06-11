@@ -56,6 +56,30 @@ _Avoid_: retry, routing, failover
 The point at which an Upstream has returned a successful response and the API Pool has begun forwarding the response stream. Before this boundary, the API Pool may Retry or Fallback; after it, the API Pool does not attempt lossless generation resume.
 _Avoid_: stream retry, resume, continuation
 
+**Native Responses Route**:
+A Model Interaction Request path where the API Pool can forward a Responses request to an Upstream without translating it to another model API family. A Native Responses Route preserves Responses-only Features.
+_Avoid_: native model, original model, full model
+
+**Responses-only Feature**:
+A request feature that belongs to the Responses API shape and cannot be represented losslessly by a non-native adapter such as Chat Completions or Anthropic Messages.
+_Avoid_: native tool call, unsupported tool, extra field
+
+**Adapter Compatibility Mode**:
+An opt-in Pool Configuration behavior that lets the API Pool use a non-native adapter when no Native Responses Route candidate is available by converting, downgrading, or removing Responses-only Features according to the target adapter's documented request fields.
+_Avoid_: Claude mode, downgrade mode, tool disabling
+
+**Compatibility Conversion**:
+A documented field mapping from a Responses request shape to a non-native adapter shape, such as `input_image` to Chat `image_url` or Anthropic `image`, or `input_file` to Chat `file` / Anthropic `document` when the target API has a matching file source.
+_Avoid_: stripping, cleanup, passthrough
+
+**Compatibility Downgrade**:
+A documented but not lossless field mapping where the target adapter has only a weaker or structurally different concept, such as Responses hosted web search to Chat `web_search_options`, or a preserved content block with target-unsupported subfields.
+_Avoid_: conversion, fallback, approximate support
+
+**Compatibility Stripping**:
+The explicit removal of Responses-only Features only after checking that no documented target adapter field can represent them. Compatibility Stripping must be visible in request diagnostics.
+_Avoid_: silent fallback, sanitization, cleanup
+
 **Management API**:
 The API Pool's control interface for observing and changing pool state, including status, Upstream creation, health probes, enable toggles, and billing refreshes. It is separate from the OpenAI-compatible model request interface used by Codex.
 _Avoid_: admin API, status API, pool API, dashboard API

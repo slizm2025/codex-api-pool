@@ -89,8 +89,24 @@ The Bearer token used to authorize access to the Management API. It may be confi
 _Avoid_: pool token, upstream key, API key
 
 **Health Probe**:
-An availability check that the API Pool sends to an Upstream, usually against `/models` or a configured health path. A Health Probe updates Health State, latency, HTTP status, and discovered model information without representing a Codex model request.
-_Avoid_: test, check, ping, health check
+An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but it is not authoritative for Codex-native availability unless it is also a Representative Model Probe.
+_Avoid_: test, check, ping, health check, real Codex check
+
+**Representative Model Probe**:
+A Management API-triggered model availability check whose request shape represents Codex-native model traffic closely enough that a successful model response can be used as evidence for Selection. A Representative Model Probe is distinct from model listing and from non-representative synthetic Health Probes.
+_Avoid_: health check, model list, synthetic probe
+
+**Representative Request Template**:
+A sanitized, time-limited request-shape template captured from real Codex Model Interaction Requests and used by the Management API to run Representative Model Probes without retaining user content or secrets.
+_Avoid_: saved prompt, cached request, dashboard request body, fixture
+
+**Authoritative Probe Failure**:
+A probe result with enough evidence to mark an Upstream or Upstream Key unavailable for Selection, such as authentication failure, rate limiting, network failure, or a clearly unsupported model/API. Non-representative and inconclusive probe results are not Authoritative Probe Failures.
+_Avoid_: failed test, bad response, inconclusive failure
+
+**Non-representative Probe Result**:
+A probe result whose request shape or returned error cannot reliably represent Codex-native model traffic. A Non-representative Probe Result may explain why a Health Probe is not authoritative, but it must not by itself prove that an Upstream is unavailable for real Codex traffic.
+_Avoid_: unavailable, failed health check, model unsupported
 
 **Usage**:
 Token consumption observed by the API Pool from successful model responses, aggregated by Upstream and time period.

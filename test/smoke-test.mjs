@@ -4822,9 +4822,157 @@ try {
     ) {
       throw new Error(`expected real Codex response to mark invalid-codex-probe healthy: ${JSON.stringify(verifiedSite)}`);
     }
+
+    invalidCodexProbeForwardRequest = null;
+    const representativeProbe = await postJson(`${invalidCodexProbePoolInfo.url}/pool/upstreams/invalid-codex-probe/probe`, 'pool-secret', {});
+    if (
+      representativeProbe.response.status !== 200 ||
+      representativeProbe.json.probe_ok !== true ||
+      representativeProbe.json.probe_status !== 'ok' ||
+      representativeProbe.json.health?.state !== 'ok' ||
+      representativeProbe.json.health?.source !== 'representative_probe' ||
+      representativeProbe.json.health?.httpStatus !== 200 ||
+      invalidCodexProbeForwardRequest?.headers?.authorization !== 'Bearer upstream-secret' ||
+      invalidCodexProbeForwardRequest?.headers?.['x-oai-attestation'] !== 'attestation-test' ||
+      !String(invalidCodexProbeForwardRequest?.body || '').includes('Respond with OK.')
+    ) {
+      throw new Error(`expected manual Health Probe to use fresh Codex Desktop Representative Request Template: ${representativeProbe.text} forwarded=${JSON.stringify(invalidCodexProbeForwardRequest)}`);
+    }
+    const representativeStatus = (await getJson(`${invalidCodexProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const representativeSite = representativeStatus.upstreams.find((upstream) => upstream.name === 'invalid-codex-probe');
+    const representativeEvidence = representativeSite?.keys?.[0]?.representative_evidence?.responses?.['gpt-5.5'];
+    if (
+      representativeEvidence?.source !== 'representative_probe' ||
+      representativeEvidence?.fresh !== true ||
+      representativeSite?.selection_weight <= representativeSite?.weight
+    ) {
+      throw new Error(`expected representative probe success evidence to affect status and bounded Selection weight: ${JSON.stringify(representativeSite)}`);
+    }
   } finally {
     await close(invalidCodexProbePool);
     await close(invalidCodexProbeBackend);
+  }
+
+  const ambiguousProbeBackend = createFakeUpstream('ambiguous-probe', ({ req, res }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'merchant custom request rejected' } }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'merchant custom temporary response' } }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const ambiguousProbeInfo = await listen(ambiguousProbeBackend);
+  const ambiguousProbePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-5.5',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'ambiguous-probe', base_url: `${ambiguousProbeInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const ambiguousProbePoolInfo = await listen(ambiguousProbePool);
+  try {
+    const ambiguousProbe = await postJson(`${ambiguousProbePoolInfo.url}/pool/upstreams/ambiguous-probe/probe`, 'pool-secret', {});
+    if (
+      ambiguousProbe.response.status !== 200 ||
+      ambiguousProbe.json.probe_ok !== false ||
+      ambiguousProbe.json.probe_status !== 'skipped' ||
+      ambiguousProbe.json.health?.state !== 'inconclusive' ||
+      !String(ambiguousProbe.json.health?.error || '').includes('not authoritative')
+    ) {
+      throw new Error(`expected ambiguous merchant probe errors to stay inconclusive: ${ambiguousProbe.text}`);
+    }
+    const ambiguousStatus = (await getJson(`${ambiguousProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const ambiguousSite = ambiguousStatus.upstreams.find((upstream) => upstream.name === 'ambiguous-probe');
+    if (ambiguousSite?.available !== true || ambiguousSite?.selection_score <= 0) {
+      throw new Error(`expected inconclusive probe result to remain selectable: ${JSON.stringify(ambiguousSite)}`);
+    }
+  } finally {
+    await close(ambiguousProbePool);
+    await close(ambiguousProbeBackend);
+  }
+
+  const ambiguousRealFailureBackend = createFakeUpstream('ambiguous-real-failure', ({ req, res }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'merchant custom real traffic failure' } }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const ambiguousRealFailureInfo = await listen(ambiguousRealFailureBackend);
+  const ambiguousRealFailurePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'ambiguous-real-failure', base_url: `${ambiguousRealFailureInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const ambiguousRealFailurePoolInfo = await listen(ambiguousRealFailurePool);
+  try {
+    for (let i = 0; i < 2; i += 1) {
+      const response = await requestJson(ambiguousRealFailurePoolInfo.url, 'pool-secret');
+      if (response.response.status < 400) throw new Error(`expected ambiguous real failure request to fail through pool: ${response.response.status} ${response.text}`);
+      const status = (await getJson(`${ambiguousRealFailurePoolInfo.url}/pool/status`, 'pool-secret')).json;
+      const site = status.upstreams.find((upstream) => upstream.name === 'ambiguous-real-failure');
+      if (site?.available !== true || site?.cooldown_ms !== 0) {
+        throw new Error(`expected early non-authoritative real failures to stay selectable: attempt=${i + 1} ${JSON.stringify(site)}`);
+      }
+    }
+    const third = await requestJson(ambiguousRealFailurePoolInfo.url, 'pool-secret');
+    if (third.response.status < 400) throw new Error(`expected third ambiguous real failure to fail through pool: ${third.response.status} ${third.text}`);
+    const cooledStatus = (await getJson(`${ambiguousRealFailurePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const cooledSite = cooledStatus.upstreams.find((upstream) => upstream.name === 'ambiguous-real-failure');
+    if (cooledSite?.available !== false || cooledSite?.cooldown_ms <= 0) {
+      throw new Error(`expected repeated non-authoritative real failures to trigger short cooldown: ${JSON.stringify(cooledSite)}`);
+    }
+  } finally {
+    await close(ambiguousRealFailurePool);
+    await close(ambiguousRealFailureBackend);
   }
 
   const invalidCodexRestoreStatsPath = path.join(statsRoot, 'invalid-codex-restore.json');

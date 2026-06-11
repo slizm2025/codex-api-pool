@@ -9,6 +9,7 @@
     "smoke": "node test/smoke-test.mjs",
     "add": "node scripts/add-upstream.mjs",
     "model": "node scripts/set-model.mjs",
+    "prototype:representative-probe": "node scripts/prototype-representative-probe.mjs",
     "service": "node scripts/service.mjs",
     "service:install": "node scripts/service.mjs install",
     "service:uninstall": "node scripts/service.mjs uninstall",

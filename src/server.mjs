@@ -751,6 +751,179 @@ function codexResponsesProbePayload(model) {
   };
 }
 
+const REPRESENTATIVE_TEMPLATE_TTL_MS = 30 * 60 * 1000;
+const REPRESENTATIVE_EVIDENCE_TTL_MS = 30 * 60 * 1000;
+const FRESH_REPRESENTATIVE_EVIDENCE_MULTIPLIER = 1.15;
+const REPRESENTATIVE_PROBE_INPUT = 'Respond with OK.';
+
+function codexClientFamilyFromHeaders(headers = {}) {
+  const originator = String(headers.originator || headers.Originator || '').trim().toLowerCase();
+  const userAgent = String(headers['user-agent'] || headers['User-Agent'] || '').trim().toLowerCase();
+  if (originator === 'codex desktop' || userAgent.includes('codex desktop/')) return 'codex_desktop';
+  return '';
+}
+
+function representativeTemplateFresh(template, at = now()) {
+  return Boolean(template && Number(template.expiresAt || 0) > at);
+}
+
+function representativeTemplateKey(protocol, clientFamily) {
+  return `${protocol}:${clientFamily}`;
+}
+
+function representativeHeaderAllowed(name) {
+  const lower = String(name || '').toLowerCase();
+  return lower === 'accept' ||
+    lower === 'accept-language' ||
+    lower === 'content-type' ||
+    lower === 'openai-beta' ||
+    lower === 'originator' ||
+    lower === 'user-agent' ||
+    lower === 'x-codex-turn-state' ||
+    lower === 'x-codex-turn-metadata' ||
+    lower.startsWith('x-oai-');
+}
+
+function sanitizeRepresentativeHeaders(headers = {}) {
+  const out = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    const lower = String(name || '').toLowerCase();
+    if (lower === 'authorization' || lower === 'cookie' || lower === 'set-cookie' || lower === 'content-length') continue;
+    if (!representativeHeaderAllowed(lower)) continue;
+    if (Array.isArray(value)) out[lower] = value.join(', ');
+    else if (value !== undefined && value !== null) out[lower] = String(value);
+  }
+  if (!out.accept) out.accept = 'application/json';
+  if (!out['content-type']) out['content-type'] = 'application/json';
+  return out;
+}
+
+function sanitizedRepresentativeInput(input) {
+  if (Array.isArray(input)) {
+    return [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: REPRESENTATIVE_PROBE_INPUT }
+        ]
+      }
+    ];
+  }
+  return REPRESENTATIVE_PROBE_INPUT;
+}
+
+function sanitizeRepresentativeBody(payload, model) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const out = {};
+  const copyFields = [
+    'tools',
+    'tool_choice',
+    'parallel_tool_calls',
+    'store',
+    'reasoning',
+    'text',
+    'stream',
+    'max_output_tokens',
+    'max_completion_tokens',
+    'temperature',
+    'top_p'
+  ];
+  for (const field of copyFields) {
+    if (Object.prototype.hasOwnProperty.call(payload, field)) out[field] = payload[field];
+  }
+  out.model = String(model || payload.model || '').trim();
+  out.input = sanitizedRepresentativeInput(payload.input);
+  out.instructions = 'Health check: respond with exactly OK.';
+  delete out.metadata;
+  return out;
+}
+
+function captureRepresentativeRequestTemplate(state, { req, pathname, body, model, options = {} } = {}) {
+  if (!state || pathname !== '/v1/responses') return null;
+  const clientFamily = codexClientFamilyFromHeaders(req?.headers || {});
+  if (clientFamily !== 'codex_desktop') return null;
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  if (!payload) return null;
+  const sanitizedBody = sanitizeRepresentativeBody(payload, model);
+  if (!sanitizedBody) return null;
+  const capturedAtMs = now();
+  const template = {
+    protocol: 'responses',
+    clientFamily,
+    capturedAt: new Date(capturedAtMs).toISOString(),
+    capturedAtMs,
+    expiresAt: capturedAtMs + REPRESENTATIVE_TEMPLATE_TTL_MS,
+    model: String(model || payload.model || '').trim(),
+    headers: sanitizeRepresentativeHeaders(req.headers),
+    body: sanitizedBody
+  };
+  state.representativeTemplates.set(representativeTemplateKey('responses', clientFamily), template);
+  return template;
+}
+
+function freshRepresentativeTemplate(state, protocol = 'responses', clientFamily = 'codex_desktop') {
+  const template = state?.representativeTemplates?.get(representativeTemplateKey(protocol, clientFamily));
+  return representativeTemplateFresh(template) ? template : null;
+}
+
+function ensureRepresentativeEvidence(key) {
+  if (!key.representativeEvidence || typeof key.representativeEvidence !== 'object' || Array.isArray(key.representativeEvidence)) {
+    key.representativeEvidence = {};
+  }
+  return key.representativeEvidence;
+}
+
+function recordRepresentativeSuccessEvidence(key, protocol, {
+  model = '',
+  source = '',
+  checkedAt = new Date().toISOString(),
+  httpStatus = 0
+} = {}) {
+  if (!key || !protocol) return;
+  const normalizedModel = String(model || '').trim();
+  if (!normalizedModel) return;
+  const evidence = ensureRepresentativeEvidence(key);
+  if (!evidence[protocol] || typeof evidence[protocol] !== 'object' || Array.isArray(evidence[protocol])) evidence[protocol] = {};
+  evidence[protocol][normalizedModel] = {
+    source: String(source || ''),
+    checked_at: checkedAt,
+    expires_at: new Date(Date.parse(checkedAt) + REPRESENTATIVE_EVIDENCE_TTL_MS).toISOString(),
+    http_status: Number(httpStatus || 0) || 0
+  };
+}
+
+function representativeEvidenceFresh(item, at = now()) {
+  const expiresAt = Date.parse(item?.expires_at || '');
+  return Number.isFinite(expiresAt) && expiresAt > at;
+}
+
+function representativeEvidencePayload(value = {}, at = now()) {
+  const out = {};
+  for (const [protocol, byModel] of Object.entries(value || {})) {
+    if (!byModel || typeof byModel !== 'object' || Array.isArray(byModel)) continue;
+    out[protocol] = {};
+    for (const [model, item] of Object.entries(byModel)) {
+      out[protocol][model] = {
+        ...item,
+        fresh: representativeEvidenceFresh(item, at),
+        expires_in_ms: Math.max(0, Date.parse(item?.expires_at || '') - at) || 0
+      };
+    }
+  }
+  return out;
+}
+
+function hasFreshRepresentativeEvidence(upstream, model, protocol = 'responses', at = now(), source = '') {
+  const normalizedModel = String(model || '').trim();
+  if (!normalizedModel) return false;
+  return (upstream?.keys || []).some((key) => {
+    const item = key?.representativeEvidence?.[protocol]?.[normalizedModel];
+    if (!representativeEvidenceFresh(item, at)) return false;
+    return !source || item.source === source;
+  });
+}
+
 async function readJsonBody(req, maxBytes) {
   const body = await readBody(req, maxBytes);
   if (body.length === 0) return {};
@@ -1122,7 +1295,7 @@ function upstreamHasUserDeclaredProtocolCapability(upstream, protocol, status = 
   return capability?.source === 'user_declared' && capability?.status === status;
 }
 
-const NON_REPRESENTATIVE_NATIVE_RESPONSES_PROBE_STATES = new Set(['unexpected_status', 'server_error', 'models_unsupported']);
+const NON_REPRESENTATIVE_NATIVE_RESPONSES_PROBE_STATES = new Set(['unexpected_status', 'server_error', 'models_unsupported', 'inconclusive']);
 
 function upstreamHasConfiguredNativeResponses(upstream) {
   return upstream?.requestMode === 'responses' ||
@@ -3032,6 +3205,7 @@ function createUpstreamState(upstream, index) {
       source: resolved.source,
       value: resolved.value,
       failures: 0,
+      nonAuthoritativeFailures: 0,
       cooldownUntil: 0,
       health: {
         state: resolved.value ? 'unknown' : 'missing_key',
@@ -3049,7 +3223,8 @@ function createUpstreamState(upstream, index) {
         lastUsedAt: null,
         availability: { samples: [] }
       },
-      quota: {}
+      quota: {},
+      representativeEvidence: {}
     };
   });
   const siteUrl = deriveSiteUrl(upstream.base_url, upstream.site_url);
@@ -3152,6 +3327,7 @@ function buildState(config) {
     pendingLiveProbePromise: null,
     billingProbing: false,
     modelOverride: typeof config.model_override === 'string' ? config.model_override : '',
+    representativeTemplates: new Map(),
     recentRequests: [],
     statsPersistTimer: null
   };
@@ -3203,7 +3379,8 @@ function statsSnapshot(state) {
       keys: Object.fromEntries(upstream.keys.map((key) => [key.label, {
         stats: key.stats,
         quota: key.quota,
-        health: key.health
+        health: key.health,
+        representativeEvidence: key.representativeEvidence || {}
       }]))
     }]))
   };
@@ -3282,7 +3459,8 @@ function healthAllowsSelection(upstream, expectedModel = undefined) {
     || state === 'oauth_ready'
     || state === 'stale_model_override'
     || state === 'advanced_curl_required'
-    || state === 'codex_forward_only';
+    || state === 'codex_forward_only'
+    || state === 'inconclusive';
 }
 
 function normalizeProbeModel(value) {
@@ -3336,12 +3514,18 @@ function probeResultPayload(health, expectedModel) {
   };
 }
 
-function upstreamSelectionWeight(upstream, availability) {
-  return upstream.weight * availability.multiplier;
+function representativeSelectionMultiplier(upstream, model, at = now()) {
+  return hasFreshRepresentativeEvidence(upstream, model, 'responses', at, 'representative_probe')
+    ? FRESH_REPRESENTATIVE_EVIDENCE_MULTIPLIER
+    : 1;
 }
 
-function upstreamSelectionScore(upstream, availability) {
-  return upstreamSelectionWeight(upstream, availability) / (
+function upstreamSelectionWeight(upstream, availability, model = '', at = now()) {
+  return upstream.weight * availability.multiplier * representativeSelectionMultiplier(upstream, model, at);
+}
+
+function upstreamSelectionScore(upstream, availability, model = '', at = now()) {
+  return upstreamSelectionWeight(upstream, availability, model, at) / (
     1 +
     upstream.inFlight +
     selectionLatencyPenalty(upstream) +
@@ -3453,6 +3637,7 @@ function restoreStats(state, statsPath) {
         key.stats = { ...key.stats, ...(oldKey.stats || {}) };
         ensureAvailability(key.stats, state.availability);
         key.quota = { ...key.quota, ...(oldKey.quota || {}) };
+        key.representativeEvidence = oldKey.representativeEvidence || {};
         if (oldKey.health) key.health = { ...key.health, ...oldKey.health };
       }
       restoreNativeResponsesForwardOnlyHealth(upstream);
@@ -3551,6 +3736,7 @@ function copyRuntimeState(target, source, { preserveHealth, availabilityConfig }
     key.stats = { ...key.stats, ...oldKey.stats };
     ensureAvailability(key.stats, availabilityConfig);
     key.quota = { ...key.quota, ...oldKey.quota };
+    key.representativeEvidence = oldKey.representativeEvidence || {};
     if (preserveHealth) key.health = { ...key.health, ...oldKey.health };
   }
 }
@@ -3620,7 +3806,7 @@ function chooseCandidate(state, tried, options = {}) {
   let total = 0;
   const weighted = candidates.map((upstream) => {
     const availability = availabilitySummary(upstream.stats, state.availability);
-    const score = upstreamSelectionScore(upstream, availability);
+    const score = upstreamSelectionScore(upstream, availability, preferredModel, at);
     total += score;
     return { upstream, score };
   });
@@ -5368,14 +5554,41 @@ function recordFailure(state, upstream, key, reason, statusCode, retryAfter) {
   }
 }
 
+function realTrafficFailureAuthoritative(statusCode, reason = '') {
+  const status = Number(statusCode || 0);
+  if (status === 0 || status === 408 || status === 429 || status === 401 || status === 403) return true;
+  if (status >= 521 && status <= 524) return true;
+  return /timeout|timed out|network|tls|socket|invalid[_ -]?api[_ -]?key|unauthorized|permission_denied|quota|rate.?limit/i.test(String(reason || ''));
+}
+
+function recordRealTrafficFailure(state, upstream, key, reason, statusCode, retryAfter) {
+  if (realTrafficFailureAuthoritative(statusCode, reason)) {
+    key.nonAuthoritativeFailures = 0;
+    recordFailure(state, upstream, key, reason, statusCode, retryAfter);
+    return;
+  }
+  const nextNonAuthoritativeFailures = Number(key.nonAuthoritativeFailures || 0) + 1;
+  if (nextNonAuthoritativeFailures >= 3) {
+    key.nonAuthoritativeFailures = 0;
+    recordFailure(state, upstream, key, reason, statusCode, retryAfter);
+    return;
+  }
+  key.nonAuthoritativeFailures = nextNonAuthoritativeFailures;
+  upstream.failures += 1;
+  upstream.lastError = reason;
+  upstream.lastStatus = statusCode || 0;
+  key.failures += 1;
+}
+
 function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
   recordAttemptOutcome(state, upstream, key, succeeded);
   const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
   const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
   if (succeeded) {
     recordSuccess(upstream, startedAt, statusCode);
+    key.nonAuthoritativeFailures = 0;
   } else {
-    recordFailure(state, upstream, key, failureReason, statusCode, retryAfter);
+    recordRealTrafficFailure(state, upstream, key, failureReason, statusCode, retryAfter);
   }
   rememberRequest(state, {
     method,
@@ -5481,6 +5694,24 @@ function providerAuthError(result) {
   return /invalid[_ -]?api[_ -]?key|authentication_error|unauthorized|permission_denied|permission denied|invalid auth|invalid token|missing api key|incorrect api key/.test(value);
 }
 
+function clearUnsupportedModelOrApiError(result) {
+  const { code, message } = responseErrorParts(result);
+  const value = `${code} ${message}`.toLowerCase();
+  return /model[_ -]?not[_ -]?found|unsupported[_ -]?model|model .*not (?:available|supported|found)|unsupported[_ -]?(?:endpoint|api)|endpoint .*not supported|api .*not supported/.test(value);
+}
+
+function inconclusiveProbeClassification(result, protocol, reason = '') {
+  const statusCode = Number(result?.statusCode || 0);
+  const statusText = statusCode ? `HTTP ${statusCode}` : 'probe response';
+  return {
+    state: 'inconclusive',
+    outcome: 'inconclusive',
+    authoritative: false,
+    representative: false,
+    error: reason || `${protocol} probe ${statusText} is not authoritative for Codex Desktop availability`
+  };
+}
+
 function hasResponsesOutput(json) {
   return Boolean(json && typeof json === 'object' && (
     typeof json.output_text === 'string' ||
@@ -5527,15 +5758,34 @@ function modelProbeValidationError(result, protocol) {
   return '';
 }
 
-function classifyModelProbe(result, protocol) {
-  const advancedCurlRequiredError = advancedCurlRequiredProbeError(result);
+function classifyModelProbe(result, protocol, options = {}) {
+  const advancedCurlRequiredError = options.representative === true ? '' : advancedCurlRequiredProbeError(result);
   if (advancedCurlRequiredError) return { state: 'advanced_curl_required', error: advancedCurlRequiredError };
   const state = classifyHealth(result.statusCode, result.error);
-  if (state !== 'ok') return { state, error: result.error || '' };
+  if (state !== 'ok') {
+    if (options.representative === true) return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
+    if (state === 'auth_error') {
+      if (responseLooksLikeBrowserChallenge(result) || !providerAuthError(result)) {
+        return inconclusiveProbeClassification(result, protocol, `${protocol} probe HTTP ${result.statusCode} did not include a recognized provider auth error shape; result is not authoritative`);
+      }
+      return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
+    }
+    if (state === 'rate_limited' || state === 'network_error' || state === 'timeout') {
+      return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
+    }
+    if (state === 'models_unsupported') {
+      return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
+    }
+    if (state === 'server_error' || state === 'unexpected_status') {
+      if (clearUnsupportedModelOrApiError(result)) return { state: 'models_unsupported', outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
+      return inconclusiveProbeClassification(result, protocol);
+    }
+    return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
+  }
   const validationError = modelProbeValidationError(result, protocol);
   return validationError
-    ? { state: 'unexpected_status', error: validationError }
-    : { state: 'ok', error: '' };
+    ? { state: 'unexpected_status', outcome: 'authoritative_failure', authoritative: true, representative: options.representative === true, error: validationError }
+    : { state: 'ok', outcome: 'ok', authoritative: true, representative: options.representative === true, error: '' };
 }
 
 function shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification) {
@@ -5553,6 +5803,7 @@ function protocolCapabilityStatusFromProbeState(state) {
   if (state === 'ok') return 'verified';
   if (state === 'advanced_curl_required' || state === 'codex_forward_only') return 'unknown';
   if (state === 'network_error' || state === 'timeout') return 'unknown';
+  if (state === 'inconclusive') return 'unknown';
   return 'failed';
 }
 
@@ -5641,6 +5892,12 @@ function updateHealthFromRealTraffic(upstream, key, {
   };
   upstream.health = health;
   if (key) {
+    recordRepresentativeSuccessEvidence(key, protocol || 'responses', {
+      model,
+      source: 'real_traffic',
+      checkedAt,
+      httpStatus
+    });
     key.health = {
       ...key.health,
       state: 'ok',
@@ -5702,7 +5959,7 @@ function healthProbeOk(health, expectedModel = undefined) {
 function healthProbeStatus(health, expectedModel = undefined) {
   const state = healthProbeEffectiveState(health, expectedModel);
   if (healthProbeOk(health, expectedModel)) return 'ok';
-  if (state === 'unknown' || state === 'disabled' || state === 'oauth_ready' || state === 'stale_model_override' || state === 'advanced_curl_required' || state === 'codex_forward_only') return 'skipped';
+  if (state === 'unknown' || state === 'disabled' || state === 'oauth_ready' || state === 'stale_model_override' || state === 'advanced_curl_required' || state === 'codex_forward_only' || state === 'inconclusive') return 'skipped';
   return 'failed';
 }
 
@@ -6349,6 +6606,73 @@ function probeResponsesUpstream(upstream, key, config, model) {
   });
 }
 
+function representativeProbePayload(template, model) {
+  const payload = {
+    ...(template?.body || {}),
+    model: String(model || template?.model || '').trim()
+  };
+  payload.input = sanitizedRepresentativeInput(template?.body?.input);
+  payload.instructions = 'Health check: respond with exactly OK.';
+  delete payload.metadata;
+  delete payload.previous_response_id;
+  return payload;
+}
+
+function probeRepresentativeResponsesUpstream(upstream, key, config, model, template) {
+  return new Promise((resolve) => {
+    const timeoutMs = Number(config.health?.timeout_ms || 10000);
+    const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
+    const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
+    const body = Buffer.from(JSON.stringify(representativeProbePayload(template, model)));
+    const headers = buildJsonRequestHeaders(targetUrl, key.value, {
+      ...(template?.headers || {}),
+      ...(upstream.probeHeaders || {})
+    });
+    headers['content-length'] = body.length;
+    const startedAt = now();
+    let settled = false;
+    const chunks = [];
+    let bodySize = 0;
+    let bodyTooLarge = false;
+    const request = requestOptionsForTarget(targetUrl, 'POST', headers, timeoutMs, upstream.proxyUrl);
+
+    const finish = (statusCode, responseHeaders = {}, error = '') => {
+      if (settled) return;
+      settled = true;
+      const responseBody = bodyTooLarge ? '' : decodeHttpBody(chunks, bodySize, responseHeaders);
+      resolve(probeResult(
+        statusCode || 0,
+        now() - startedAt,
+        responseBody,
+        bodyTooLarge ? 'response body too large' : error,
+        responseHeaders['retry-after'],
+        responseHeaders
+      ));
+    };
+
+    const probeReq = request.client.request(request.target, request.options, (probeRes) => {
+      probeRes.on('data', (chunk) => {
+        if (bodyTooLarge) return;
+        bodySize += chunk.length;
+        if (bodySize > 128 * 1024) {
+          bodyTooLarge = true;
+          chunks.length = 0;
+          bodySize = 0;
+          return;
+        }
+        chunks.push(chunk);
+      });
+      probeRes.on('end', () => finish(probeRes.statusCode || 0, probeRes.headers));
+      probeRes.on('error', (error) => finish(probeRes.statusCode || 0, probeRes.headers, error.message));
+    });
+    probeReq.on('timeout', () => {
+      probeReq.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    probeReq.on('error', (error) => finish(0, {}, error.message));
+    probeReq.end(body);
+  });
+}
+
 function probeAnthropicUpstream(upstream, key, config, model) {
   return new Promise((resolve) => {
     const timeoutMs = Number(config.health?.timeout_ms || 10000);
@@ -6889,6 +7213,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
   let healthError = '';
   let healthWarning = '';
   let resolvedMode = '';
+  let healthSource = 'probe';
 
   // Step 1: Try real model request based on upstream type
   if (isAnthropic && !isOpenAi) {
@@ -6913,56 +7238,106 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
       healthError = classified.error || chatResult.error;
       if (stateName === 'ok') resolvedMode = 'chat_completions';
     } else {
-      // Try /v1/responses first
-      const responsesResult = await probeResponsesUpstream(upstream, key, config, probeModel);
-      applyQuota(upstream, key, responsesResult.headers || {});
-      const responsesClassification = classifyModelProbe(responsesResult, 'responses');
-      recordProtocolCapabilityProbe(upstream, 'responses', responsesResult, responsesClassification, { checkedAt, model: probeModel });
-      const responsesState = responsesClassification.state;
-
-      if (responsesState === 'ok') {
-        stateName = 'ok';
-        healthResult = responsesResult;
-        healthError = '';
-        resolvedMode = 'responses';
-      } else {
-        // /responses failed → try /v1/chat/completions as fallback
-        const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
-        applyQuota(upstream, key, chatResult.headers || {});
-        const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
-        recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: probeModel });
-        const chatState = chatClassification.state;
-
-        if (chatState === 'ok') {
+      const representativeTemplate = options.live === true
+        ? freshRepresentativeTemplate(state, 'responses', 'codex_desktop')
+        : null;
+      if (representativeTemplate) {
+        const representativeModel = probeModel || representativeTemplate.model;
+        const representativeResult = await probeRepresentativeResponsesUpstream(upstream, key, config, representativeModel, representativeTemplate);
+        applyQuota(upstream, key, representativeResult.headers || {});
+        const representativeClassification = classifyModelProbe(representativeResult, 'responses', { representative: true });
+        recordProtocolCapabilityProbe(upstream, 'responses', representativeResult, representativeClassification, {
+          checkedAt,
+          model: representativeModel,
+          probeType: 'representative_model_request',
+          representative: true
+        });
+        stateName = representativeClassification.state;
+        healthResult = representativeResult;
+        healthError = representativeClassification.error || representativeResult.error;
+        healthWarning = 'checked by representative Codex Desktop request template';
+        healthSource = 'representative_probe';
+        if (representativeClassification.state === 'ok') {
           stateName = 'ok';
-          healthResult = chatResult;
           healthError = '';
-          healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
-          resolvedMode = 'chat_completions';
+          healthWarning = 'verified by representative Codex Desktop request template';
+          resolvedMode = 'responses';
+          recordRepresentativeSuccessEvidence(key, 'responses', {
+            model: representativeModel,
+            source: 'representative_probe',
+            checkedAt,
+            httpStatus: representativeResult.statusCode
+          });
+        }
+      }
+
+      // Try /v1/responses first
+      if (!healthResult) {
+        const responsesResult = await probeResponsesUpstream(upstream, key, config, probeModel);
+        applyQuota(upstream, key, responsesResult.headers || {});
+        const responsesClassification = classifyModelProbe(responsesResult, 'responses');
+        recordProtocolCapabilityProbe(upstream, 'responses', responsesResult, responsesClassification, { checkedAt, model: probeModel });
+        const responsesState = responsesClassification.state;
+
+        if (responsesState === 'ok') {
+          stateName = 'ok';
+          healthResult = responsesResult;
+          healthError = '';
+          resolvedMode = 'responses';
         } else {
-          const verifiedRealTrafficProtocol = verifiedRealTrafficProtocolForModel(upstream, probeModel);
-          if (verifiedRealTrafficProtocol) {
-            stateName = 'codex_forward_only';
-            healthResult = responsesResult;
-            healthError = `real ${verifiedRealTrafficProtocol} traffic has succeeded for ${probeModel}, but the standard Health Probe is not representative of real Codex traffic: ${codexForwardOnlyProbeError(responsesClassification, chatClassification)}`;
-          } else if (shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification)) {
-            stateName = 'codex_forward_only';
-            healthResult = responsesResult;
-            healthError = codexForwardOnlyProbeError(responsesClassification, chatClassification);
+          // /responses failed → try /v1/chat/completions as fallback
+          const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
+          applyQuota(upstream, key, chatResult.headers || {});
+          const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
+          recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: probeModel });
+          const chatState = chatClassification.state;
+
+          if (chatState === 'ok') {
+            stateName = 'ok';
+            healthResult = chatResult;
+            healthError = '';
+            healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
+            resolvedMode = 'chat_completions';
           } else {
-            // Both real probes failed; /models is only supplementary and cannot mark Health ok.
             if (responsesState === 'advanced_curl_required' || responsesState === 'codex_forward_only') {
               stateName = responsesState;
               healthResult = responsesResult;
               healthError = responsesClassification.error;
-            } else if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only') {
+            } else if (shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification)) {
+              stateName = 'codex_forward_only';
+              healthResult = responsesResult;
+              healthError = codexForwardOnlyProbeError(responsesClassification, chatClassification);
+            } else if (
+              responsesState === 'models_unsupported' &&
+              chatClassification.authoritative === true &&
+              chatState !== 'models_unsupported'
+            ) {
               stateName = chatState;
               healthResult = chatResult;
-              healthError = chatClassification.error;
+              healthError = chatClassification.error || chatResult.error || `chat_completions probe ${chatState}`;
+            } else if (responsesClassification.authoritative === true) {
+              stateName = responsesState;
+              healthResult = responsesResult;
+              healthError = responsesClassification.error || responsesResult.error || `responses probe ${responsesState}`;
+            } else if (chatClassification.authoritative === true) {
+              stateName = chatState;
+              healthResult = chatResult;
+              healthError = chatClassification.error || chatResult.error || `chat_completions probe ${chatState}`;
             } else {
-              stateName = responsesState === 'auth_error' ? responsesState : chatState;
-              healthResult = responsesState === 'auth_error' ? responsesResult : chatResult;
-              healthError = responsesClassification.error || chatClassification.error || responsesResult.error || chatResult.error || `responses probe ${responsesState}; chat probe ${chatState}`;
+              const verifiedRealTrafficProtocol = verifiedRealTrafficProtocolForModel(upstream, probeModel);
+              if (verifiedRealTrafficProtocol) {
+                stateName = 'codex_forward_only';
+                healthResult = responsesResult;
+                healthError = `real ${verifiedRealTrafficProtocol} traffic has succeeded for ${probeModel}, but the standard Health Probe is not representative of real Codex traffic: ${codexForwardOnlyProbeError(responsesClassification, chatClassification)}`;
+              } else if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only') {
+                stateName = chatState;
+                healthResult = chatResult;
+                healthError = chatClassification.error;
+              } else {
+                stateName = responsesState === 'inconclusive' ? 'inconclusive' : chatState;
+                healthResult = responsesState === 'inconclusive' ? responsesResult : chatResult;
+                healthError = `${responsesClassification.error || `responses probe ${responsesState}`}; ${chatClassification.error || `chat probe ${chatState}`}`;
+              }
             }
           }
         }
@@ -7011,6 +7386,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
 
   upstream.health = {
     state: stateName,
+    source: healthSource,
     checkedAt,
     latencyMs: healthResult.latencyMs,
     httpStatus: healthResult.statusCode,
@@ -7024,6 +7400,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
 
   key.health = {
     state: stateName,
+    source: healthSource,
     checkedAt,
     latencyMs: healthResult.latencyMs,
     httpStatus: healthResult.statusCode,
@@ -9501,7 +9878,7 @@ function createStatusPayload(config, state) {
     upstreams: state.upstreams.map((upstream) => {
       const availability = availabilitySummary(upstream.stats, state.availability);
       const available = upstreamAvailable(upstream, at, state.modelOverride);
-      const selectionWeight = upstreamSelectionWeight(upstream, availability);
+      const selectionWeight = upstreamSelectionWeight(upstream, availability, state.modelOverride, at);
       const effectiveHealthState = healthProbeEffectiveState(upstream.health, state.modelOverride);
       return {
         name: upstream.name,
@@ -9529,7 +9906,7 @@ function createStatusPayload(config, state) {
         enabled: upstream.enabled,
         weight: upstream.weight,
         selection_weight: roundedSelectionValue(selectionWeight),
-        selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability)) : 0,
+        selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, at)) : 0,
         available,
         cooldown_ms: Math.max(0, upstream.cooldownUntil - at),
         in_flight: upstream.inFlight,
@@ -9567,10 +9944,11 @@ function createStatusPayload(config, state) {
           stats: key.stats,
           availability: availabilitySummary(key.stats, state.availability),
           quota: key.quota,
-            health: {
-              state: key.health.state,
-              source: key.health.source || '',
-              checked_at: key.health.checkedAt,
+          representative_evidence: representativeEvidencePayload(key.representativeEvidence || {}, at),
+          health: {
+            state: key.health.state,
+            source: key.health.source || '',
+            checked_at: key.health.checkedAt,
             latency_ms: key.health.latencyMs,
             http_status: key.health.httpStatus,
             error: key.health.error,
@@ -10686,6 +11064,15 @@ export function createPoolServer(config, options = {}) {
       const originalBodyIsJson = Boolean(jsonObjectFromRequestBody(req, originalBody, responsesJsonOptions));
       const modelInteractionRequest = isModelInteractionRequest(req.method, pathname);
 
+      if (modelInteractionRequest) {
+        captureRepresentativeRequestTemplate(state, {
+          req,
+          pathname,
+          body: originalBody,
+          model: requestedModel,
+          options: responsesJsonOptions
+        });
+      }
 
       let networkAttempt = 1;
       while (networkAttempt <= maxAttempts) {
@@ -11038,7 +11425,7 @@ export function createPoolServer(config, options = {}) {
         persistStats(state, statsPath);
         const nativeResponsesUnsupported = activeRequiresNativeResponses && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(result.statusCode);
         if (modelInteractionRequest && !nativeResponsesUnsupported) {
-          recordFailure(state, upstream, key, result.reason, result.statusCode, result.retryAfter);
+          recordRealTrafficFailure(state, upstream, key, result.reason, result.statusCode, result.retryAfter);
         }
         if (modelInteractionRequest) {
           rememberRequest(state, {

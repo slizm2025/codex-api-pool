@@ -1,6 +1,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
+import zlib from 'node:zlib';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -4499,7 +4500,13 @@ try {
     if (unstableHigh.availability?.samples !== 10 || unstableHigh.availability?.rate !== 0 || unstableHigh.availability?.multiplier !== 0.08 || unstableHigh.selection_weight !== 0.8) {
       throw new Error(`expected unstable-high availability to heavily reduce selection weight: ${JSON.stringify(unstableHigh?.availability)} / ${unstableHigh?.selection_weight}`);
     }
-    if (steadyLow.availability?.samples !== 11 || steadyLow.availability?.successes !== 11 || steadyLow.availability?.multiplier !== 1.2 || steadyLow.selection_weight !== 1.2) {
+    if (
+      steadyLow.availability?.samples !== 11 ||
+      steadyLow.availability?.successes !== 11 ||
+      steadyLow.availability?.multiplier !== 1.2 ||
+      steadyLow.representative_availability?.state !== 'fresh' ||
+      steadyLow.selection_weight !== 1.38
+    ) {
       throw new Error(`expected steady-low availability to keep boosted selection weight after success: ${JSON.stringify(steadyLow?.availability)} / ${steadyLow?.selection_weight}`);
     }
     if (!(steadyLow.selection_score > unstableHigh.selection_score)) {
@@ -4774,6 +4781,8 @@ try {
       probe.json.health?.state !== 'advanced_curl_required' ||
       probe.json.health?.httpStatus !== 400 ||
       !String(probe.json.health?.error || '').includes('真实 Codex') ||
+      probe.json.health?.upstream_result?.status_code !== 400 ||
+      !String(probe.json.health?.upstream_result?.body || '').includes('invalid_responses_request') ||
       !probe.json.health?.models?.includes('gpt-5.5')
     ) {
       throw new Error(`expected invalid-codex synthetic probe to stay dispatchable for real Codex traffic: ${probe.text}`);
@@ -4785,7 +4794,9 @@ try {
       site?.selection_score <= 0 ||
       site?.capabilities?.responses?.status !== 'unknown' ||
       site?.capabilities?.responses?.representative !== false ||
-      site?.capabilities?.responses?.http_status !== 400
+      site?.capabilities?.responses?.http_status !== 400 ||
+      site?.representative_availability?.state !== 'missing' ||
+      site?.representative_availability?.verified !== false
     ) {
       throw new Error(`expected invalid-codex probe to be classified as non-representative, not unavailable: ${JSON.stringify(site)}`);
     }
@@ -4818,42 +4829,291 @@ try {
     if (
       verifiedSite?.health?.state !== 'ok' ||
       verifiedSite?.health?.source !== 'real_traffic' ||
-      verifiedSite?.capabilities?.responses?.source !== 'real_traffic'
+      verifiedSite?.capabilities?.responses?.source !== 'real_traffic' ||
+      verifiedSite?.representative_availability?.state !== 'fresh' ||
+      !verifiedSite?.representative_availability?.sources?.includes('real_traffic') ||
+      verifiedSite?.selection_weight <= verifiedSite?.weight
     ) {
       throw new Error(`expected real Codex response to mark invalid-codex-probe healthy: ${JSON.stringify(verifiedSite)}`);
     }
 
     invalidCodexProbeForwardRequest = null;
-    const representativeProbe = await postJson(`${invalidCodexProbePoolInfo.url}/pool/upstreams/invalid-codex-probe/probe`, 'pool-secret', {});
+    const secondSyntheticProbe = await postJson(`${invalidCodexProbePoolInfo.url}/pool/upstreams/invalid-codex-probe/probe`, 'pool-secret', {});
     if (
-      representativeProbe.response.status !== 200 ||
-      representativeProbe.json.probe_ok !== true ||
-      representativeProbe.json.probe_status !== 'ok' ||
-      representativeProbe.json.health?.state !== 'ok' ||
-      representativeProbe.json.health?.source !== 'representative_probe' ||
-      representativeProbe.json.health?.httpStatus !== 200 ||
-      invalidCodexProbeForwardRequest?.headers?.authorization !== 'Bearer upstream-secret' ||
-      invalidCodexProbeForwardRequest?.headers?.['x-oai-attestation'] !== 'attestation-test' ||
-      !String(invalidCodexProbeForwardRequest?.body || '').includes('Respond with OK.')
+      secondSyntheticProbe.response.status !== 200 ||
+      secondSyntheticProbe.json.probe_ok !== false ||
+      secondSyntheticProbe.json.probe_status !== 'skipped' ||
+      secondSyntheticProbe.json.health?.state !== 'advanced_curl_required' ||
+      secondSyntheticProbe.json.health?.source !== 'probe' ||
+      secondSyntheticProbe.json.health?.httpStatus !== 400 ||
+      secondSyntheticProbe.json.health?.upstream_result?.status_code !== 400 ||
+      !String(secondSyntheticProbe.json.health?.upstream_result?.body || '').includes('invalid_responses_request') ||
+      invalidCodexProbeForwardRequest !== null
     ) {
-      throw new Error(`expected manual Health Probe to use fresh Codex Desktop Representative Request Template: ${representativeProbe.text} forwarded=${JSON.stringify(invalidCodexProbeForwardRequest)}`);
+      throw new Error(`expected manual Health Probe to remain synthetic and not replay Codex Desktop template: ${secondSyntheticProbe.text} forwarded=${JSON.stringify(invalidCodexProbeForwardRequest)}`);
     }
-    const representativeStatus = (await getJson(`${invalidCodexProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
-    const representativeSite = representativeStatus.upstreams.find((upstream) => upstream.name === 'invalid-codex-probe');
-    const representativeEvidence = representativeSite?.keys?.[0]?.representative_evidence?.responses?.['gpt-5.5'];
+    const postSyntheticStatus = (await getJson(`${invalidCodexProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const postSyntheticSite = postSyntheticStatus.upstreams.find((upstream) => upstream.name === 'invalid-codex-probe');
+    const realTrafficEvidence = postSyntheticSite?.keys?.[0]?.representative_evidence?.responses?.['gpt-5.5'];
     if (
-      representativeEvidence?.source !== 'representative_probe' ||
-      representativeEvidence?.fresh !== true ||
-      representativeSite?.selection_weight <= representativeSite?.weight
+      realTrafficEvidence?.source !== 'real_traffic' ||
+      realTrafficEvidence?.fresh !== true ||
+      postSyntheticSite?.available !== true ||
+      postSyntheticSite?.representative_availability?.state !== 'fresh' ||
+      !postSyntheticSite?.representative_availability?.sources?.includes('real_traffic') ||
+      postSyntheticSite?.selection_weight <= postSyntheticSite?.weight
     ) {
-      throw new Error(`expected representative probe success evidence to affect status and bounded Selection weight: ${JSON.stringify(representativeSite)}`);
+      throw new Error(`expected synthetic probe not to erase real-traffic evidence or block Selection: ${JSON.stringify(postSyntheticSite)}`);
+    }
+    } finally {
+      await close(invalidCodexProbePool);
+      await close(invalidCodexProbeBackend);
+    }
+
+  let rawchatLikeRequests = [];
+  const rawchatLikeBackend = createFakeUpstream('rawchat-like-invalid-chat-200', ({ req, res, body }) => {
+    rawchatLikeRequests.push({ url: req.url, headers: req.headers, body });
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: '请使用最新版的codex客户端或codex cli调用', code: 'codex_access_restricted' } }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      const payload = zlib.gzipSync(Buffer.from(JSON.stringify({
+        code: 0,
+        msg: '该接口未接入公益站独立网关，旧转发链路已关闭',
+        data: null
+      })));
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-encoding': 'gzip',
+        'content-length': payload.length
+      });
+      res.end(payload);
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const rawchatLikeInfo = await listen(rawchatLikeBackend);
+  const rawchatLikePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'gpt-5.5',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'rawchat-like-invalid-chat-200', base_url: `${rawchatLikeInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const rawchatLikePoolInfo = await listen(rawchatLikePool);
+  try {
+    const realBody = JSON.stringify({ model: 'gpt-5.5', input: 'hello rawchat-like', stream: false });
+    const realResponse = await fetch(`${rawchatLikePoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(realBody)),
+        'user-agent': 'Codex Desktop/0.138.0-alpha.7',
+        originator: 'Codex Desktop',
+        'x-oai-attestation': 'rawchat-nonce-1',
+        'x-codex-turn-state': 'turn-rawchat-nonce-1'
+      },
+      body: realBody
+    });
+    const realText = await realResponse.text();
+    const realJson = JSON.parse(realText);
+    if (
+      realResponse.status !== 200 ||
+      realResponse.headers.get('x-codex-api-pool-route') !== 'responses->chat_completions' ||
+      realJson.code !== 0 ||
+      !rawchatLikeRequests.some((item) => item.url === '/v1/chat/completions')
+    ) {
+      throw new Error(`expected rawchat-like invalid chat fallback to be forwarded but not treated as success: ${realResponse.status} ${realText} forwarded=${JSON.stringify(rawchatLikeRequests)}`);
+    }
+    const afterRealStatus = (await getJson(`${rawchatLikePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const afterRealSite = afterRealStatus.upstreams.find((upstream) => upstream.name === 'rawchat-like-invalid-chat-200');
+    if (
+      afterRealSite?.resolved_request_mode === 'chat_completions' ||
+      afterRealSite?.health?.source === 'real_traffic' ||
+      afterRealSite?.representative_availability?.state !== 'missing'
+    ) {
+      throw new Error(`expected HTTP 200 without concrete output not to learn chat_completions or real traffic: ${JSON.stringify(afterRealSite)}`);
+    }
+    rawchatLikeRequests = [];
+    const probe = await postJson(`${rawchatLikePoolInfo.url}/pool/upstreams/rawchat-like-invalid-chat-200/probe`, 'pool-secret', {});
+    const syntheticResponsesForward = rawchatLikeRequests.find((item) => item.url === '/v1/responses');
+    if (
+      probe.response.status !== 200 ||
+      probe.json.probe_ok !== false ||
+      probe.json.probe_status !== 'skipped' ||
+      probe.json.health?.state !== 'advanced_curl_required' ||
+      probe.json.health?.source !== 'probe' ||
+      !String(probe.json.health?.error || '').includes('高级 Curl') ||
+      probe.json.health?.upstream_result?.status_code !== 403 ||
+      !String(probe.json.health?.upstream_result?.body || '').includes('codex_access_restricted') ||
+      syntheticResponsesForward?.headers?.['x-oai-attestation'] === 'rawchat-nonce-1'
+    ) {
+      throw new Error(`expected rawchat-like manual probe to stay synthetic and return upstream error details: ${probe.text} forwarded=${JSON.stringify(rawchatLikeRequests)}`);
+    }
+    const afterProbeStatus = (await getJson(`${rawchatLikePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const afterProbeSite = afterProbeStatus.upstreams.find((upstream) => upstream.name === 'rawchat-like-invalid-chat-200');
+    if (afterProbeSite?.available !== true || afterProbeSite?.resolved_request_mode === 'chat_completions') {
+      throw new Error(`expected rawchat-like upstream to stay selectable and not cache invalid chat mode: ${JSON.stringify(afterProbeSite)}`);
     }
   } finally {
-    await close(invalidCodexProbePool);
-    await close(invalidCodexProbeBackend);
+    await close(rawchatLikePool);
+    await close(rawchatLikeBackend);
   }
 
-  const ambiguousProbeBackend = createFakeUpstream('ambiguous-probe', ({ req, res }) => {
+    const singleUseAttestationSeen = new Set();
+    let singleUseForwardRequest = null;
+    const singleUseTemplateBackend = createFakeUpstream('single-use-template', ({ req, res, body }) => {
+      if (req.url.endsWith('/models')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));
+        return;
+      }
+      const attestation = String(req.headers['x-oai-attestation'] || '');
+      const hasCodexContext = req.headers.originator === 'Codex Desktop' &&
+        /^Codex Desktop\//.test(req.headers['user-agent'] || '') &&
+        attestation;
+      if (req.url.endsWith('/responses') && hasCodexContext && !singleUseAttestationSeen.has(attestation)) {
+        singleUseAttestationSeen.add(attestation);
+        singleUseForwardRequest = { url: req.url, headers: req.headers, body };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'resp_single_use_template_real',
+          object: 'response',
+          output_text: 'real-ok',
+          output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'real-ok' }] }],
+          body: JSON.parse(body || '{}')
+        }));
+        return;
+      }
+      if (req.url.endsWith('/responses') && hasCodexContext) {
+        singleUseForwardRequest = { url: req.url, headers: req.headers, body };
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'one-time attestation replayed', code: 'attestation_replay' } }));
+        return;
+      }
+      if (req.url.endsWith('/responses')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'missing Codex context' } }));
+        return;
+      }
+      if (req.url.endsWith('/chat/completions')) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+    const singleUseTemplateInfo = await listen(singleUseTemplateBackend);
+    const singleUseTemplatePool = createTestPool({
+      server: {
+        host: '127.0.0.1',
+        port: 0,
+        public_prefix: '/v1',
+        auth_token_env: 'TEST_POOL_TOKEN',
+        max_body_bytes: 1024 * 1024,
+        request_timeout_ms: 5000
+      },
+      model_override: 'gpt-5.5',
+      retry: {
+        max_attempts: 1,
+        failure_threshold: 1,
+        base_cooldown_ms: 1000,
+        key_cooldown_ms: 1000
+      },
+      health: { enabled: false, path: '/models', timeout_ms: 1000 },
+      upstreams: [
+        { name: 'single-use-template', base_url: `${singleUseTemplateInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+      ]
+    });
+    const singleUseTemplatePoolInfo = await listen(singleUseTemplatePool);
+    try {
+      const realBody = JSON.stringify({ model: 'gpt-5.5', input: 'hello with one-time attestation', stream: false });
+      const realResponse = await fetch(`${singleUseTemplatePoolInfo.url}/v1/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer pool-secret',
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(realBody)),
+          'user-agent': 'Codex Desktop/0.138.0-alpha.7',
+          originator: 'Codex Desktop',
+          'x-oai-attestation': 'nonce-1'
+        },
+        body: realBody
+      });
+      const realText = await realResponse.text();
+      const realJson = JSON.parse(realText);
+      if (
+        realResponse.status !== 200 ||
+        realJson.output_text !== 'real-ok' ||
+        singleUseForwardRequest?.headers?.['x-oai-attestation'] !== 'nonce-1'
+      ) {
+        throw new Error(`expected real Codex request with one-time attestation to succeed: ${realResponse.status} ${realText} forwarded=${JSON.stringify(singleUseForwardRequest)}`);
+      }
+      const templateStatus = (await getJson(`${singleUseTemplatePoolInfo.url}/pool/status`, 'pool-secret')).json;
+      const template = templateStatus.representative_templates?.responses?.codex_desktop;
+      const templateRisk = template?.replay_risk;
+      if (
+        templateRisk?.present !== true ||
+        !templateRisk?.fields?.includes('headers.x-oai-attestation') ||
+        template?.headers?.['x-oai-attestation'] !== 'redacted' ||
+        Object.prototype.hasOwnProperty.call(template || {}, 'body')
+      ) {
+        throw new Error(`expected captured template to expose replay-risk header names only: ${JSON.stringify(templateStatus.representative_templates)}`);
+      }
+      singleUseForwardRequest = null;
+      const syntheticProbe = await postJson(`${singleUseTemplatePoolInfo.url}/pool/upstreams/single-use-template/probe`, 'pool-secret', {});
+      if (
+        syntheticProbe.response.status !== 200 ||
+        syntheticProbe.json.probe_ok !== false ||
+        syntheticProbe.json.probe_status !== 'skipped' ||
+        syntheticProbe.json.health?.state !== 'advanced_curl_required' ||
+        syntheticProbe.json.health?.source !== 'probe' ||
+        syntheticProbe.json.health?.upstream_result?.status_code !== 400 ||
+        !String(syntheticProbe.json.health?.upstream_result?.body || '').includes('missing Codex context') ||
+        singleUseForwardRequest !== null
+      ) {
+        throw new Error(`expected synthetic probe not to replay one-time template fields: ${syntheticProbe.text} forwarded=${JSON.stringify(singleUseForwardRequest)}`);
+      }
+      const syntheticStatus = (await getJson(`${singleUseTemplatePoolInfo.url}/pool/status`, 'pool-secret')).json;
+      const syntheticSite = syntheticStatus.upstreams.find((upstream) => upstream.name === 'single-use-template');
+      if (
+        syntheticSite?.available !== true ||
+        syntheticSite?.cooldown_ms !== 0 ||
+        syntheticSite?.representative_availability?.state !== 'fresh' ||
+        !syntheticSite?.representative_availability?.sources?.includes('real_traffic')
+      ) {
+        throw new Error(`expected synthetic probe failure not to mark real-traffic verified upstream unavailable: ${JSON.stringify(syntheticSite)}`);
+      }
+    } finally {
+      await close(singleUseTemplatePool);
+      await close(singleUseTemplateBackend);
+    }
+
+    const ambiguousProbeBackend = createFakeUpstream('ambiguous-probe', ({ req, res }) => {
     if (req.url.endsWith('/models')) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }));

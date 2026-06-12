@@ -89,16 +89,24 @@ The Bearer token used to authorize access to the Management API. It may be confi
 _Avoid_: pool token, upstream key, API key
 
 **Health Probe**:
-An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but it is not authoritative for Codex-native availability unless it is also a Representative Model Probe.
+An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but synthetic probe failures are authoritative only when they contain deterministic failure evidence.
 _Avoid_: test, check, ping, health check, real Codex check
 
 **Representative Model Probe**:
-A Management API-triggered model availability check whose request shape represents Codex-native model traffic closely enough that a successful model response can be used as evidence for Selection. A Representative Model Probe is distinct from model listing and from non-representative synthetic Health Probes.
+A model availability check whose request shape is actual Codex-native model traffic closely enough that a successful model response can be used as evidence for Selection. In the current implementation, representative availability is proven by real Codex traffic rather than by replaying in-memory templates from the Management API.
 _Avoid_: health check, model list, synthetic probe
 
 **Representative Request Template**:
-A sanitized, time-limited request-shape template captured from real Codex Model Interaction Requests and used by the Management API to run Representative Model Probes without retaining user content or secrets.
+A redacted, time-limited request-shape metadata record captured from real Codex Model Interaction Requests for diagnostics. It is memory-only, does not retain a replayable request body or unmasked one-time context values, and is not used by the Management API to run Health Probes.
 _Avoid_: saved prompt, cached request, dashboard request body, fixture
+
+**Replay-risk Template Field**:
+A redacted Representative Request Template field name whose original value may be bound to a single Codex turn, request, nonce, signature, attestation, or session. Replay-risk fields are why Management API tests do not replay Representative Request Templates.
+_Avoid_: reusable template field, permanent credential, upstream key
+
+**Representative Availability**:
+A derived, non-persistent interpretation of recent real Codex success evidence for an Upstream, scoped by protocol and model. It reports whether evidence is fresh, stale, or missing, and may apply bounded Selection weighting without becoming a hard allowlist.
+_Avoid_: whitelist, permanent health, model list availability
 
 **Authoritative Probe Failure**:
 A probe result with enough evidence to mark an Upstream or Upstream Key unavailable for Selection, such as authentication failure, rate limiting, network failure, or a clearly unsupported model/API. Non-representative and inconclusive probe results are not Authoritative Probe Failures.

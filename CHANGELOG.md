@@ -1,5 +1,78 @@
 # 更新日志
 
+## 2026-06-12 CST
+
+本次更新按 Representative Model Probe 架构复审结果继续收敛实现边界，目标是减少健康探测、真实请求、Selection 和 Dashboard 之间的重复判断。
+
+- 新增 Representative Availability 汇总投影，将 key-level representative evidence 统一解释为 `fresh`、`stale` 或 `missing`，并通过 `/pool/status.upstreams[].representative_availability` 暴露。
+- Selection 的 representative multiplier 改为读取同一 Representative Availability 汇总；真实 Codex 成功会在 fresh 期间提供小幅加权，但仍保持加权随机负载均衡。
+- 将 synthetic probe 的分类辅助函数集中化，并把 OpenAI Responses + Chat Completions 双探测组合决策抽出为独立决策函数，避免 `probeOneUpstream` 内继续扩散 authoritative / non-representative 语义。
+- 将 Model Interaction Request 的结果记录统一到单一 outcome helper，集中处理 response stats、Availability、token usage、成功状态和真实请求失败/cooldown 逻辑。
+- 拆分 `/pool/status` 的 Upstream/Key view projection，减少 Management Dashboard payload 与 Runtime State 的直接耦合。
+- smoke 测试补充 Representative Availability 断言，覆盖 synthetic probe 后 `missing`、真实 Codex 成功后 `fresh + real_traffic`，以及后续 synthetic probe 不抹除真实请求证据。
+- Representative Request Template 现在只保留红acted 元数据和 replay-risk header 名称，例如 `headers.x-oai-attestation`；手动 Health Probe 不再重放内存模板，避免一次性字段导致无意义测试。
+- Management API probe 失败时会在本次响应中返回 `health.upstream_result`，包含上游状态码、响应头、响应体、错误和 retry-after，便于后续判断。
+- 基于真实 rawchat 上游复测修正 auto request-mode 学习条件：只有解析到具体模型输出的真实请求才会写入 `resolvedRequestMode` 和 `real_traffic` 证据，避免 `HTTP 200 + code/msg/data:null` 这类商家业务错误把上游误学习为 chat-only 并短路后续真实请求验证；同时 success accounting 现在会解析 gzip/br/deflate JSON/SSE 响应体。
+
+### 验证
+
+已通过：
+
+```bash
+node --check src/server.mjs
+node --check test/smoke-test.mjs
+npm run smoke
+node -e 'import("./src/server.mjs").then(async ({createPoolServer}) => { const server = createPoolServer({ server: { host: "127.0.0.1", port: 0, public_prefix: "/v1", auth_token_env: "" }, health: { enabled: false }, upstreams: [{ name: "usage-site", base_url: "http://127.0.0.1:1/v1", weight: 1, keys: [] }] }); await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); }); const { port } = server.address(); const response = await fetch(`http://127.0.0.1:${port}/pool/dashboard`); const html = await response.text(); const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]); for (const script of scripts) new Function(script); server.close(); console.log(`dashboard scripts parse ok (${scripts.length})`); })'
+```
+
+## 2026-06-11 CST
+
+本次更新修复 Codex Desktop 真实请求可用、但 Management Dashboard 健康监测误判 Upstream 不可用的问题。核心变化是引入 Representative Request Template 和 Representative Model Probe，让手动健康监测能复用真实 Codex Desktop 请求形状，而不是只依赖 synthetic Health Probe。
+
+### Representative Model Probe
+
+- 从已通过 Pool Token 鉴权的真实 Codex Desktop `/v1/responses` Model Interaction Request 捕获内存-only Representative Request Template。
+- Template 只保留请求形状和必要 Codex context header，例如 `x-oai-attestation`；不持久化、不写入配置、不展示原始敏感值。
+- Template body 替换用户输入为最小无害探测内容 `Respond with OK.`，并剔除 `metadata`、`previous_response_id`、用户 prompt 和会话内容。
+- 手动 Dashboard Health Probe 在存在 fresh Codex Desktop template 时优先运行 Representative Model Probe；后台定时 Health Probe 不重放 template。
+- Representative Model Probe 成功会设置 `health.source = representative_probe`，与普通 `probe` 和 `real_traffic` 区分。
+
+### Probe 分类与 Selection
+
+- 新增 `inconclusive` Health State：商家自定义、无法稳定归因的 `400/403/5xx` 等探测错误不会直接阻断 Selection。
+- synthetic Health Probe 返回 `invalid_responses_request` / `invalid Codex request` 时继续视为 non-representative，不再把 `any` 这类 Codex-context-gated Upstream 错判不可用。
+- Representative Model Probe 或真实 Codex 请求中的同类错误按代表性请求失败处理，不再降级为 synthetic-only 诊断。
+- 代表性成功证据按 `Upstream Key + protocol + model` 记录，带 30 分钟 freshness，并通过 `/pool/status.upstreams[].keys[].representative_evidence` 暴露。
+- Selection 保持加权随机和负载均衡，只对 fresh representative probe evidence 施加小幅 multiplier，不做固定优先级队列。
+- 真实 Codex 非权威失败前两次不立即 cooldown；连续三次才触发短 cooldown。Auth、rate limit、network、timeout、Cloudflare 52x 等强失败仍立即走原 cooldown 逻辑。
+
+### Dashboard
+
+- `/pool/status` 顶层新增 `representative_templates`，只展示 template freshness、模型和 redacted header 名称。
+- Upstream Workbench 增加 `Codex Desktop Template fresh/stale/missing` 读数，方便判断手动健康监测是否具备代表性。
+- Health State `ok` 现在保留来源：synthetic probe、representative probe、real traffic 可在状态 payload 中区分。
+
+### 文档与测试
+
+- `CONTEXT.md` 增加 Representative Model Probe、Representative Request Template、Authoritative Probe Failure 和 Non-representative Probe Result 术语。
+- 新增 ADR：`docs/adr/0003-non-authoritative-probes-do-not-block-selection.md`。
+- 新增 PRD：`docs/prd-representative-model-probe.md`，并发布为 GitHub Issue #21。
+- smoke 测试覆盖：
+  - any-like Upstream synthetic probe 失败但真实 Codex Desktop 请求成功。
+  - 真实 Codex Desktop 请求后，手动健康按钮使用 Representative Model Probe。
+  - ambiguous merchant probe error 进入 `inconclusive` 且保持 selectable。
+  - Representative success evidence 写入 key/protocol/model 作用域。
+  - 非权威真实失败连续三次才 cooldown。
+
+### 验证
+
+已通过：
+
+```bash
+npm run smoke
+node -e 'import("./src/server.mjs").then(async ({createPoolServer}) => { const server = createPoolServer({ server: { host: "127.0.0.1", port: 0, public_prefix: "/v1", auth_token_env: "" }, health: { enabled: false }, upstreams: [{ name: "usage-site", base_url: "http://127.0.0.1:1/v1", weight: 1, keys: [] }] }); await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); }); const { port } = server.address(); const response = await fetch(`http://127.0.0.1:${port}/pool/dashboard`); const html = await response.text(); const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]); for (const script of scripts) new Function(script); server.close(); console.log(`dashboard scripts parse ok (${scripts.length})`); })'
+```
+
 ## 2026-06-09 CST
 
 本次更新优化检测网站的站点排序规则，让页面顺序更贴近真实 Selection 状态。

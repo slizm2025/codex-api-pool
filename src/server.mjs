@@ -646,6 +646,18 @@ function probeResult(statusCode, latencyMs, body = '', error = '', retryAfter = 
   return { statusCode, latencyMs, body, error, retryAfter, headers };
 }
 
+function probeUpstreamResultPayload(result) {
+  if (!result) return undefined;
+  return {
+    status_code: Number(result.statusCode || 0),
+    latency_ms: Number(result.latencyMs || 0),
+    headers: result.headers || {},
+    body: String(result.body || ''),
+    error: result.error || '',
+    retry_after: result.retryAfter
+  };
+}
+
 function sanitizeResponseHeaders(headers, upstreamName) {
   const out = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -754,7 +766,7 @@ function codexResponsesProbePayload(model) {
 const REPRESENTATIVE_TEMPLATE_TTL_MS = 30 * 60 * 1000;
 const REPRESENTATIVE_EVIDENCE_TTL_MS = 30 * 60 * 1000;
 const FRESH_REPRESENTATIVE_EVIDENCE_MULTIPLIER = 1.15;
-const REPRESENTATIVE_PROBE_INPUT = 'Respond with OK.';
+const REPRESENTATIVE_REPLAY_RISK_HEADER_PATTERN = /(?:attestation|nonce|signature|signed|token|turn|metadata|state|session|request[-_]?id|idempotency|trace|challenge|csrf)/i;
 
 function codexClientFamilyFromHeaders(headers = {}) {
   const originator = String(headers.originator || headers.Originator || '').trim().toLowerCase();
@@ -798,45 +810,15 @@ function sanitizeRepresentativeHeaders(headers = {}) {
   return out;
 }
 
-function sanitizedRepresentativeInput(input) {
-  if (Array.isArray(input)) {
-    return [
-      {
-        type: 'message',
-        role: 'user',
-        content: [
-          { type: 'input_text', text: REPRESENTATIVE_PROBE_INPUT }
-        ]
-      }
-    ];
+function representativeTemplateReplayRisk(template) {
+  const fields = [];
+  for (const name of Object.keys(template?.headers || {})) {
+    if (REPRESENTATIVE_REPLAY_RISK_HEADER_PATTERN.test(name)) fields.push(`headers.${name}`);
   }
-  return REPRESENTATIVE_PROBE_INPUT;
-}
-
-function sanitizeRepresentativeBody(payload, model) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
-  const out = {};
-  const copyFields = [
-    'tools',
-    'tool_choice',
-    'parallel_tool_calls',
-    'store',
-    'reasoning',
-    'text',
-    'stream',
-    'max_output_tokens',
-    'max_completion_tokens',
-    'temperature',
-    'top_p'
-  ];
-  for (const field of copyFields) {
-    if (Object.prototype.hasOwnProperty.call(payload, field)) out[field] = payload[field];
-  }
-  out.model = String(model || payload.model || '').trim();
-  out.input = sanitizedRepresentativeInput(payload.input);
-  out.instructions = 'Health check: respond with exactly OK.';
-  delete out.metadata;
-  return out;
+  return {
+    present: fields.length > 0,
+    fields
+  };
 }
 
 function captureRepresentativeRequestTemplate(state, { req, pathname, body, model, options = {} } = {}) {
@@ -845,9 +827,8 @@ function captureRepresentativeRequestTemplate(state, { req, pathname, body, mode
   if (clientFamily !== 'codex_desktop') return null;
   const payload = jsonObjectFromRequestBody(req, body, options);
   if (!payload) return null;
-  const sanitizedBody = sanitizeRepresentativeBody(payload, model);
-  if (!sanitizedBody) return null;
   const capturedAtMs = now();
+  const sanitizedHeaders = sanitizeRepresentativeHeaders(req.headers);
   const template = {
     protocol: 'responses',
     clientFamily,
@@ -855,16 +836,28 @@ function captureRepresentativeRequestTemplate(state, { req, pathname, body, mode
     capturedAtMs,
     expiresAt: capturedAtMs + REPRESENTATIVE_TEMPLATE_TTL_MS,
     model: String(model || payload.model || '').trim(),
-    headers: sanitizeRepresentativeHeaders(req.headers),
-    body: sanitizedBody
+    headers: Object.fromEntries(Object.keys(sanitizedHeaders).map((name) => [name, 'redacted']))
   };
   state.representativeTemplates.set(representativeTemplateKey('responses', clientFamily), template);
   return template;
 }
 
-function freshRepresentativeTemplate(state, protocol = 'responses', clientFamily = 'codex_desktop') {
-  const template = state?.representativeTemplates?.get(representativeTemplateKey(protocol, clientFamily));
-  return representativeTemplateFresh(template) ? template : null;
+function representativeTemplatesPayload(state, at = now()) {
+  const out = {};
+  for (const [key, template] of state?.representativeTemplates || []) {
+    const [protocol, clientFamily] = key.split(':');
+    if (!protocol || !clientFamily) continue;
+    if (!out[protocol]) out[protocol] = {};
+    out[protocol][clientFamily] = {
+      fresh: representativeTemplateFresh(template, at),
+      captured_at: template.capturedAt,
+      expires_in_ms: Math.max(0, Number(template.expiresAt || 0) - at),
+      model: template.model || '',
+      replay_risk: representativeTemplateReplayRisk(template),
+      headers: Object.fromEntries(Object.keys(template.headers || {}).map((name) => [name, 'redacted']))
+    };
+  }
+  return out;
 }
 
 function ensureRepresentativeEvidence(key) {
@@ -914,14 +907,45 @@ function representativeEvidencePayload(value = {}, at = now()) {
   return out;
 }
 
-function hasFreshRepresentativeEvidence(upstream, model, protocol = 'responses', at = now(), source = '') {
+function representativeAvailability(upstream, {
+  model = '',
+  protocol = 'responses',
+  at = now()
+} = {}) {
   const normalizedModel = String(model || '').trim();
-  if (!normalizedModel) return false;
-  return (upstream?.keys || []).some((key) => {
-    const item = key?.representativeEvidence?.[protocol]?.[normalizedModel];
-    if (!representativeEvidenceFresh(item, at)) return false;
-    return !source || item.source === source;
-  });
+  const evidence = [];
+  for (const key of upstream?.keys || []) {
+    const byModel = key?.representativeEvidence?.[protocol] || {};
+    const item = normalizedModel ? byModel[normalizedModel] : null;
+    if (!item) continue;
+    const checkedAtMs = Date.parse(item.checked_at || '');
+    evidence.push({
+      keyLabel: key.label || '',
+      source: String(item.source || ''),
+      checkedAtMs: Number.isFinite(checkedAtMs) ? checkedAtMs : 0,
+      fresh: representativeEvidenceFresh(item, at)
+    });
+  }
+  const freshEvidence = evidence.filter((item) => item.fresh);
+  const latest = evidence
+    .slice()
+    .sort((a, b) => b.checkedAtMs - a.checkedAtMs)[0];
+  const state = freshEvidence.length > 0
+    ? 'fresh'
+    : evidence.length > 0
+      ? 'stale'
+      : 'missing';
+  return {
+    protocol,
+    model: normalizedModel,
+    state,
+    verified: freshEvidence.length > 0,
+    fresh_evidence_count: freshEvidence.length,
+    evidence_count: evidence.length,
+    sources: [...new Set(freshEvidence.map((item) => item.source).filter(Boolean))].sort(),
+    latest_checked_at: latest?.checkedAtMs ? new Date(latest.checkedAtMs).toISOString() : '',
+    multiplier: state === 'fresh' ? FRESH_REPRESENTATIVE_EVIDENCE_MULTIPLIER : 1
+  };
 }
 
 async function readJsonBody(req, maxBytes) {
@@ -3329,6 +3353,7 @@ function buildState(config) {
     modelOverride: typeof config.model_override === 'string' ? config.model_override : '',
     representativeTemplates: new Map(),
     recentRequests: [],
+    lastProbeResults: [],
     statsPersistTimer: null
   };
 }
@@ -3515,9 +3540,7 @@ function probeResultPayload(health, expectedModel) {
 }
 
 function representativeSelectionMultiplier(upstream, model, at = now()) {
-  return hasFreshRepresentativeEvidence(upstream, model, 'responses', at, 'representative_probe')
-    ? FRESH_REPRESENTATIVE_EVIDENCE_MULTIPLIER
-    : 1;
+  return representativeAvailability(upstream, { model, protocol: 'responses', at }).multiplier;
 }
 
 function upstreamSelectionWeight(upstream, availability, model = '', at = now()) {
@@ -4149,9 +4172,14 @@ function hasConcreteOutputFromSse(text) {
 
 function shouldCaptureUsageBody(headers = {}) {
   const contentType = String(firstHeader(headers, ['content-type']) || '').toLowerCase();
-  const contentEncoding = String(firstHeader(headers, ['content-encoding']) || '').toLowerCase();
   if (!contentType.includes('json') && !contentType.includes('event-stream')) return false;
-  return !contentEncoding || contentEncoding === 'identity';
+  return true;
+}
+
+function capturedUsageBody(chunks, size, headers = {}) {
+  const contentEncoding = String(firstHeader(headers, ['content-encoding']) || '').toLowerCase();
+  if (!contentEncoding || contentEncoding === 'identity') return Buffer.concat(chunks, size);
+  return Buffer.from(decodeHttpBody(chunks, size, headers), 'utf8');
 }
 
 function createUsageCapture(headers = {}) {
@@ -4170,7 +4198,7 @@ function createUsageCapture(headers = {}) {
       };
       return captured;
     }
-    const body = Buffer.concat(chunks, size);
+    const body = capturedUsageBody(chunks, size, headers);
     const bodyUsage = extractTokenUsageFromBody(body);
     captured = {
       tokens: hasTokenUsage(bodyUsage) ? bodyUsage : extractTokenUsageFromHeaders(headers),
@@ -5556,6 +5584,7 @@ function recordFailure(state, upstream, key, reason, statusCode, retryAfter) {
 
 function realTrafficFailureAuthoritative(statusCode, reason = '') {
   const status = Number(statusCode || 0);
+  if (status === STREAM_ERROR_STATUS) return true;
   if (status === 0 || status === 408 || status === 429 || status === 401 || status === 403) return true;
   if (status >= 521 && status <= 524) return true;
   return /timeout|timed out|network|tls|socket|invalid[_ -]?api[_ -]?key|unauthorized|permission_denied|quota|rate.?limit/i.test(String(reason || ''));
@@ -5580,16 +5609,46 @@ function recordRealTrafficFailure(state, upstream, key, reason, statusCode, retr
   key.failures += 1;
 }
 
-function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
+function recordModelInteractionOutcome({
+  state,
+  upstream,
+  key,
+  statusCode,
+  startedAt,
+  retried = false,
+  succeeded = statusCode >= 200 && statusCode < 400,
+  reason = '',
+  retryAfter,
+  tokenCount = 0,
+  applyFailure = true
+}) {
+  recordResponseStats(upstream, key, statusCode, retried, succeeded);
   recordAttemptOutcome(state, upstream, key, succeeded);
   const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
-  const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
   if (succeeded) {
     recordSuccess(upstream, startedAt, statusCode);
     key.nonAuthoritativeFailures = 0;
-  } else {
+  } else if (applyFailure) {
+    const failureReason = reason || `HTTP ${statusCode}`;
     recordRealTrafficFailure(state, upstream, key, failureReason, statusCode, retryAfter);
   }
+  return recordedTokens;
+}
+
+function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
+  const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
+  const recordedTokens = recordModelInteractionOutcome({
+    state,
+    upstream,
+    key,
+    statusCode,
+    startedAt,
+    retried: false,
+    succeeded,
+    reason: failureReason,
+    retryAfter,
+    tokenCount
+  });
   rememberRequest(state, {
     method,
     path: pathname,
@@ -5660,6 +5719,9 @@ function advancedCurlRequiredProbeError(result) {
   }
   if (code === 'codex_access_restricted' || /codex_access_restricted|请使用最新版的codex客户端或codex cli调用|use latest codex client|please use .*codex.*(?:client|cli)/i.test(body)) {
     return '该上游要求比标准 Curl 更完整的请求形态（例如真实 Codex 客户端上下文、签名或额外头），当前测试请求无法单独验证；请使用匹配上游要求的高级 Curl profile 或真实 Codex 请求转发验证。';
+  }
+  if (/missing .*codex .*context|codex .*context .*required|requires .*codex .*context|真实 codex .*上下文|缺少.*codex.*上下文/i.test(body)) {
+    return '该上游要求真实 Codex 请求上下文。标准 Health Probe 只能做合成验证，不能单独证明该上游不可用；请用真实 Codex 请求转发的响应结果验证可用性。';
   }
   return '';
 }
@@ -5760,7 +5822,15 @@ function modelProbeValidationError(result, protocol) {
 
 function classifyModelProbe(result, protocol, options = {}) {
   const advancedCurlRequiredError = options.representative === true ? '' : advancedCurlRequiredProbeError(result);
-  if (advancedCurlRequiredError) return { state: 'advanced_curl_required', error: advancedCurlRequiredError };
+  if (advancedCurlRequiredError) {
+    return {
+      state: 'advanced_curl_required',
+      outcome: 'non_representative',
+      authoritative: false,
+      representative: false,
+      error: advancedCurlRequiredError
+    };
+  }
   const state = classifyHealth(result.statusCode, result.error);
   if (state !== 'ok') {
     if (options.representative === true) return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
@@ -5786,6 +5856,101 @@ function classifyModelProbe(result, protocol, options = {}) {
   return validationError
     ? { state: 'unexpected_status', outcome: 'authoritative_failure', authoritative: true, representative: options.representative === true, error: validationError }
     : { state: 'ok', outcome: 'ok', authoritative: true, representative: options.representative === true, error: '' };
+}
+
+function probeClassificationError(classified, result, protocol) {
+  if (classified?.error) return classified.error;
+  if (result?.error) return result.error;
+  return `${protocol} probe ${classified?.state || 'unknown'}`;
+}
+
+function probeClassificationIsAuthoritativeFailure(classified) {
+  return classified?.outcome === 'authoritative_failure' || classified?.authoritative === true && classified?.state !== 'ok';
+}
+
+function probeClassificationIsNonRepresentative(classified) {
+  return classified?.outcome === 'non_representative';
+}
+
+function openAiProbeDecision({
+  upstream,
+  probeModel,
+  responsesResult,
+  responsesClassification,
+  chatResult,
+  chatClassification
+}) {
+  const responsesState = responsesClassification?.state || 'unknown';
+  const chatState = chatClassification?.state || 'unknown';
+  if (chatState === 'ok') {
+    return {
+      stateName: 'ok',
+      healthResult: chatResult,
+      healthError: '',
+      healthWarning: `responses probe ${responsesState}; chat_completions probe ok`,
+      resolvedMode: 'chat_completions'
+    };
+  }
+  if (responsesState === 'advanced_curl_required' || responsesState === 'codex_forward_only') {
+    return {
+      stateName: responsesState,
+      healthResult: responsesResult,
+      healthError: probeClassificationError(responsesClassification, responsesResult, 'responses')
+    };
+  }
+  if (shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification)) {
+    return {
+      stateName: 'codex_forward_only',
+      healthResult: responsesResult,
+      healthError: codexForwardOnlyProbeError(responsesClassification, chatClassification)
+    };
+  }
+  if (
+    responsesState === 'models_unsupported' &&
+    probeClassificationIsAuthoritativeFailure(chatClassification) &&
+    chatState !== 'models_unsupported'
+  ) {
+    return {
+      stateName: chatState,
+      healthResult: chatResult,
+      healthError: probeClassificationError(chatClassification, chatResult, 'chat_completions')
+    };
+  }
+  if (probeClassificationIsAuthoritativeFailure(responsesClassification)) {
+    return {
+      stateName: responsesState,
+      healthResult: responsesResult,
+      healthError: probeClassificationError(responsesClassification, responsesResult, 'responses')
+    };
+  }
+  if (probeClassificationIsAuthoritativeFailure(chatClassification)) {
+    return {
+      stateName: chatState,
+      healthResult: chatResult,
+      healthError: probeClassificationError(chatClassification, chatResult, 'chat_completions')
+    };
+  }
+
+  const verifiedRealTrafficProtocol = verifiedRealTrafficProtocolForModel(upstream, probeModel);
+  if (verifiedRealTrafficProtocol) {
+    return {
+      stateName: 'codex_forward_only',
+      healthResult: responsesResult,
+      healthError: `real ${verifiedRealTrafficProtocol} traffic has succeeded for ${probeModel}, but the standard Health Probe is not representative of real Codex traffic: ${codexForwardOnlyProbeError(responsesClassification, chatClassification)}`
+    };
+  }
+  if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only' || probeClassificationIsNonRepresentative(chatClassification)) {
+    return {
+      stateName: chatState,
+      healthResult: chatResult,
+      healthError: probeClassificationError(chatClassification, chatResult, 'chat_completions')
+    };
+  }
+  return {
+    stateName: responsesState === 'inconclusive' ? 'inconclusive' : chatState,
+    healthResult: responsesState === 'inconclusive' ? responsesResult : chatResult,
+    healthError: `${probeClassificationError(responsesClassification, responsesResult, 'responses')}; ${probeClassificationError(chatClassification, chatResult, 'chat_completions')}`
+  };
 }
 
 function shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification) {
@@ -6606,73 +6771,6 @@ function probeResponsesUpstream(upstream, key, config, model) {
   });
 }
 
-function representativeProbePayload(template, model) {
-  const payload = {
-    ...(template?.body || {}),
-    model: String(model || template?.model || '').trim()
-  };
-  payload.input = sanitizedRepresentativeInput(template?.body?.input);
-  payload.instructions = 'Health check: respond with exactly OK.';
-  delete payload.metadata;
-  delete payload.previous_response_id;
-  return payload;
-}
-
-function probeRepresentativeResponsesUpstream(upstream, key, config, model, template) {
-  return new Promise((resolve) => {
-    const timeoutMs = Number(config.health?.timeout_ms || 10000);
-    const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
-    const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
-    const body = Buffer.from(JSON.stringify(representativeProbePayload(template, model)));
-    const headers = buildJsonRequestHeaders(targetUrl, key.value, {
-      ...(template?.headers || {}),
-      ...(upstream.probeHeaders || {})
-    });
-    headers['content-length'] = body.length;
-    const startedAt = now();
-    let settled = false;
-    const chunks = [];
-    let bodySize = 0;
-    let bodyTooLarge = false;
-    const request = requestOptionsForTarget(targetUrl, 'POST', headers, timeoutMs, upstream.proxyUrl);
-
-    const finish = (statusCode, responseHeaders = {}, error = '') => {
-      if (settled) return;
-      settled = true;
-      const responseBody = bodyTooLarge ? '' : decodeHttpBody(chunks, bodySize, responseHeaders);
-      resolve(probeResult(
-        statusCode || 0,
-        now() - startedAt,
-        responseBody,
-        bodyTooLarge ? 'response body too large' : error,
-        responseHeaders['retry-after'],
-        responseHeaders
-      ));
-    };
-
-    const probeReq = request.client.request(request.target, request.options, (probeRes) => {
-      probeRes.on('data', (chunk) => {
-        if (bodyTooLarge) return;
-        bodySize += chunk.length;
-        if (bodySize > 128 * 1024) {
-          bodyTooLarge = true;
-          chunks.length = 0;
-          bodySize = 0;
-          return;
-        }
-        chunks.push(chunk);
-      });
-      probeRes.on('end', () => finish(probeRes.statusCode || 0, probeRes.headers));
-      probeRes.on('error', (error) => finish(probeRes.statusCode || 0, probeRes.headers, error.message));
-    });
-    probeReq.on('timeout', () => {
-      probeReq.destroy(new Error(`timeout after ${timeoutMs}ms`));
-    });
-    probeReq.on('error', (error) => finish(0, {}, error.message));
-    probeReq.end(body);
-  });
-}
-
 function probeAnthropicUpstream(upstream, key, config, model) {
   return new Promise((resolve) => {
     const timeoutMs = Number(config.health?.timeout_ms || 10000);
@@ -7202,7 +7300,9 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
         recordFailure(state, upstream, key, error || `health ${stateName}`, result.statusCode, result.retryAfter);
       }
     }
-    return upstream.health;
+    return stateName === 'ok' || !result
+      ? upstream.health
+      : { ...upstream.health, upstream_result: probeUpstreamResultPayload(result) };
   }
 
   // ── Real model request as primary health check ──
@@ -7238,108 +7338,46 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
       healthError = classified.error || chatResult.error;
       if (stateName === 'ok') resolvedMode = 'chat_completions';
     } else {
-      const representativeTemplate = options.live === true
-        ? freshRepresentativeTemplate(state, 'responses', 'codex_desktop')
-        : null;
-      if (representativeTemplate) {
-        const representativeModel = probeModel || representativeTemplate.model;
-        const representativeResult = await probeRepresentativeResponsesUpstream(upstream, key, config, representativeModel, representativeTemplate);
-        applyQuota(upstream, key, representativeResult.headers || {});
-        const representativeClassification = classifyModelProbe(representativeResult, 'responses', { representative: true });
-        recordProtocolCapabilityProbe(upstream, 'responses', representativeResult, representativeClassification, {
-          checkedAt,
-          model: representativeModel,
-          probeType: 'representative_model_request',
-          representative: true
-        });
-        stateName = representativeClassification.state;
-        healthResult = representativeResult;
-        healthError = representativeClassification.error || representativeResult.error;
-        healthWarning = 'checked by representative Codex Desktop request template';
-        healthSource = 'representative_probe';
-        if (representativeClassification.state === 'ok') {
-          stateName = 'ok';
-          healthError = '';
-          healthWarning = 'verified by representative Codex Desktop request template';
-          resolvedMode = 'responses';
-          recordRepresentativeSuccessEvidence(key, 'responses', {
-            model: representativeModel,
-            source: 'representative_probe',
-            checkedAt,
-            httpStatus: representativeResult.statusCode
-          });
-        }
-      }
-
       // Try /v1/responses first
-      if (!healthResult) {
-        const responsesResult = await probeResponsesUpstream(upstream, key, config, probeModel);
-        applyQuota(upstream, key, responsesResult.headers || {});
-        const responsesClassification = classifyModelProbe(responsesResult, 'responses');
-        recordProtocolCapabilityProbe(upstream, 'responses', responsesResult, responsesClassification, { checkedAt, model: probeModel });
-        const responsesState = responsesClassification.state;
+      const responsesResult = await probeResponsesUpstream(upstream, key, config, probeModel);
+      applyQuota(upstream, key, responsesResult.headers || {});
+      const responsesClassification = classifyModelProbe(responsesResult, 'responses');
+      recordProtocolCapabilityProbe(upstream, 'responses', responsesResult, responsesClassification, { checkedAt, model: probeModel });
+      const responsesState = responsesClassification.state;
 
-        if (responsesState === 'ok') {
+      if (responsesState === 'ok') {
+        stateName = 'ok';
+        healthResult = responsesResult;
+        healthError = '';
+        resolvedMode = 'responses';
+      } else {
+        // /responses failed → try /v1/chat/completions as fallback
+        const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
+        applyQuota(upstream, key, chatResult.headers || {});
+        const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
+        recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: probeModel });
+        const chatState = chatClassification.state;
+
+        if (chatState === 'ok') {
           stateName = 'ok';
-          healthResult = responsesResult;
+          healthResult = chatResult;
           healthError = '';
-          resolvedMode = 'responses';
+          healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
+          resolvedMode = 'chat_completions';
         } else {
-          // /responses failed → try /v1/chat/completions as fallback
-          const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
-          applyQuota(upstream, key, chatResult.headers || {});
-          const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
-          recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: probeModel });
-          const chatState = chatClassification.state;
-
-          if (chatState === 'ok') {
-            stateName = 'ok';
-            healthResult = chatResult;
-            healthError = '';
-            healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
-            resolvedMode = 'chat_completions';
-          } else {
-            if (responsesState === 'advanced_curl_required' || responsesState === 'codex_forward_only') {
-              stateName = responsesState;
-              healthResult = responsesResult;
-              healthError = responsesClassification.error;
-            } else if (shouldKeepNativeResponsesProbeDispatchable(upstream, responsesClassification)) {
-              stateName = 'codex_forward_only';
-              healthResult = responsesResult;
-              healthError = codexForwardOnlyProbeError(responsesClassification, chatClassification);
-            } else if (
-              responsesState === 'models_unsupported' &&
-              chatClassification.authoritative === true &&
-              chatState !== 'models_unsupported'
-            ) {
-              stateName = chatState;
-              healthResult = chatResult;
-              healthError = chatClassification.error || chatResult.error || `chat_completions probe ${chatState}`;
-            } else if (responsesClassification.authoritative === true) {
-              stateName = responsesState;
-              healthResult = responsesResult;
-              healthError = responsesClassification.error || responsesResult.error || `responses probe ${responsesState}`;
-            } else if (chatClassification.authoritative === true) {
-              stateName = chatState;
-              healthResult = chatResult;
-              healthError = chatClassification.error || chatResult.error || `chat_completions probe ${chatState}`;
-            } else {
-              const verifiedRealTrafficProtocol = verifiedRealTrafficProtocolForModel(upstream, probeModel);
-              if (verifiedRealTrafficProtocol) {
-                stateName = 'codex_forward_only';
-                healthResult = responsesResult;
-                healthError = `real ${verifiedRealTrafficProtocol} traffic has succeeded for ${probeModel}, but the standard Health Probe is not representative of real Codex traffic: ${codexForwardOnlyProbeError(responsesClassification, chatClassification)}`;
-              } else if (chatState === 'advanced_curl_required' || chatState === 'codex_forward_only') {
-                stateName = chatState;
-                healthResult = chatResult;
-                healthError = chatClassification.error;
-              } else {
-                stateName = responsesState === 'inconclusive' ? 'inconclusive' : chatState;
-                healthResult = responsesState === 'inconclusive' ? responsesResult : chatResult;
-                healthError = `${responsesClassification.error || `responses probe ${responsesState}`}; ${chatClassification.error || `chat probe ${chatState}`}`;
-              }
-            }
-          }
+          const decision = openAiProbeDecision({
+            upstream,
+            probeModel,
+            responsesResult,
+            responsesClassification,
+            chatResult,
+            chatClassification
+          });
+          stateName = decision.stateName;
+          healthResult = decision.healthResult;
+          healthError = decision.healthError;
+          healthWarning = decision.healthWarning || healthWarning;
+          resolvedMode = decision.resolvedMode || resolvedMode;
         }
       }
     }
@@ -7409,17 +7447,21 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     probeModel
   };
 
+  const returnedHealth = stateName === 'ok'
+    ? upstream.health
+    : { ...upstream.health, upstream_result: probeUpstreamResultPayload(healthResult) };
+
   if (stateName === 'ok' || stateName === 'models_unsupported' || stateName === 'unexpected_status' || stateName === 'advanced_curl_required' || stateName === 'codex_forward_only') {
     upstream.lastError = '';
     upstream.lastStatus = healthResult.statusCode;
-    return upstream.health;
+    return returnedHealth;
   }
 
   if (stateName === 'auth_error' || stateName === 'rate_limited' || stateName === 'server_error' || stateName === 'network_error' || stateName === 'timeout') {
     recordFailure(state, upstream, key, healthError || `health ${stateName}`, healthResult.statusCode, healthResult.retryAfter);
   }
 
-  return upstream.health;
+  return returnedHealth;
 }
 
 function hasClaudeModel(models) {
@@ -7642,22 +7684,30 @@ async function runHealthChecks(state, config, logger = console, probeOptions = {
         state.pendingLiveProbePromise = pendingLiveProbePromise;
       }
       await state.pendingLiveProbePromise;
-      return;
+      return state.lastProbeResults || [];
     }
     await state.probingPromise.catch(() => {});
-    return;
+    return state.lastProbeResults || [];
   }
+  const probeResults = [];
   const probingPromise = (async () => {
     const concurrency = Math.max(1, Number(config.health?.concurrency || 4));
-    await mapWithConcurrency(state.upstreams.filter((upstream) => upstream.enabled), concurrency, (upstream) => probeOneUpstream(state, upstream, config, probeOptions));
+    await mapWithConcurrency(state.upstreams.filter((upstream) => upstream.enabled), concurrency, async (upstream) => {
+      const health = await probeOneUpstream(state, upstream, config, probeOptions);
+      probeResults.push({ upstream: upstream.name, health });
+    });
   })();
   state.probingPromise = probingPromise;
   state.probing = true;
   state.probingLive = live;
   try {
     await probingPromise;
+    state.lastProbeResults = probeResults;
+    return probeResults;
   } catch (error) {
     logger.warn?.(`[health] ${error.message}`);
+    state.lastProbeResults = probeResults;
+    return probeResults;
   } finally {
     if (state.probingPromise === probingPromise) {
       state.probingPromise = null;
@@ -8243,6 +8293,7 @@ function dashboardHtml() {
     let upstreamCache = new Map();
     let cardsSignature = '';
     let modelOptionsSignature = '';
+    let latestStatus = null;
     let adminToken = localStorage.getItem('codexPoolAdminToken') || '';
     let signinFilter = localStorage.getItem('codexPoolSigninFilter') || 'all';
     let latestProbeResult = null;
@@ -8904,6 +8955,11 @@ function dashboardHtml() {
           <div class="availability-samples" data-field="availability_history" aria-hidden="true">\${dots}</div>
         </div>\`;
     }
+    function representativeTemplateLabel(data) {
+      const template = data?.representative_templates?.responses?.codex_desktop;
+      if (!template) return 'missing';
+      return template.fresh ? 'fresh' : 'stale';
+    }
     const upstreamSupportsModel = (upstream, model) => {
       if (!model) return true;
       const models = upstream.health?.models || [];
@@ -9072,6 +9128,7 @@ function dashboardHtml() {
       setText(card, '[data-field="http"]', fmt(upstream.health?.http_status));
       setText(card, '[data-field="latency"]', fmt(upstream.health?.latency_ms, 'ms'));
       setText(card, '[data-field="models_count"]', fmt(upstream.health?.models_count));
+      setText(card, '[data-field="representative_template"]', representativeTemplateLabel(latestStatus));
       setText(card, '[data-field="cooldown"]', \`\${Math.ceil((upstream.cooldown_ms || 0) / 1000)}s\`);
       setText(card, '[data-field="weight"]', upstream.weight);
       setText(card, '[data-field="selection_weight"]', fmt(upstream.selection_weight));
@@ -9309,6 +9366,7 @@ function dashboardHtml() {
         return;
       }
       const data = await response.json();
+      latestStatus = data;
       const knownModels = data.model?.known || [];
       const activeModel = data.model?.override || '';
       const allUps = sortedUpstreams(data.upstreams || [], activeModel);
@@ -9365,6 +9423,7 @@ function dashboardHtml() {
             <div class="mini-line">Weight <strong data-field="weight">\${u.weight}</strong> -> <strong data-field="selection_weight">\${fmt(u.selection_weight)}</strong> · Score <strong data-field="selection_score">\${fmt(u.selection_score)}</strong></div>
             \${availabilityHtml(u)}
             <div class="mini-line">Models <strong data-field="models_count">\${fmt(u.health?.models_count)}</strong> · Active <strong>\${activeModel ? esc(activeModel) : 'Following request'}</strong></div>
+            <div class="mini-line">Codex Desktop Template <strong data-field="representative_template">\${representativeTemplateLabel(data)}</strong></div>
             <div class="mini-line">Cooldown <strong data-field="cooldown">\${Math.ceil((u.cooldown_ms || 0) / 1000)}s</strong></div>
             <div class="mini-line">Failures <strong data-field="failures">\${u.failures}</strong></div>
           </div>
@@ -9837,6 +9896,98 @@ function knownModels(state) {
     .sort((a, b) => a.localeCompare(b));
 }
 
+function createKeyStatusView(key, state, at) {
+  return {
+    label: key.label,
+    source: key.source,
+    configured: Boolean(key.value),
+    cooldown_ms: Math.max(0, key.cooldownUntil - at),
+    failures: key.failures,
+    stats: key.stats,
+    availability: availabilitySummary(key.stats, state.availability),
+    quota: key.quota,
+    representative_evidence: representativeEvidencePayload(key.representativeEvidence || {}, at),
+    health: {
+      state: key.health.state,
+      source: key.health.source || '',
+      checked_at: key.health.checkedAt,
+      latency_ms: key.health.latencyMs,
+      http_status: key.health.httpStatus,
+      error: key.health.error,
+      warning: key.health.warning || ''
+    }
+  };
+}
+
+function createUpstreamStatusView(upstream, config, state, at, today) {
+  const availability = availabilitySummary(upstream.stats, state.availability);
+  const available = upstreamAvailable(upstream, at, state.modelOverride);
+  const selectionWeight = upstreamSelectionWeight(upstream, availability, state.modelOverride, at);
+  const effectiveHealthState = healthProbeEffectiveState(upstream.health, state.modelOverride);
+  return {
+    name: upstream.name,
+    base_url: upstream.baseUrl,
+    site_url: upstream.siteUrl,
+    signin_available: upstream.signinAvailable,
+    signin_status: signinStatus(upstream.signinAvailable, upstream.signinCompletedDate, today),
+    signin_completed: upstream.signinAvailable && upstream.signinCompletedDate === today,
+    signin_completed_date: visibleSigninCompletedDate(upstream.signinAvailable, upstream.signinCompletedDate, today),
+    proxy_url: upstream.proxyUrl || undefined,
+    codex_oauth: upstream.codexOAuth,
+    request_mode: upstream.requestMode,
+    resolved_request_mode: upstream.resolvedRequestMode || undefined,
+    oauth_expires_at: upstream.oauthExpiresAt || undefined,
+    oauth_client_id: upstream.oauthClientId || undefined,
+    oauth_email: upstream.oauthEmail || undefined,
+    oauth_plan_type: upstream.oauthPlanType || undefined,
+    chatgpt_account_id: upstream.chatGptAccountId || undefined,
+    chatgpt_user_id: upstream.chatGptUserId || undefined,
+    organization_id: upstream.organizationId || undefined,
+    health_path: upstream.healthPath || config.health?.path || '/models',
+    probe_auth: upstream.probeAuth,
+    api: upstream.api,
+    capabilities: normalizeProtocolCapabilities(upstream.capabilities),
+    enabled: upstream.enabled,
+    weight: upstream.weight,
+    selection_weight: roundedSelectionValue(selectionWeight),
+    selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, at)) : 0,
+    representative_availability: representativeAvailability(upstream, {
+      model: state.modelOverride,
+      protocol: 'responses',
+      at
+    }),
+    available,
+    cooldown_ms: Math.max(0, upstream.cooldownUntil - at),
+    in_flight: upstream.inFlight,
+    successes: upstream.successes,
+    failures: upstream.failures,
+    ewma_latency_ms: upstream.ewmaLatencyMs,
+    last_status: upstream.lastStatus,
+    last_error: upstream.lastError,
+    stats: upstream.stats,
+    availability,
+    usage: usagePayload(upstream.stats, today),
+    quota: upstream.quota,
+    billing: billingPayload(upstream.billing, upstream.billingConfig),
+    health: {
+      state: effectiveHealthState,
+      raw_state: upstream.health.state,
+      source: upstream.health.source || '',
+      checked_at: upstream.health.checkedAt,
+      latency_ms: upstream.health.latencyMs,
+      http_status: upstream.health.httpStatus,
+      error: healthProbeEffectiveError(upstream.health, state.modelOverride),
+      warning: upstream.health.warning || '',
+      diagnostics: upstream.health.diagnostics || undefined,
+      probe_model: upstream.health.probeModel || '',
+      models: upstream.health.models || [],
+      models_count: upstream.health.modelsCount,
+      key_label: upstream.health.keyLabel
+    },
+    keys: upstream.keys.map((key) => createKeyStatusView(key, state, at))
+  };
+}
+
 function createStatusPayload(config, state) {
   const at = now();
   const today = localDateKey(at);
@@ -9857,6 +10008,7 @@ function createStatusPayload(config, state) {
         }
       }
     },
+    representative_templates: representativeTemplatesPayload(state, at),
     recent_requests: config.debug?.capture_request_headers === true
       ? state.recentRequests
       : stripRequestDebugFields(state.recentRequests),
@@ -9875,88 +10027,7 @@ function createStatusPayload(config, state) {
     },
     usage: aggregateUsage(state.upstreams, today),
     billing: aggregateBilling(state.upstreams),
-    upstreams: state.upstreams.map((upstream) => {
-      const availability = availabilitySummary(upstream.stats, state.availability);
-      const available = upstreamAvailable(upstream, at, state.modelOverride);
-      const selectionWeight = upstreamSelectionWeight(upstream, availability, state.modelOverride, at);
-      const effectiveHealthState = healthProbeEffectiveState(upstream.health, state.modelOverride);
-      return {
-        name: upstream.name,
-        base_url: upstream.baseUrl,
-        site_url: upstream.siteUrl,
-        signin_available: upstream.signinAvailable,
-        signin_status: signinStatus(upstream.signinAvailable, upstream.signinCompletedDate, today),
-        signin_completed: upstream.signinAvailable && upstream.signinCompletedDate === today,
-        signin_completed_date: visibleSigninCompletedDate(upstream.signinAvailable, upstream.signinCompletedDate, today),
-        proxy_url: upstream.proxyUrl || undefined,
-        codex_oauth: upstream.codexOAuth,
-        request_mode: upstream.requestMode,
-        resolved_request_mode: upstream.resolvedRequestMode || undefined,
-        oauth_expires_at: upstream.oauthExpiresAt || undefined,
-        oauth_client_id: upstream.oauthClientId || undefined,
-        oauth_email: upstream.oauthEmail || undefined,
-        oauth_plan_type: upstream.oauthPlanType || undefined,
-        chatgpt_account_id: upstream.chatGptAccountId || undefined,
-        chatgpt_user_id: upstream.chatGptUserId || undefined,
-        organization_id: upstream.organizationId || undefined,
-        health_path: upstream.healthPath || config.health?.path || '/models',
-        probe_auth: upstream.probeAuth,
-        api: upstream.api,
-        capabilities: normalizeProtocolCapabilities(upstream.capabilities),
-        enabled: upstream.enabled,
-        weight: upstream.weight,
-        selection_weight: roundedSelectionValue(selectionWeight),
-        selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, at)) : 0,
-        available,
-        cooldown_ms: Math.max(0, upstream.cooldownUntil - at),
-        in_flight: upstream.inFlight,
-        successes: upstream.successes,
-        failures: upstream.failures,
-        ewma_latency_ms: upstream.ewmaLatencyMs,
-        last_status: upstream.lastStatus,
-        last_error: upstream.lastError,
-        stats: upstream.stats,
-        availability,
-        usage: usagePayload(upstream.stats, today),
-        quota: upstream.quota,
-        billing: billingPayload(upstream.billing, upstream.billingConfig),
-        health: {
-          state: effectiveHealthState,
-          raw_state: upstream.health.state,
-          source: upstream.health.source || '',
-          checked_at: upstream.health.checkedAt,
-          latency_ms: upstream.health.latencyMs,
-          http_status: upstream.health.httpStatus,
-          error: healthProbeEffectiveError(upstream.health, state.modelOverride),
-          warning: upstream.health.warning || '',
-          diagnostics: upstream.health.diagnostics || undefined,
-          probe_model: upstream.health.probeModel || '',
-          models: upstream.health.models || [],
-          models_count: upstream.health.modelsCount,
-          key_label: upstream.health.keyLabel
-        },
-        keys: upstream.keys.map((key) => ({
-          label: key.label,
-          source: key.source,
-          configured: Boolean(key.value),
-          cooldown_ms: Math.max(0, key.cooldownUntil - at),
-          failures: key.failures,
-          stats: key.stats,
-          availability: availabilitySummary(key.stats, state.availability),
-          quota: key.quota,
-          representative_evidence: representativeEvidencePayload(key.representativeEvidence || {}, at),
-          health: {
-            state: key.health.state,
-            source: key.health.source || '',
-            checked_at: key.health.checkedAt,
-            latency_ms: key.health.latencyMs,
-            http_status: key.health.httpStatus,
-            error: key.health.error,
-            warning: key.health.warning || ''
-          }
-        }))
-      };
-    })
+    upstreams: state.upstreams.map((upstream) => createUpstreamStatusView(upstream, config, state, at, today))
   };
 }
 
@@ -10622,7 +10693,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
   }
 
   if (req.method === 'POST' && pathname === '/pool/probe') {
-    await runHealthChecks(state, config, console, { live: true });
+    const probeResults = await runHealthChecks(state, config, console, { live: true });
     persistStats(state, statsPath);
     const summary = healthProbeSummary(state.upstreams, state.modelOverride);
     return jsonResponse(res, 200, {
@@ -10630,6 +10701,7 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
       probe_ok: summary.probe_ok,
       probe_status: summary.probe_status,
       summary,
+      probe_results: probeResults,
       result: createStatusPayload(config, state)
     });
   }
@@ -11204,28 +11276,9 @@ export function createPoolServer(config, options = {}) {
             method: requestMethod,
             headers: requestHeadersForAttempt
           });
-          if (result.type === 'response' && result.statusCode >= 200 && result.statusCode < 300) {
-            upstream.resolvedRequestMode = 'chat_completions';
-            upstream.cooldownUntil = 0;
-            upstream.failures = 0;
-            key.cooldownUntil = 0;
-            key.failures = 0;
-          }
         }
 
-
-
-
         if (result.type === 'response') {
-          if (
-            canUseChatAdapter &&
-            !useChatCompletionsAdapter &&
-            upstream.requestMode === 'auto' &&
-            result.statusCode >= 200 &&
-            result.statusCode < 300
-          ) {
-            upstream.resolvedRequestMode = 'responses';
-          }
           applyQuota(upstream, key, result.response.headers);
           const usageCapture = createUsageCapture(result.response.headers);
           const isSuccessfulAnthropicAdapter = useAnthropicAdapter && result.statusCode >= 200 && result.statusCode < 300;
@@ -11296,9 +11349,16 @@ export function createPoolServer(config, options = {}) {
               return;
             }
             if (modelInteractionRequest) {
-              recordResponseStats(upstream, key, STREAM_ERROR_STATUS, false, false);
-              recordAttemptOutcome(state, upstream, key, false);
-              recordFailure(state, upstream, key, reason, STREAM_ERROR_STATUS, undefined);
+              recordModelInteractionOutcome({
+                state,
+                upstream,
+                key,
+                statusCode: STREAM_ERROR_STATUS,
+                startedAt: result.startedAt,
+                retried: attempt > 1,
+                succeeded: false,
+                reason
+              });
               rememberRequest(state, {
                 method: req.method,
                 path: pathname,
@@ -11358,6 +11418,13 @@ export function createPoolServer(config, options = {}) {
                     ? 'responses'
                     : '';
               if (protocol) {
+                if (upstream.requestMode === 'auto' && (protocol === 'chat_completions' || protocol === 'responses')) {
+                  upstream.resolvedRequestMode = protocol;
+                }
+                upstream.cooldownUntil = 0;
+                upstream.failures = 0;
+                key.cooldownUntil = 0;
+                key.failures = 0;
                 const checkedAt = new Date().toISOString();
                 recordProtocolCapabilityRealTraffic(upstream, protocol, {
                   checkedAt,
@@ -11379,7 +11446,6 @@ export function createPoolServer(config, options = {}) {
                 ? `HTTP ${result.statusCode} with output tokens 0`
                 : `HTTP ${result.statusCode} without concrete output`;
             if (modelInteractionRequest) {
-              recordResponseStats(upstream, key, result.statusCode, false, responseSucceeded);
               finishResponseAttempt({
                 state,
                 upstream,
@@ -11418,15 +11484,22 @@ export function createPoolServer(config, options = {}) {
         }
 
         applyQuota(upstream, key, result.headers || {});
+        const nativeResponsesUnsupported = activeRequiresNativeResponses && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(result.statusCode);
         if (modelInteractionRequest) {
-          recordResponseStats(upstream, key, result.statusCode, true, false);
-          recordAttemptOutcome(state, upstream, key, false);
+          recordModelInteractionOutcome({
+            state,
+            upstream,
+            key,
+            statusCode: result.statusCode,
+            startedAt: result.startedAt,
+            retried: true,
+            succeeded: false,
+            reason: result.reason,
+            retryAfter: result.retryAfter,
+            applyFailure: !nativeResponsesUnsupported
+          });
         }
         persistStats(state, statsPath);
-        const nativeResponsesUnsupported = activeRequiresNativeResponses && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(result.statusCode);
-        if (modelInteractionRequest && !nativeResponsesUnsupported) {
-          recordRealTrafficFailure(state, upstream, key, result.reason, result.statusCode, result.retryAfter);
-        }
         if (modelInteractionRequest) {
           rememberRequest(state, {
             method: req.method,

@@ -60,6 +60,14 @@ _Avoid_: stream retry, resume, continuation
 A Model Interaction Request path where the API Pool can forward a Responses request to an Upstream without translating it to another model API family. A Native Responses Route preserves Responses-only Features.
 _Avoid_: native model, original model, full model
 
+**Request Interface**:
+The model API family that current evidence says an Upstream can successfully serve for a Requested Model, such as Responses, Chat Completions, Anthropic Messages, or Codex OAuth Responses. Once learned, it guides later Model Interaction Requests so the API Pool keeps using the interface that has been proven for that Upstream until stronger evidence changes it.
+_Avoid_: endpoint guess, route preference, protocol hint
+
+**Forwarding Strategy**:
+The learned way the API Pool sends future Model Interaction Requests for the same Upstream and Requested Model after real traffic succeeds, such as Native Responses, Chat Completions, or Chat Completions with Adapter Compatibility Mode.
+_Avoid_: permanent model setting, global routing mode, provider type
+
 **Responses-only Feature**:
 A request feature that belongs to the Responses API shape and cannot be represented losslessly by a non-native adapter such as Chat Completions or Anthropic Messages.
 _Avoid_: native tool call, unsupported tool, extra field
@@ -107,6 +115,10 @@ _Avoid_: reusable template field, permanent credential, upstream key
 **Representative Availability**:
 A derived, non-persistent interpretation of recent real Codex success evidence for an Upstream, scoped by protocol and model. It reports whether evidence is fresh, stale, or missing, and may apply bounded Selection weighting without becoming a hard allowlist.
 _Avoid_: whitelist, permanent health, model list availability
+
+**Verification Tier**:
+The Management Dashboard grouping that communicates the evidence level behind an Upstream's current usability: recently proven by real Codex traffic, proven only by first-layer probe evidence, or not currently verified as usable by either evidence layer.
+_Avoid_: availability category, status group, priority queue
 
 **Authoritative Probe Failure**:
 A probe result with enough evidence to mark an Upstream or Upstream Key unavailable for Selection, such as authentication failure, rate limiting, network failure, or a clearly unsupported model/API. Non-representative and inconclusive probe results are not Authoritative Probe Failures.

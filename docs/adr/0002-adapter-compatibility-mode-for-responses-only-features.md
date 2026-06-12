@@ -4,6 +4,10 @@ Codex may include Responses-only Features in every Responses request even when t
 
 The API Pool will support an opt-in Adapter Compatibility Mode. When a Responses request contains Responses-only Features and no Native Responses Route candidate is available, the pool may apply documented Compatibility Conversion, Compatibility Downgrade, and only then Compatibility Stripping before routing the request through a non-native adapter such as Chat Completions or Anthropic Messages.
 
+An Upstream whose learned Request Interface is Chat Completions is not a Native Responses Route candidate. If Adapter Compatibility Mode is enabled, compatible Responses requests should continue through the learned Chat Completions interface instead of re-probing `/v1/responses` with native-only request shapes.
+
+If a Native Responses Route attempt fails for a Responses-shaped request, an OpenAI-compatible Upstream in automatic mode may retry the same request through Chat Completions. When the request contains Responses-only Features, that Chat retry uses Adapter Compatibility Mode if it is enabled, reports the conversion/downgrade/stripping diagnostics, and learns a per-Upstream/per-Requested-Model Forwarding Strategy only after the real Chat response succeeds.
+
 Compatibility decisions must be explicit in diagnostics. The pool must report which tool types, input item types, content types, output formats, or fields were converted, downgraded, or removed in response headers, Recent Request Timeline entries, and Management Dashboard surfaces. It must not remove user content or mandatory tool intent when an official target field exists, and it must not run before checking for a Native Responses Route candidate.
 
 Docs-backed mappings:

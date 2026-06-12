@@ -28,6 +28,10 @@ Repeated non-authoritative failures from real Codex traffic may trigger a short 
 
 Synthetic Health Probe success and real Codex traffic success can both produce an `ok` Health State, but the Management Dashboard and Selection diagnostics must keep their sources distinguishable. Synthetic success proves only the synthetic request shape; real Codex success refreshes representative evidence.
 
+Successful probe or real traffic evidence can also learn an Upstream's Request Interface. Once the learned interface is Chat Completions, future Responses-shaped Codex traffic should prefer the Chat Completions adapter for that Upstream rather than repeatedly trying Native Responses first. This is a protocol routing preference, not an Authoritative Probe Failure for Responses.
+
+Real successful model traffic can additionally learn a Forwarding Strategy scoped to `Upstream + Requested Model`. Later requests for the same pair should use that strategy directly, such as Native Responses, Chat Completions, or Chat Completions with Adapter Compatibility Mode, until a later successful strategy supersedes it.
+
 Synthetic Health Probes choose their target model from the current Model Override. Model listing must not be used to infer availability or choose a supposedly usable model for the probe; `/models` remains model discovery and display evidence only.
 
 Synthetic Health Probe success requires a valid model response shape, not merely HTTP success. For Responses protocol probes, success requires HTTP `2xx` plus Responses output evidence such as `output_text`, a non-empty `output` array, or streaming `response.output_*` events, and must not be an explicit zero-output result. A target-protocol `2xx` response without valid output is an Authoritative Probe Failure for invalid output shape for that synthetic shape.

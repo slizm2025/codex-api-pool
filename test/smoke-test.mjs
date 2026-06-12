@@ -629,6 +629,54 @@ const cachedChatThenNative = createFakeUpstream('cached-chat-then-native', ({ re
   res.end(JSON.stringify({ error: 'not found' }));
 });
 
+let nativeFeatureBlockedResponsesHits = 0;
+let nativeFeatureBlockedChatHits = 0;
+const nativeFeatureBlocked = createFakeUpstream('native-feature-blocked', ({ req, res, body }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  if (req.url.endsWith('/responses')) {
+    nativeFeatureBlockedResponsesHits += 1;
+    const payload = JSON.parse(body || '{}');
+    if (Array.isArray(payload.tools) && payload.tools.some((tool) => tool?.type === 'image_generation')) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Image generation is not enabled for this group', type: 'permission_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'resp_native_feature_ok',
+      object: 'response',
+      output_text: 'native-ok',
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }
+    }));
+    return;
+  }
+  if (req.url.endsWith('/chat/completions')) {
+    nativeFeatureBlockedChatHits += 1;
+    const payload = JSON.parse(body || '{}');
+    if (Array.isArray(payload.tools) && payload.tools.some((tool) => tool?.type === 'image_generation')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'image_generation must be stripped before chat fallback', payload }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-native-feature-blocked',
+      object: 'chat.completion',
+      created: 1,
+      model: payload.model,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'chat-lossy-ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
 let anthropicMessagesHits = 0;
 const anthropicMessages = createFakeUpstream('anthropic-messages', ({ req, res, body }) => {
   if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
@@ -898,19 +946,50 @@ const nextModelSite = createFakeUpstream('next-model-site', ({ req, res, body })
   res.end(JSON.stringify({ ok: true, id: 'resp_next_model', object: 'response', output_text: 'ok', body: JSON.parse(body) }));
 });
 
-const anthropicModels = createFakeUpstream('anthropic-models', ({ req, res }) => {
+let recoveringRawchatHealthy = false;
+let recoveringRawchatResponsesHits = 0;
+const recoveringRawchat = createFakeUpstream('recovering-rawchat', ({ req, res, body }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+    return;
+  }
+  if (!recoveringRawchatHealthy) {
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' });
+    res.end(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'rawchat temporarily unavailable' } }));
+    return;
+  }
+  recoveringRawchatResponsesHits += 1;
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    id: 'resp_recovering_rawchat',
+    object: 'response',
+    output_text: 'ok',
+    output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+    body: JSON.parse(body),
+    usage: { input_tokens: 1, output_tokens: 1 }
+  }));
+});
+
+const anthropicModels = createFakeUpstream('anthropic-models', ({ req, res, body }) => {
   if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ data: [{ id: 'claude-sonnet-test' }] }));
     return;
   }
   if (req.url === '/v1/messages' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
+    const payload = JSON.parse(body || '{}');
+    if (payload.model !== 'claude-sonnet-test') {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'expected anthropic probe to use model override', payload }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       id: 'msg_anthropic_probe',
       type: 'message',
       role: 'assistant',
-      model: 'claude-sonnet-test',
+      model: payload.model,
       content: [{ type: 'text', text: 'ok' }],
       usage: { input_tokens: 1, output_tokens: 1 }
     }));
@@ -1053,6 +1132,7 @@ const chatChoicesEmptyInfo = await listen(chatChoicesEmpty);
 const anthropicContentEmptyInfo = await listen(anthropicContentEmpty);
 const chatOnlyInfo = await listen(chatOnly);
 const cachedChatThenNativeInfo = await listen(cachedChatThenNative);
+const nativeFeatureBlockedInfo = await listen(nativeFeatureBlocked);
 const anthropicMessagesInfo = await listen(anthropicMessages);
 const billingInfo = await listen(billingUpstream);
 const billingHugeLimitInfo = await listen(billingHugeLimitUpstream);
@@ -1061,6 +1141,7 @@ const billingLoginHtmlInfo = await listen(billingLoginHtmlUpstream);
 const cloudflareTimeoutInfo = await listen(cloudflareTimeout);
 const streamAbortInfo = await listen(streamAbort);
 const nextModelSiteInfo = await listen(nextModelSite);
+const recoveringRawchatInfo = await listen(recoveringRawchat);
 const anthropicModelsInfo = await listen(anthropicModels);
 const dualProtocolModelsInfo = await listen(dualProtocolModels);
 const codexOauthBackendInfo = await listen(codexOauthBackend);
@@ -1819,6 +1900,14 @@ try {
   });
   const nativeUnsupportedToolPoolInfo = await listen(nativeUnsupportedToolPool);
   try {
+    const beforeStatus = (await getJson(`${nativeUnsupportedToolPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const beforeSite = beforeStatus.upstreams.find((upstream) => upstream.name === 'native-responses');
+    if (
+      beforeSite?.request_interface?.type !== 'pending' ||
+      beforeSite?.request_interface?.label !== 'Pending Verification'
+    ) {
+      throw new Error(`expected configured native Responses upstream not to claim a request interface before successful traffic: ${JSON.stringify(beforeSite?.request_interface)}`);
+    }
     const unsupportedToolBody = JSON.stringify({
       model: 'test-model',
       input: 'search the web',
@@ -1844,6 +1933,15 @@ try {
       json.body?.metadata?.keep_unknown_tool_test !== true
     ) {
       throw new Error(`expected native Responses upstream to receive unsupported tool fields intact: ${response.status} ${text}`);
+    }
+    const afterStatus = (await getJson(`${nativeUnsupportedToolPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const afterSite = afterStatus.upstreams.find((upstream) => upstream.name === 'native-responses');
+    if (
+      afterSite?.request_interface?.type !== 'responses' ||
+      afterSite?.request_interface?.source !== 'real_traffic' ||
+      afterSite?.request_interface?.path !== '/v1/responses'
+    ) {
+      throw new Error(`expected successful native Responses traffic to determine the request interface: ${JSON.stringify(afterSite?.request_interface)}`);
     }
   } finally {
     await close(nativeUnsupportedToolPool);
@@ -2346,75 +2444,35 @@ try {
     });
     const nativeToolsText = await nativeToolsResponse.text();
     const nativeToolsJson = JSON.parse(nativeToolsText);
-    const forwardedToolTypes = nativeToolsJson.body?.tools?.map((tool) => tool?.type);
     if (
-      nativeToolsResponse.status !== 200 ||
-      nativeToolsJson.body?.metadata?.cached_chat_native_tools_test !== true ||
-      nativeToolsJson.body?.text?.format?.type !== 'grammar' ||
-      !['custom', 'namespace', 'tool_search', 'web_search', 'image_generation'].every((type) => forwardedToolTypes?.includes(type)) ||
-      cachedChatThenNativeResponsesHits !== 2 ||
+      nativeToolsResponse.status !== 422 ||
+      !nativeToolsJson.unsupported_tool_types?.includes('custom') ||
+      !nativeToolsJson.unsupported_tool_types?.includes('namespace') ||
+      !nativeToolsJson.unsupported_tool_types?.includes('tool_search') ||
+      !nativeToolsJson.unsupported_tool_types?.includes('web_search') ||
+      !nativeToolsJson.unsupported_tool_types?.includes('image_generation') ||
+      !nativeToolsJson.unsupported_output_format_types?.includes('grammar') ||
+      nativeToolsJson.attempts?.length !== 0 ||
+      !String(nativeToolsJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      cachedChatThenNativeResponsesHits !== 1 ||
       cachedChatThenNativeChatHits !== 1
     ) {
-      throw new Error(`expected cached chat fallback to re-probe native Responses with native tools intact: ${nativeToolsResponse.status} ${nativeToolsText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+      throw new Error(`expected learned Chat interface to block strict native-only Responses before any upstream call: ${nativeToolsResponse.status} ${nativeToolsText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
     }
 
-    const nativeToolChoiceBody = JSON.stringify({
-      model: 'test-model',
-      input: 'force native tool choice',
-      stream: false,
-      tool_choice: { type: 'web_search', name: 'web_search' },
-      metadata: { native_tool_choice_test: true }
+    const compatibilityUpdate = await postJson(`${cachedChatThenNativePoolInfo.url}/pool/compatibility`, 'pool-secret', {
+      strip_responses_only_features: true,
+      adapters: { chat_completions: true, anthropic_messages: false }
     });
-    const nativeToolChoiceResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
-      method: 'POST',
-      headers: {
-        authorization: 'Bearer pool-secret',
-        'content-type': 'application/json',
-        'content-length': String(Buffer.byteLength(nativeToolChoiceBody))
-      },
-      body: nativeToolChoiceBody
-    });
-    const nativeToolChoiceText = await nativeToolChoiceResponse.text();
-    const nativeToolChoiceJson = JSON.parse(nativeToolChoiceText);
     if (
-      nativeToolChoiceResponse.status !== 200 ||
-      nativeToolChoiceJson.body?.tool_choice?.type !== 'web_search' ||
-      nativeToolChoiceJson.body?.metadata?.native_tool_choice_test !== true ||
-      cachedChatThenNativeResponsesHits !== 3 ||
-      cachedChatThenNativeChatHits !== 1
+      compatibilityUpdate.response.status !== 200 ||
+      compatibilityUpdate.json.compatibility?.adapter_mode?.strip_responses_only_features !== true ||
+      compatibilityUpdate.json.compatibility?.adapter_mode?.adapters?.chat_completions !== true
     ) {
-      throw new Error(`expected cached chat fallback to re-probe native Responses for native tool_choice: ${nativeToolChoiceResponse.status} ${nativeToolChoiceText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+      throw new Error(`expected compatibility mode to enable Chat adapter after learning Chat interface: ${compatibilityUpdate.text}`);
     }
 
-    const wrongContentTypeBody = JSON.stringify({
-      model: 'test-model',
-      input: 'json body with wrong content type',
-      stream: false,
-      tools: [{ type: 'web_search', search_context_size: 'low' }],
-      metadata: { wrong_content_type_test: true }
-    });
-    const wrongContentTypeResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
-      method: 'POST',
-      headers: {
-        authorization: 'Bearer pool-secret',
-        'content-type': 'text/plain',
-        'content-length': String(Buffer.byteLength(wrongContentTypeBody))
-      },
-      body: wrongContentTypeBody
-    });
-    const wrongContentTypeText = await wrongContentTypeResponse.text();
-    const wrongContentTypeJson = JSON.parse(wrongContentTypeText);
-    if (
-      wrongContentTypeResponse.status !== 200 ||
-      wrongContentTypeJson.body?.tools?.[0]?.type !== 'web_search' ||
-      wrongContentTypeJson.body?.metadata?.wrong_content_type_test !== true ||
-      cachedChatThenNativeResponsesHits !== 4 ||
-      cachedChatThenNativeChatHits !== 1
-    ) {
-      throw new Error(`expected JSON body with wrong content-type to preserve native Responses fields and normalize upstream content-type: ${wrongContentTypeResponse.status} ${wrongContentTypeText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
-    }
-
-    const nativeInputBody = JSON.stringify({
+    const compatibleNativeInputBody = JSON.stringify({
       model: 'test-model',
       stream: false,
       input: [
@@ -2422,31 +2480,129 @@ try {
         { role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }] },
         { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
       ],
-      metadata: { native_input_test: true }
+      metadata: { learned_chat_compatibility_test: true }
     });
-    const nativeInputResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
+    const compatibleNativeInputResponse = await fetch(`${cachedChatThenNativePoolInfo.url}/v1/responses`, {
       method: 'POST',
       headers: {
         authorization: 'Bearer pool-secret',
         'content-type': 'application/json',
-        'content-length': String(Buffer.byteLength(nativeInputBody))
+        'content-length': String(Buffer.byteLength(compatibleNativeInputBody))
       },
-      body: nativeInputBody
+      body: compatibleNativeInputBody
     });
-    const nativeInputText = await nativeInputResponse.text();
-    const nativeInputJson = JSON.parse(nativeInputText);
+    const compatibleNativeInputText = await compatibleNativeInputResponse.text();
+    const compatibleNativeInputJson = JSON.parse(compatibleNativeInputText);
     if (
-      nativeInputResponse.status !== 200 ||
-      nativeInputJson.body?.input?.[1]?.content?.[0]?.type !== 'input_image' ||
-      nativeInputJson.body?.input?.[2]?.type !== 'reasoning' ||
-      nativeInputJson.body?.metadata?.native_input_test !== true ||
-      cachedChatThenNativeResponsesHits !== 5 ||
-      cachedChatThenNativeChatHits !== 1
+      compatibleNativeInputResponse.status !== 200 ||
+      compatibleNativeInputJson.output_text !== 'cached-pong' ||
+      compatibleNativeInputResponse.headers.get('x-codex-api-pool-route') !== 'responses->chat_completions' ||
+      compatibleNativeInputResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      cachedChatThenNativeResponsesHits !== 1 ||
+      cachedChatThenNativeChatHits !== 2
     ) {
-      throw new Error(`expected cached chat fallback to re-probe native Responses for native input items: ${nativeInputResponse.status} ${nativeInputText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
+      throw new Error(`expected learned Chat interface to route compatible native-only request through Chat adapter: ${compatibleNativeInputResponse.status} ${compatibleNativeInputText} responses=${cachedChatThenNativeResponsesHits} chat=${cachedChatThenNativeChatHits}`);
     }
   } finally {
     await close(cachedChatThenNativePool);
+  }
+
+  nativeFeatureBlockedResponsesHits = 0;
+  nativeFeatureBlockedChatHits = 0;
+  const nativeFeatureBlockedPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 3000
+    },
+    model_override: 'test-model',
+    compatibility: {
+      adapter_mode: {
+        strip_responses_only_features: true,
+        adapters: { chat_completions: true, anthropic_messages: false }
+      }
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 4,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000,
+      chat_fallback_probe_timeout_ms: 50
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
+    upstreams: [
+      { name: 'native-feature-blocked', base_url: `${nativeFeatureBlockedInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const nativeFeatureBlockedPoolInfo = await listen(nativeFeatureBlockedPool);
+  try {
+    const blockedFeatureBody = JSON.stringify({
+      model: 'test-model',
+      stream: false,
+      include: ['reasoning'],
+      text: { format: { type: 'text' }, verbosity: 'high' },
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: 'draw but answer text' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'native reasoning item' }] }
+      ],
+      tools: [
+        { type: 'image_generation', size: '1024x1024' },
+        { type: 'function', name: 'lookup_weather', parameters: { type: 'object', properties: {} } }
+      ]
+    });
+    const firstBlockedFeatureResponse = await fetch(`${nativeFeatureBlockedPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(blockedFeatureBody))
+      },
+      body: blockedFeatureBody
+    });
+    const firstBlockedFeatureText = await firstBlockedFeatureResponse.text();
+    const firstBlockedFeatureJson = JSON.parse(firstBlockedFeatureText);
+    const firstBlockedFeatureStatus = (await getJson(`${nativeFeatureBlockedPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const firstBlockedFeatureSite = firstBlockedFeatureStatus.upstreams.find((upstream) => upstream.name === 'native-feature-blocked');
+    if (
+      firstBlockedFeatureResponse.status !== 200 ||
+      firstBlockedFeatureJson.output_text !== 'chat-lossy-ok' ||
+      firstBlockedFeatureResponse.headers.get('x-codex-api-pool-route') !== 'responses->chat_completions' ||
+      firstBlockedFeatureResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      !String(firstBlockedFeatureResponse.headers.get('x-codex-api-pool-stripped') || '').includes('tools=image_generation') ||
+      !String(firstBlockedFeatureResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
+      nativeFeatureBlockedResponsesHits !== 1 ||
+      nativeFeatureBlockedChatHits !== 1 ||
+      firstBlockedFeatureSite?.route_strategies?.['test-model']?.strategy !== 'chat_completions_compatibility'
+    ) {
+      throw new Error(`expected native feature block to fall back to lossy Chat and learn strategy: ${firstBlockedFeatureResponse.status} ${firstBlockedFeatureText} responses=${nativeFeatureBlockedResponsesHits} chat=${nativeFeatureBlockedChatHits} site=${JSON.stringify(firstBlockedFeatureSite?.route_strategies)}`);
+    }
+
+    const secondBlockedFeatureResponse = await fetch(`${nativeFeatureBlockedPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(blockedFeatureBody))
+      },
+      body: blockedFeatureBody
+    });
+    const secondBlockedFeatureText = await secondBlockedFeatureResponse.text();
+    const secondBlockedFeatureJson = JSON.parse(secondBlockedFeatureText);
+    if (
+      secondBlockedFeatureResponse.status !== 200 ||
+      secondBlockedFeatureJson.output_text !== 'chat-lossy-ok' ||
+      secondBlockedFeatureResponse.headers.get('x-codex-api-pool-route') !== 'responses->chat_completions' ||
+      secondBlockedFeatureResponse.headers.get('x-codex-api-pool-compatibility') !== 'adapter' ||
+      nativeFeatureBlockedResponsesHits !== 1 ||
+      nativeFeatureBlockedChatHits !== 2
+    ) {
+      throw new Error(`expected learned lossy Chat strategy to skip native Responses on subsequent same-model request: ${secondBlockedFeatureResponse.status} ${secondBlockedFeatureText} responses=${nativeFeatureBlockedResponsesHits} chat=${nativeFeatureBlockedChatHits}`);
+    }
+  } finally {
+    await close(nativeFeatureBlockedPool);
   }
 
   chatOnlyResponsesHits = 0;
@@ -2585,8 +2741,9 @@ try {
       scrubChatResponse.status !== 422 ||
       expectedStrictFieldTypes.some((field) => !scrubChatJson.unsupported_field_types?.includes(field)) ||
       !String(scrubChatJson.error || '').includes('fields') ||
-      scrubChatJson.attempts?.[0]?.status !== 404 ||
-      chatOnlyResponsesHits !== 2 ||
+      scrubChatJson.attempts?.length !== 0 ||
+      !String(scrubChatJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      chatOnlyResponsesHits !== 1 ||
       chatOnlyChatHits !== 3
     ) {
       throw new Error(`expected Responses-only fields to require native Responses in strict mode: ${scrubChatResponse.status} ${scrubChatText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
@@ -2640,15 +2797,16 @@ try {
     if (
       unsupportedChatToolResponse.status !== 422 ||
       unsupportedChatToolJson.unsupported_tool_types?.[0] !== 'web_search_preview' ||
-      !String(unsupportedChatToolJson.error || '').includes('cannot be converted by available upstreams') ||
-      unsupportedChatToolJson.attempts?.[0]?.status !== 404 ||
-      chatOnlyResponsesHits !== 3 ||
+      !String(unsupportedChatToolJson.error || '').includes('no compatible upstream candidate') ||
+      unsupportedChatToolJson.attempts?.length !== 0 ||
+      !String(unsupportedChatToolJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      chatOnlyResponsesHits !== 1 ||
       chatOnlyChatHits !== 4
     ) {
-      throw new Error(`expected unsupported tool to re-probe native Responses without chat fallback: ${unsupportedChatToolResponse.status} ${unsupportedChatToolText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+      throw new Error(`expected unsupported tool to respect learned Chat interface without native re-probe: ${unsupportedChatToolResponse.status} ${unsupportedChatToolText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
     }
-    if (chatOnlyResponsesHits !== 3 || chatOnlyChatHits !== 4) {
-      throw new Error(`expected first request to probe responses once, then reuse chat completions: responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+    if (chatOnlyResponsesHits !== 1 || chatOnlyChatHits !== 4) {
+      throw new Error(`expected first request to probe responses once, then reuse learned Chat interface: responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
     }
     const unsupportedChatInputBody = JSON.stringify({
       model: 'test-model',
@@ -2674,16 +2832,24 @@ try {
       unsupportedChatInputResponse.status !== 422 ||
       !unsupportedChatInputJson.unsupported_input_types?.includes('reasoning') ||
       unsupportedChatInputJson.unsupported_input_types?.includes('content:input_image') ||
-      !String(unsupportedChatInputJson.error || '').includes('cannot be converted by available upstreams') ||
-      unsupportedChatInputJson.attempts?.[0]?.status !== 404 ||
-      chatOnlyResponsesHits !== 4 ||
+      !String(unsupportedChatInputJson.error || '').includes('no compatible upstream candidate') ||
+      unsupportedChatInputJson.attempts?.length !== 0 ||
+      !String(unsupportedChatInputJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      chatOnlyResponsesHits !== 1 ||
       chatOnlyChatHits !== 4
     ) {
-      throw new Error(`expected reasoning input not to be degraded through chat adapter while input_image is convertible: ${unsupportedChatInputResponse.status} ${unsupportedChatInputText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
+      throw new Error(`expected reasoning input to respect learned Chat interface without native re-probe: ${unsupportedChatInputResponse.status} ${unsupportedChatInputText} responses=${chatOnlyResponsesHits} chat=${chatOnlyChatHits}`);
     }
     const chatOnlyStatus = (await getJson(`${chatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
     const chatOnlySite = chatOnlyStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
-    if (chatOnlySite?.resolved_request_mode !== 'chat_completions' || chatOnlySite?.usage?.total_tokens !== 18 || chatOnlySite?.usage?.input_tokens !== 9 || chatOnlySite?.usage?.output_tokens !== 9) {
+    if (
+      chatOnlySite?.resolved_request_mode !== 'chat_completions' ||
+      chatOnlySite?.request_interface?.type !== 'chat_completions' ||
+      chatOnlySite?.request_interface?.path !== '/v1/chat/completions' ||
+      chatOnlySite?.usage?.total_tokens !== 18 ||
+      chatOnlySite?.usage?.input_tokens !== 9 ||
+      chatOnlySite?.usage?.output_tokens !== 9
+    ) {
       throw new Error(`expected chat completions fallback mode and usage to be recorded: ${JSON.stringify(chatOnlySite)}`);
     }
     const runtimeChatOnly = chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only');
@@ -4535,6 +4701,75 @@ try {
     await close(restoredAvailabilityPool);
   }
 
+  const recoveringRawchatPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'test-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: {
+      enabled: true,
+      path: '/models',
+      timeout_ms: 1000,
+      interval_ms: 100,
+      concurrency: 1
+    },
+    upstreams: [
+      { name: 'recovering-rawchat', base_url: `${recoveringRawchatInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const recoveringRawchatPoolInfo = await listen(recoveringRawchatPool);
+  try {
+    recoveringRawchatHealthy = false;
+    recoveringRawchatResponsesHits = 0;
+    await sleep(700);
+    const downStatus = (await getJson(`${recoveringRawchatPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const downSite = downStatus.upstreams.find((upstream) => upstream.name === 'recovering-rawchat');
+    if (downSite?.available !== false || downSite?.health?.state !== 'rate_limited' || downSite?.cooldown_ms <= 0 || downSite?.selection_score !== 0) {
+      throw new Error(`expected automatic probe to mark rate-limited rawchat unavailable: ${JSON.stringify(downSite)}`);
+    }
+
+    recoveringRawchatHealthy = true;
+    await sleep(350);
+    const recoveredStatus = (await getJson(`${recoveringRawchatPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const recoveredSite = recoveredStatus.upstreams.find((upstream) => upstream.name === 'recovering-rawchat');
+    if (
+      recoveredSite?.available !== true ||
+      recoveredSite?.health?.state !== 'ok' ||
+      recoveredSite?.cooldown_ms !== 0 ||
+      recoveredSite?.selection_score <= 0 ||
+      recoveredSite?.representative_availability?.verified !== false
+    ) {
+      throw new Error(`expected automatic probe recovery to return rawchat to Selection before real verification: ${JSON.stringify(recoveredSite)}`);
+    }
+
+    const recoveredRequest = await requestJson(recoveringRawchatPoolInfo.url, 'pool-secret');
+    if (
+      recoveredRequest.response.status !== 200 ||
+      recoveredRequest.response.headers.get('x-codex-api-pool-upstream') !== 'recovering-rawchat' ||
+      recoveringRawchatResponsesHits < 1
+    ) {
+      throw new Error(`expected recovered rawchat to receive real traffic: ${recoveredRequest.response.status} ${recoveredRequest.text}`);
+    }
+    const verifiedStatus = (await getJson(`${recoveringRawchatPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const verifiedSite = verifiedStatus.upstreams.find((upstream) => upstream.name === 'recovering-rawchat');
+    if (verifiedSite?.representative_availability?.verified !== true || verifiedSite?.health?.source !== 'real_traffic') {
+      throw new Error(`expected real traffic to verify recovered rawchat: ${JSON.stringify(verifiedSite)}`);
+    }
+  } finally {
+    await close(recoveringRawchatPool);
+  }
+
   const siteFallbackPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -4781,11 +5016,25 @@ try {
       probe.json.health?.state !== 'advanced_curl_required' ||
       probe.json.health?.httpStatus !== 400 ||
       !String(probe.json.health?.error || '').includes('真实 Codex') ||
+      !String(probe.json.health?.api_pool_error || '').includes('真实 Codex') ||
+      probe.json.health?.upstream_error?.code !== 'invalid_responses_request' ||
+      !String(probe.json.health?.upstream_error?.message || '').includes('invalid codex request') ||
       probe.json.health?.upstream_result?.status_code !== 400 ||
       !String(probe.json.health?.upstream_result?.body || '').includes('invalid_responses_request') ||
       !probe.json.health?.models?.includes('gpt-5.5')
     ) {
       throw new Error(`expected invalid-codex synthetic probe to stay dispatchable for real Codex traffic: ${probe.text}`);
+    }
+    const batchProbe = await postJson(`${invalidCodexProbePoolInfo.url}/pool/probe`, 'pool-secret', {});
+    const batchProbeHealth = batchProbe.json.probe_results?.find((item) => item.upstream === 'invalid-codex-probe')?.health;
+    if (
+      batchProbe.response.status !== 200 ||
+      batchProbeHealth?.state !== 'advanced_curl_required' ||
+      !String(batchProbeHealth?.api_pool_error || '').includes('真实 Codex') ||
+      batchProbeHealth?.upstream_error?.code !== 'invalid_responses_request' ||
+      !String(batchProbeHealth?.upstream_result?.body || '').includes('invalid_responses_request')
+    ) {
+      throw new Error(`expected batch probe to return API Pool and upstream merchant errors: ${batchProbe.text}`);
     }
     const status = (await getJson(`${invalidCodexProbePoolInfo.url}/pool/status`, 'pool-secret')).json;
     const site = status.upstreams.find((upstream) => upstream.name === 'invalid-codex-probe');
@@ -4967,6 +5216,8 @@ try {
       probe.json.health?.state !== 'advanced_curl_required' ||
       probe.json.health?.source !== 'probe' ||
       !String(probe.json.health?.error || '').includes('高级 Curl') ||
+      probe.json.health?.upstream_error?.code !== 'codex_access_restricted' ||
+      !String(probe.json.health?.upstream_error?.message || '').includes('最新版') ||
       probe.json.health?.upstream_result?.status_code !== 403 ||
       !String(probe.json.health?.upstream_result?.body || '').includes('codex_access_restricted') ||
       syntheticResponsesForward?.headers?.['x-oai-attestation'] === 'rawchat-nonce-1'
@@ -5092,6 +5343,7 @@ try {
         syntheticProbe.json.probe_status !== 'skipped' ||
         syntheticProbe.json.health?.state !== 'advanced_curl_required' ||
         syntheticProbe.json.health?.source !== 'probe' ||
+        !String(syntheticProbe.json.health?.upstream_error?.message || '').includes('missing Codex context') ||
         syntheticProbe.json.health?.upstream_result?.status_code !== 400 ||
         !String(syntheticProbe.json.health?.upstream_result?.body || '').includes('missing Codex context') ||
         singleUseForwardRequest !== null
@@ -5536,7 +5788,7 @@ try {
     await close(normalAuthErrorCurlBackend);
   }
 
-  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, and immediate health probe all passed');
+  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, automatic probe recovery, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, and immediate health probe all passed');
 } finally {
   await close(codexOauthProxy);
   await close(codexOauthCompactOnlyBackend);
@@ -5547,12 +5799,14 @@ try {
   await close(pool);
   await close(dualProtocolModels);
   await close(anthropicModels);
+  await close(recoveringRawchat);
   await close(billingLoginHtmlUpstream);
   await close(billingBlockedUpstream);
   await close(billingHugeLimitUpstream);
   await close(billingUpstream);
   await close(anthropicMessages);
   await close(cachedChatThenNative);
+  await close(nativeFeatureBlocked);
   await close(chatOnly);
   await close(anthropicContentEmpty);
   await close(chatChoicesEmpty);

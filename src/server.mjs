@@ -658,6 +658,28 @@ function probeUpstreamResultPayload(result) {
   };
 }
 
+function probeUpstreamErrorPayload(result) {
+  if (!result) return undefined;
+  const parts = responseErrorParts(result);
+  const message = parts.message || result.error || String(result.body || '').trim();
+  return {
+    code: parts.code || '',
+    message,
+    status_code: Number(result.statusCode || 0),
+    transport_error: result.error || ''
+  };
+}
+
+function probeHealthDebugPayload(health, result) {
+  if (!health || health.state === 'ok' || !result) return health;
+  return {
+    ...health,
+    api_pool_error: health.error || '',
+    upstream_error: probeUpstreamErrorPayload(result),
+    upstream_result: probeUpstreamResultPayload(result)
+  };
+}
+
 function sanitizeResponseHeaders(headers, upstreamName) {
   const out = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -1009,6 +1031,136 @@ function isCodexOAuthConfig(input) {
 }
 
 const PROTOCOL_CAPABILITY_NAMES = ['responses', 'chat_completions', 'anthropic_messages'];
+const ROUTE_STRATEGY_NAMES = new Set([
+  'responses',
+  'chat_completions',
+  'chat_completions_compatibility',
+  'anthropic_messages',
+  'anthropic_messages_compatibility',
+  'codex_oauth_responses'
+]);
+
+function routeStrategyModelKey(model) {
+  return String(model || '').trim() || '__default__';
+}
+
+function normalizeRouteStrategyEntry(entry, modelKey = '') {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const strategy = String(entry.strategy || entry.route || '').trim();
+  if (!ROUTE_STRATEGY_NAMES.has(strategy)) return null;
+  return {
+    strategy,
+    model: String(entry.model || modelKey || ''),
+    source: String(entry.source || 'real_traffic'),
+    checked_at: typeof entry.checked_at === 'string'
+      ? entry.checked_at
+      : typeof entry.checkedAt === 'string'
+        ? entry.checkedAt
+        : new Date().toISOString(),
+    reason: String(entry.reason || '')
+  };
+}
+
+function normalizeRouteStrategies(input = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const entries = {};
+  for (const [modelKey, value] of Object.entries(input)) {
+    const normalized = normalizeRouteStrategyEntry(value, modelKey);
+    if (normalized) entries[modelKey] = normalized;
+  }
+  return entries;
+}
+
+function routeStrategyForUpstream(upstream, model) {
+  const strategies = normalizeRouteStrategies(upstream?.routeStrategies || upstream?.route_strategies);
+  return strategies[routeStrategyModelKey(model)] || strategies.__default__ || null;
+}
+
+function routeStrategyUsesChatCompletions(strategy) {
+  const value = typeof strategy === 'string' ? strategy : strategy?.strategy;
+  return value === 'chat_completions' || value === 'chat_completions_compatibility';
+}
+
+function routeStrategyUsesNativeResponses(strategy) {
+  const value = typeof strategy === 'string' ? strategy : strategy?.strategy;
+  return value === 'responses' || value === 'codex_oauth_responses';
+}
+
+function learnRouteStrategy(upstream, model, strategy, { source = 'real_traffic', reason = '' } = {}) {
+  if (!upstream || !ROUTE_STRATEGY_NAMES.has(strategy)) return;
+  const modelKey = routeStrategyModelKey(model);
+  upstream.routeStrategies = normalizeRouteStrategies(upstream.routeStrategies);
+  upstream.routeStrategies[modelKey] = {
+    strategy,
+    model: String(model || ''),
+    source,
+    checked_at: new Date().toISOString(),
+    reason: String(reason || '')
+  };
+}
+
+function requestInterfaceForUpstream(upstream = {}) {
+  const configuredMode = upstream.requestMode || normalizeRequestMode(upstream.request_mode, upstream.codexOAuth);
+  const resolvedMode = upstream.resolvedRequestMode || upstream.resolved_request_mode || '';
+  const labels = {
+    responses: 'Responses',
+    chat_completions: 'Chat Completions',
+    anthropic_messages: 'Anthropic Messages'
+  };
+  const paths = {
+    responses: '/v1/responses',
+    chat_completions: '/v1/chat/completions',
+    anthropic_messages: '/v1/messages'
+  };
+  const capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+  const verifiedProtocols = PROTOCOL_CAPABILITY_NAMES
+    .map((protocol) => ({ protocol, capability: capabilities[protocol] || {} }))
+    .filter((item) => item.capability.status === 'verified' && ['probe', 'real_traffic'].includes(item.capability.source));
+
+  if (verifiedProtocols.length === 1) {
+    const { protocol, capability } = verifiedProtocols[0];
+    const type = protocol === 'responses' && (configuredMode === 'codex_oauth' || upstream.codexOAuth || upstream.codex_oauth)
+      ? 'codex_oauth_responses'
+      : protocol;
+    return {
+      type,
+      label: type === 'codex_oauth_responses' ? 'Codex OAuth Responses' : labels[protocol],
+      source: capability.source,
+      path: paths[protocol],
+      configured_mode: configuredMode || 'auto',
+      resolved_mode: resolvedMode || '',
+      checked_at: capability.checked_at || null,
+      model: capability.model || '',
+      http_status: capability.http_status || 0
+    };
+  }
+  if (verifiedProtocols.length > 1) {
+    return {
+      type: 'model_dependent',
+      label: 'Model Dependent',
+      source: 'verified',
+      path: '',
+      configured_mode: configuredMode || 'auto',
+      resolved_mode: resolvedMode || '',
+      verified: Object.fromEntries(verifiedProtocols.map(({ protocol, capability }) => [protocol, {
+        label: labels[protocol],
+        path: paths[protocol],
+        source: capability.source,
+        checked_at: capability.checked_at || null,
+        model: capability.model || '',
+        http_status: capability.http_status || 0
+      }]))
+    };
+  }
+  return {
+    type: 'pending',
+    label: 'Pending Verification',
+    source: 'pending',
+    path: '',
+    configured_mode: configuredMode || 'auto',
+    resolved_mode: ''
+  };
+}
 
 function emptyProtocolCapability(status = 'unknown', reason = '') {
   return {
@@ -1303,7 +1455,8 @@ function canUseChatCompletionsAdapter(pathname, upstream, model) {
 }
 
 function isChatCompletionsOnlyMode(upstream) {
-  return upstream?.requestMode === 'chat_completions';
+  return upstream?.requestMode === 'chat_completions' ||
+    upstream?.resolvedRequestMode === 'chat_completions';
 }
 
 function protocolCapabilityStatus(upstream, protocol) {
@@ -1330,6 +1483,9 @@ function canAttemptNativeResponses(pathname, upstream, model) {
   if (pathname !== '/v1/responses') return true;
   if (shouldUseAnthropicResponsesAdapter(pathname, model)) return false;
   if (!canUseChatCompletionsAdapter(pathname, upstream, model)) return true;
+  const learnedStrategy = routeStrategyForUpstream(upstream, model);
+  if (routeStrategyUsesNativeResponses(learnedStrategy)) return true;
+  if (routeStrategyUsesChatCompletions(learnedStrategy)) return false;
   return !isChatCompletionsOnlyMode(upstream);
 }
 
@@ -3266,6 +3422,7 @@ function createUpstreamState(upstream, index) {
     proxyUrl: normalizeProxyUrl(upstream.proxy_url || upstream.proxyUrl),
     requestMode,
     resolvedRequestMode: requestMode === 'chat_completions' || requestMode === 'responses' ? requestMode : '',
+    routeStrategies: normalizeRouteStrategies(upstream.route_strategies || upstream.routeStrategies),
     codexOAuth,
     oauthExpiresAt: typeof upstream.oauth_expires_at === 'string' ? upstream.oauth_expires_at : '',
     oauthClientId: typeof upstream.oauth_client_id === 'string' ? upstream.oauth_client_id : '',
@@ -3386,6 +3543,7 @@ function statsSnapshot(state) {
       stats: upstream.stats,
       quota: upstream.quota,
       capabilities: upstream.capabilities,
+      routeStrategies: upstream.routeStrategies || {},
       billing: upstream.billing,
       health: {
         state: upstream.health.state,
@@ -3645,6 +3803,7 @@ function restoreStats(state, statsPath) {
       ensureAvailability(upstream.stats, state.availability);
       upstream.quota = { ...upstream.quota, ...(old.quota || {}) };
       upstream.capabilities = mergeRestoredProtocolCapabilities(old.capabilities, upstream.capabilities);
+      upstream.routeStrategies = normalizeRouteStrategies(old.routeStrategies || old.route_strategies || upstream.routeStrategies);
       if (old.billing) upstream.billing = { ...upstream.billing, ...old.billing };
       if (old.health?.models?.length) {
         upstream.health = {
@@ -3735,6 +3894,7 @@ function copyRuntimeState(target, source, { preserveHealth, availabilityConfig }
   ensureAvailability(target.stats, availabilityConfig);
   target.quota = { ...target.quota, ...source.quota };
   target.capabilities = normalizeProtocolCapabilities(source.capabilities || target.capabilities);
+  target.routeStrategies = normalizeRouteStrategies(source.routeStrategies || target.routeStrategies);
   target.billing = { ...target.billing, ...source.billing };
   if (preserveHealth) target.health = { ...target.health, ...source.health };
   if (!target.enabled) {
@@ -3864,7 +4024,9 @@ function nativeResponsesCandidateDiagnostics(state, pathname, model, tried = new
     else if (!upstreamSupportsModel(upstream, model)) reason = 'upstream does not support the requested model/API family';
     else if (!upstream.keys.some((key) => keyAvailable(key, at))) reason = 'no upstream key is currently available';
     else if (!canAttemptNativeResponses(pathname, upstream, model)) {
-      reason = 'configured request_mode=chat_completions cannot carry native Responses-only features';
+      reason = upstream.resolvedRequestMode === 'chat_completions' && upstream.requestMode !== 'chat_completions'
+        ? 'resolved request interface chat_completions cannot carry native Responses-only features'
+        : 'configured request_mode=chat_completions cannot carry native Responses-only features';
     } else if (!upstream.keys.some((key) => keyAvailable(key, at) && !tried.has(`${upstream.name}:${key.index}`))) {
       reason = 'all available keys have already been attempted';
     }
@@ -5987,8 +6149,8 @@ function recordProtocolCapabilityProbe(upstream, protocol, result, classified, {
   representative = true
 } = {}) {
   if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
-  if (upstreamHasUserDeclaredProtocolCapability(upstream, protocol)) return;
   const state = classified?.state || classifyModelProbe(result || {}, protocol).state;
+  if (state !== 'ok' && upstreamHasUserDeclaredProtocolCapability(upstream, protocol)) return;
   const existing = upstream.capabilities?.[protocol];
   if (
     state !== 'ok' &&
@@ -7300,9 +7462,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
         recordFailure(state, upstream, key, error || `health ${stateName}`, result.statusCode, result.retryAfter);
       }
     }
-    return stateName === 'ok' || !result
-      ? upstream.health
-      : { ...upstream.health, upstream_result: probeUpstreamResultPayload(result) };
+    return probeHealthDebugPayload(upstream.health, result);
   }
 
   // ── Real model request as primary health check ──
@@ -7318,7 +7478,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
   // Step 1: Try real model request based on upstream type
   if (isAnthropic && !isOpenAi) {
     // Pure Anthropic upstream → probe /v1/messages first
-    const result = await probeAnthropicUpstream(upstream, key, config);
+    const result = await probeAnthropicUpstream(upstream, key, config, probeModel);
     applyQuota(upstream, key, result.headers || {});
     const classified = classifyModelProbe(result, 'anthropic');
     recordProtocolCapabilityProbe(upstream, 'anthropic_messages', result, classified, { checkedAt, model: probeModel });
@@ -7384,7 +7544,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
 
     // For "both" API upstreams, also try Anthropic
     if (isAnthropic && stateName !== 'ok') {
-      const anthropicResult = await probeAnthropicUpstream(upstream, key, config);
+      const anthropicResult = await probeAnthropicUpstream(upstream, key, config, probeModel);
       applyQuota(upstream, key, anthropicResult.headers || {});
       const anthropicClassification = classifyModelProbe(anthropicResult, 'anthropic');
       recordProtocolCapabilityProbe(upstream, 'anthropic_messages', anthropicResult, anthropicClassification, { checkedAt, model: probeModel });
@@ -7447,9 +7607,7 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     probeModel
   };
 
-  const returnedHealth = stateName === 'ok'
-    ? upstream.health
-    : { ...upstream.health, upstream_result: probeUpstreamResultPayload(healthResult) };
+  const returnedHealth = probeHealthDebugPayload(upstream.health, healthResult);
 
   if (stateName === 'ok' || stateName === 'models_unsupported' || stateName === 'unexpected_status' || stateName === 'advanced_curl_required' || stateName === 'codex_forward_only') {
     upstream.lastError = '';
@@ -7907,13 +8065,42 @@ function dashboardHtml() {
     .signin-action.is-complete { color: var(--good); border-color: rgba(22,136,90,.42); background: rgba(22,136,90,.08); }
     .signin-action.is-off { color: var(--cold); border-color: rgba(49,95,125,.36); background: rgba(49,95,125,.08); }
     .signin-action[disabled] { cursor: default; opacity: .68; transform: none; }
-    .signin-toolbar { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; }
-    .signin-filters { display: flex; gap: 6px; flex-wrap: wrap; }
-    .signin-filter { min-height: 32px; padding: 6px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.32); }
-    .signin-filter.active { color: var(--paper); background: var(--ink); border-color: var(--ink); }
+    .signin-toolbar, .workbench-toolbar { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; }
+    .workbench-toolbar { align-items: flex-start; flex-wrap: wrap; }
+    .workbench-filter-stack { display: grid; gap: 8px; }
+    .workbench-filter-line { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .filter-label { color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; min-width: 74px; }
+    .signin-filters, .verification-filters { display: flex; gap: 6px; flex-wrap: wrap; }
+    .signin-filter, .verification-filter { min-height: 32px; padding: 6px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.32); }
+    .signin-filter.active, .verification-filter.active { color: var(--paper); background: var(--ink); border-color: var(--ink); }
     .signin-count { color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .verification-tier-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.38); color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .verification-tier-head strong { color: var(--ink); font-size: 13px; }
+    .verification-tier-head span { overflow-wrap: anywhere; }
+    .verification-tier-head[data-tier="real_verified"] { border-left: 4px solid var(--good); }
+    .verification-tier-head[data-tier="probe_only"] { border-left: 4px solid var(--cold); }
+    .verification-tier-head[data-tier="unavailable"] { border-left: 4px solid var(--bad); }
     .probe-site { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.28); }
     .probe-site[disabled] { cursor: wait; opacity: .68; transform: none; }
+    .probe-inline { grid-column: 1 / -1; display: grid; gap: 8px; border-top: 1px dashed var(--line); padding-top: 10px; cursor: default; }
+    .probe-inline[hidden] { display: none; }
+    .probe-inline-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .probe-inline-title { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+    .probe-inline-title strong { font-size: 12px; line-height: 1.25; }
+    .probe-inline-title time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .probe-inline-grid { display: grid; grid-template-columns: repeat(5, minmax(76px, 1fr)); gap: 8px; }
+    .probe-inline-item { border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.42); padding: 8px 9px; min-width: 0; }
+    .probe-inline-item small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 2px; }
+    .probe-inline-item strong { display: block; color: var(--ink); font-size: 13px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .probe-diagnostics { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; align-items: stretch; }
+    .probe-diagnostic { border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.42); padding: 9px 10px; min-width: 0; display: grid; gap: 5px; align-content: start; }
+    .probe-diagnostic[data-kind="api"] { border-left: 3px solid var(--cold); }
+    .probe-diagnostic[data-kind="upstream"] { border-left: 3px solid var(--warn); }
+    .probe-diagnostic[data-kind="raw"] { border-left: 3px solid var(--accent); }
+    .probe-diagnostic small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+    .probe-diagnostic strong { display: block; color: var(--ink); font-size: 12px; line-height: 1.3; overflow-wrap: anywhere; }
+    .probe-diagnostic code { display: block; color: var(--ink); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 130px; overflow: auto; border: 1px solid rgba(23,33,29,.08); border-radius: 5px; background: rgba(23,33,29,.035); padding: 7px; }
+    .probe-diagnostic .probe-meta { color: var(--muted); font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
     .claude-site { min-width: 78px; padding: 7px 10px; font-size: 12px; box-shadow: none; color: var(--cold); border-color: rgba(49,95,125,.42); background: rgba(49,95,125,.08); }
     .claude-site[disabled] { cursor: wait; opacity: .68; transform: none; }
     .billing-site { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.28); }
@@ -7989,11 +8176,10 @@ function dashboardHtml() {
     .probe-summary-item span { display: block; color: var(--muted); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
     .probe-summary-item strong { display: block; font-size: 16px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .probe-result-list { display: grid; gap: 7px; max-height: 310px; overflow: auto; }
-    .probe-result-row { display: grid; grid-template-columns: minmax(150px, 1fr) 88px repeat(3, minmax(72px, .45fr)) minmax(180px, 1.2fr); gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.42); padding: 9px 10px; font-size: 12px; }
+    .probe-result-row { display: grid; grid-template-columns: minmax(150px, 1fr) 88px repeat(3, minmax(72px, .45fr)); gap: 10px; align-items: start; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.42); padding: 9px 10px; font-size: 12px; }
     .probe-result-row strong { overflow-wrap: anywhere; }
     .probe-result-row small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 2px; }
     .probe-state { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; border: 1px solid currentColor; padding: 4px 7px; font-size: 11px; line-height: 1; white-space: nowrap; }
-    .probe-detail { color: var(--muted); line-height: 1.35; overflow-wrap: anywhere; }
     .probe-raw { border: 1px solid var(--line); border-radius: 7px; background: rgba(23,33,29,.04); overflow: hidden; }
     .probe-raw summary { cursor: pointer; list-style: none; padding: 9px 10px; color: var(--muted); font-size: 12px; }
     .probe-raw summary::-webkit-details-marker { display: none; }
@@ -8029,8 +8215,8 @@ function dashboardHtml() {
     .toast { min-width: 0; overflow-wrap: anywhere; }
     .last-refresh { flex: 0 0 auto; color: rgba(99,112,107,.82); }
     .empty { padding: 24px; color: var(--muted); }
-    @media (max-width: 1100px) { .diagnostic-strip { grid-template-columns: 1fr; } .workbench-head { display: none; } .workbench-row { grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(120px, 1fr)); } .facts { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 760px) { header, .summary, .model-panel, .curl-panel, .curl-body-grid, .curl-result-body, .import-panel, .grid, .workbench-row, .workbench-models-row, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .curl-actions { justify-content: flex-start; } .model-strip-label { padding-top: 0; } .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-history-day summary, .usage-site-row { grid-template-columns: 1fr 1fr; } .request-row, .probe-result-row { grid-template-columns: 1fr; } .probe-results-head { flex-direction: column; } .probe-results-actions { justify-content: flex-start; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
+    @media (max-width: 1100px) { .diagnostic-strip, .probe-diagnostics { grid-template-columns: 1fr; } .workbench-head { display: none; } .workbench-row { grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(120px, 1fr)); } .facts { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 760px) { header, .summary, .model-panel, .curl-panel, .curl-body-grid, .curl-result-body, .import-panel, .grid, .workbench-row, .workbench-models-row, .probe-inline-grid, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .curl-actions { justify-content: flex-start; } .model-strip-label { padding-top: 0; } .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-history-day summary, .usage-site-row { grid-template-columns: 1fr 1fr; } .request-row, .probe-result-row { grid-template-columns: 1fr; } .probe-results-head { flex-direction: column; } .probe-results-actions { justify-content: flex-start; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
   </style>
 </head>
 <body>
@@ -8161,14 +8347,29 @@ function dashboardHtml() {
         <h2 id="upstream-workbench-title"><span class="title-mark" data-icon="server"></span>Upstream Workbench</h2>
         <p>扫描每个 Upstream 的 Health State、Cooldown、Usage、Billing、Quota 和安全操作。</p>
       </div>
-      <div class="signin-toolbar">
-        <div class="signin-filters" role="group" aria-label="签到状态筛选">
-          <button class="ghost signin-filter" type="button" data-signin-filter="all">全部</button>
-          <button class="ghost signin-filter" type="button" data-signin-filter="pending">今日未签</button>
-          <button class="ghost signin-filter" type="button" data-signin-filter="completed">今日已签</button>
-          <button class="ghost signin-filter" type="button" data-signin-filter="not_required">无需签到</button>
+      <div class="workbench-toolbar">
+        <div class="workbench-filter-stack">
+          <div class="workbench-filter-line">
+            <span class="filter-label">验证层级</span>
+            <div class="verification-filters" role="group" aria-label="验证层级筛选">
+              <button class="ghost verification-filter" type="button" data-verification-filter="all">全部</button>
+              <button class="ghost verification-filter" type="button" data-verification-filter="real_verified">真实请求验证</button>
+              <button class="ghost verification-filter" type="button" data-verification-filter="probe_only">一层检测通过</button>
+              <button class="ghost verification-filter" type="button" data-verification-filter="unavailable">不可用 / 未验证</button>
+            </div>
+          </div>
+          <div class="workbench-filter-line">
+            <span class="filter-label">签到状态</span>
+            <div class="signin-filters" role="group" aria-label="签到状态筛选">
+              <button class="ghost signin-filter" type="button" data-signin-filter="all">全部</button>
+              <button class="ghost signin-filter" type="button" data-signin-filter="pending">今日未签</button>
+              <button class="ghost signin-filter" type="button" data-signin-filter="completed">今日已签</button>
+              <button class="ghost signin-filter" type="button" data-signin-filter="not_required">无需签到</button>
+            </div>
+          </div>
         </div>
         <div class="signin-count" id="signinFilterCount"></div>
+        <div class="signin-count" id="verificationFilterCount"></div>
       </div>
       <section id="cards" class="workbench-list" aria-label="Upstream Workbench rows"></section>
     </section>
@@ -8267,6 +8468,8 @@ function dashboardHtml() {
     const signinPendingCount = document.querySelector('#signinPendingCount');
     const signinFilterCount = document.querySelector('#signinFilterCount');
     const signinFilterButtons = [...document.querySelectorAll('[data-signin-filter]')];
+    const verificationFilterCount = document.querySelector('#verificationFilterCount');
+    const verificationFilterButtons = [...document.querySelectorAll('[data-verification-filter]')];
     const probeResults = document.querySelector('#probeResults');
     const probeResultsTitle = document.querySelector('#probeResultsTitle');
     const probeResultsMeta = document.querySelector('#probeResultsMeta');
@@ -8291,13 +8494,15 @@ function dashboardHtml() {
     const curlResultRaw = document.querySelector('#curlResultRaw');
     let editingName = '';
     let upstreamCache = new Map();
-    let cardsSignature = '';
+    let cardsSignature = null;
     let modelOptionsSignature = '';
     let latestStatus = null;
     let adminToken = localStorage.getItem('codexPoolAdminToken') || '';
     let signinFilter = localStorage.getItem('codexPoolSigninFilter') || 'all';
+    let verificationFilter = localStorage.getItem('codexPoolVerificationFilter') || 'all';
     let latestProbeResult = null;
     let latestCurlResult = null;
+    const upstreamProbeResults = new Map();
     const probingUpstreams = new Set();
     const claudeCheckingUpstreams = new Set();
     const claudeCheckResults = new Map();
@@ -8372,13 +8577,182 @@ function dashboardHtml() {
           health
         }];
       }
-      const upstreams = payload.result?.upstreams || payload.upstreams || [];
+      const upstreams = payload.probe_results || payload.upstreams || payload.result?.upstreams || [];
       return upstreams.map((upstream) => ({
-        name: upstream.name || 'unknown',
+        name: upstream.name || upstream.upstream || 'unknown',
         status: upstream.enabled === false ? 'skipped' : probeResultState(upstream, upstream.health),
         health: upstream.health || {},
         enabled: upstream.enabled
       }));
+    }
+    function probeDisplayStatus(status, state) {
+      if (status === 'running') return '测试中';
+      return status || state || 'unknown';
+    }
+    function probeStatusClass(status, state) {
+      if (status === 'ok' || state === 'ok') return 'ok';
+      if (status === 'skipped' || status === 'running' || state === 'running') return 'cold';
+      return stateClass(state || status || 'unknown');
+    }
+    function compactProbeText(value, limit = 420) {
+      const text = String(value || '').trim();
+      if (!text) return '';
+      return text.length > limit ? text.slice(0, limit - 1) + '...' : text;
+    }
+    function probeUpstreamBody(health) {
+      const raw = health?.upstream_result?.body || '';
+      if (!raw) return '';
+      try {
+        return JSON.stringify(JSON.parse(raw), null, 2);
+      } catch {
+        return String(raw);
+      }
+    }
+    function probeUpstreamHeader(health, name) {
+      const headers = health?.upstream_result?.headers || {};
+      const target = String(name || '').toLowerCase();
+      for (const [key, value] of Object.entries(headers)) {
+        if (String(key).toLowerCase() === target) return value;
+      }
+      return '';
+    }
+    function probeDiagnosticCards(row, fallbackError = '') {
+      const health = row?.health || {};
+      const upstreamError = health.upstream_error || {};
+      const upstreamResult = health.upstream_result || {};
+      const apiPoolError = health.api_pool_error || health.error || fallbackError || '';
+      const httpStatus = upstreamError.status_code || upstreamResult.status_code || healthValue(health, 'http_status', 'httpStatus');
+      const hasUpstreamDiagnostics = upstreamError.message || upstreamError.code || upstreamError.transport_error || upstreamResult.status_code;
+      const cards = [];
+      if (apiPoolError || health.warning) {
+        cards.push({
+          kind: 'api',
+          label: 'apiPool 错误',
+          title: apiPoolError || health.warning,
+          meta: health.state ? 'state=' + health.state : ''
+        });
+      }
+      if (hasUpstreamDiagnostics) {
+        cards.push({
+          kind: 'upstream',
+          label: '上游商家错误',
+          title: [
+            upstreamError.code ? '[' + upstreamError.code + ']' : '',
+            upstreamError.message || upstreamError.transport_error || '未解析到上游错误正文'
+          ].filter(Boolean).join(' '),
+          meta: 'http=' + fmt(httpStatus)
+        });
+      }
+      const body = probeUpstreamBody(health);
+      if (body) {
+        cards.push({
+          kind: 'raw',
+          label: '上游原始响应',
+          code: compactProbeText(body, 700),
+          meta: compactProbeText(probeUpstreamHeader(health, 'content-type'), 120)
+        });
+      }
+      if (cards.length === 0) {
+        cards.push({
+          kind: 'api',
+          label: '测试摘要',
+          title: '未返回错误详情',
+          meta: health.state ? 'state=' + health.state : ''
+        });
+      }
+      return cards;
+    }
+    function probeDiagnosticsHtml(row, fallbackError = '') {
+      return '<div class="probe-diagnostics">' + probeDiagnosticCards(row, fallbackError).map((card) =>
+        '<div class="probe-diagnostic" data-kind="' + esc(card.kind) + '">'
+          + '<small>' + esc(card.label) + '</small>'
+          + (card.title ? '<strong title="' + esc(card.title) + '">' + esc(compactProbeText(card.title, 260)) + '</strong>' : '')
+          + (card.code ? '<code>' + esc(card.code) + '</code>' : '')
+          + (card.meta ? '<div class="probe-meta">' + esc(card.meta) + '</div>' : '')
+        + '</div>'
+      ).join('') + '</div>';
+    }
+    function rememberInlineProbeRows(rows, { mode, title, responseOk = true, error = '', at = new Date().toISOString() } = {}) {
+      rows.forEach((row) => {
+        if (!row?.name) return;
+        upstreamProbeResults.set(row.name, { ...row, mode, title, responseOk, error, at });
+        renderInlineProbeResult(row.name);
+      });
+    }
+    function rememberInlineProbeRunning(name, { mode = 'one', title = '', skipped = false } = {}) {
+      if (!name) return;
+      const upstream = upstreamCache.get(name) || {};
+      const health = {
+        ...(upstream.health || {}),
+        state: skipped ? 'disabled' : 'running',
+        error: skipped ? '站点已停用，跳过测试。' : '测试中',
+        warning: ''
+      };
+      upstreamProbeResults.set(name, {
+        name,
+        status: skipped ? 'skipped' : 'running',
+        health,
+        mode,
+        title: title || \`\${name} 测试结果\`,
+        responseOk: true,
+        error: skipped ? '站点已停用，跳过测试。' : '',
+        at: new Date().toISOString()
+      });
+      renderInlineProbeResult(name);
+    }
+    function rememberAllInlineProbeRunning() {
+      upstreamCache.forEach((upstream, name) => {
+        rememberInlineProbeRunning(name, {
+          mode: 'all',
+          title: '全部测试结果',
+          skipped: upstream.enabled === false
+        });
+      });
+    }
+    function inlineProbeResultBodyHtml(result) {
+      if (!result) return '';
+      const health = result.health || {};
+      const state = health?.state || result.status || 'unknown';
+      const status = result.status || state;
+      const statusClass = probeStatusClass(status, state);
+      const at = result.at ? new Date(result.at).toLocaleTimeString() : '';
+      const responseText = result.responseOk === false ? '请求失败' : status === 'running' ? '请求中' : '请求完成';
+      return '<div class="probe-inline-head">'
+        + '<div class="probe-inline-title"><span class="probe-state ' + statusClass + '">' + esc(probeDisplayStatus(status, state)) + '</span><strong>' + esc(result.title || '测试结果') + '</strong></div>'
+        + '<time>' + esc(at ? at + ' · ' + responseText : responseText) + '</time>'
+        + '</div>'
+        + '<div class="probe-inline-grid">'
+        + '<div class="probe-inline-item"><small>Result</small><strong title="' + esc(probeDisplayStatus(status, state)) + '">' + esc(probeDisplayStatus(status, state)) + '</strong></div>'
+        + '<div class="probe-inline-item"><small>State</small><strong title="' + esc(state) + '">' + esc(state) + '</strong></div>'
+        + '<div class="probe-inline-item"><small>HTTP</small><strong>' + esc(fmt(healthValue(health, 'http_status', 'httpStatus'))) + '</strong></div>'
+        + '<div class="probe-inline-item"><small>Latency</small><strong>' + esc(fmt(healthValue(health, 'latency_ms', 'latencyMs'), 'ms')) + '</strong></div>'
+        + '<div class="probe-inline-item"><small>Models</small><strong>' + esc(fmt(healthValue(health, 'models_count', 'modelsCount'))) + '</strong></div>'
+        + '</div>'
+        + probeDiagnosticsHtml(result, result.error);
+    }
+    function inlineProbeResultHtml(name) {
+      const result = upstreamProbeResults.get(name);
+      return '<div class="probe-inline" data-probe-result="' + esc(name) + '"' + (result ? '' : ' hidden') + '>' + inlineProbeResultBodyHtml(result) + '</div>';
+    }
+    function renderInlineProbeResult(name) {
+      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const node = card?.querySelector('[data-probe-result]');
+      if (!node) return;
+      const result = upstreamProbeResults.get(name);
+      node.hidden = !result;
+      node.innerHTML = result ? inlineProbeResultBodyHtml(result) : '';
+    }
+    function clearInlineProbeResults() {
+      upstreamProbeResults.clear();
+      cards.querySelectorAll('[data-probe-result]').forEach((node) => {
+        node.hidden = true;
+        node.innerHTML = '';
+      });
+    }
+    function scrollInlineProbeResult(name) {
+      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const node = card?.querySelector('[data-probe-result]');
+      if (node && !node.hidden) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
     function probeSummaryItems(payload, mode, responseOk) {
       if (!payload) return [];
@@ -8402,9 +8776,11 @@ function dashboardHtml() {
       ];
     }
     function renderProbeResult(payload, { mode, title, responseOk = true, error = '' } = {}) {
-      latestProbeResult = { mode, title, responseOk, error, payload, at: new Date().toISOString() };
+      const at = new Date().toISOString();
+      latestProbeResult = { mode, title, responseOk, error, payload, at };
       if (!probeResults) return;
       const rows = probeResultRows(payload, mode);
+      rememberInlineProbeRows(rows, { mode, title, responseOk, error, at });
       probeResults.hidden = false;
       probeResultsTitle.textContent = title || '测试结果';
       probeResultsMeta.textContent = new Date().toLocaleString() + ' · ' + (responseOk ? '请求完成' : '请求失败') + (error ? ' · ' + error : '');
@@ -8414,23 +8790,22 @@ function dashboardHtml() {
       probeResultsList.innerHTML = rows.length ? rows.map((row) => {
         const health = row.health || {};
         const state = health?.state || row.status || 'unknown';
-        const statusClass = row.status === 'ok' || state === 'ok' ? 'ok' : row.status === 'skipped' ? 'cold' : stateClass(state);
-        const errorText = error || health?.error || health?.warning || '';
-        const feedback = errorText || '模型 ' + fmt(healthValue(health, 'models_count', 'modelsCount')) + ' 个';
+        const statusClass = probeStatusClass(row.status, state);
         return '<div class="probe-result-row">'
           + '<div><small>Upstream</small><strong>' + esc(row.name) + '</strong></div>'
-          + '<div><small>Result</small><span class="probe-state ' + statusClass + '">' + esc(row.status || state) + '</span></div>'
+          + '<div><small>Result</small><span class="probe-state ' + statusClass + '">' + esc(probeDisplayStatus(row.status, state)) + '</span></div>'
           + '<div><small>State</small><strong>' + esc(state) + '</strong></div>'
           + '<div><small>HTTP</small><strong>' + esc(fmt(healthValue(health, 'http_status', 'httpStatus'))) + '</strong></div>'
           + '<div><small>Latency</small><strong>' + esc(fmt(healthValue(health, 'latency_ms', 'latencyMs'), 'ms')) + '</strong></div>'
-          + '<div class="probe-detail"><small>Feedback</small>' + esc(feedback) + '</div>'
+          + probeDiagnosticsHtml(row, error)
           + '</div>';
       }).join('') : '<div class="empty">暂无测试明细。</div>';
       probeResultsRaw.textContent = JSON.stringify(latestProbeResult, null, 2);
-      probeResults.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      if (mode === 'one' && rows[0]?.name) scrollInlineProbeResult(rows[0].name);
     }
     function clearProbeResult() {
       latestProbeResult = null;
+      clearInlineProbeResults();
       if (!probeResults) return;
       probeResults.hidden = true;
       probeResultsSummary.innerHTML = '';
@@ -8682,6 +9057,24 @@ function dashboardHtml() {
         }).join('')
         + '</div>';
     }
+    function requestInterfaceLabel(upstream) {
+      return upstream?.request_interface?.label || 'Pending Verification';
+    }
+    function requestInterfaceTitle(upstream) {
+      const info = upstream?.request_interface || {};
+      const verified = info.verified ? Object.values(info.verified).map((item) => [item.label, item.path, item.source, item.model].filter(Boolean).join(' ')).join(' | ') : '';
+      return [
+        info.label || 'Pending Verification',
+        info.path || '',
+        info.source ? 'source=' + info.source : '',
+        info.configured_mode ? 'configured=' + info.configured_mode : '',
+        info.resolved_mode ? 'resolved=' + info.resolved_mode : '',
+        info.model ? 'model=' + info.model : '',
+        info.http_status ? 'HTTP ' + info.http_status : '',
+        info.checked_at ? 'checked=' + info.checked_at : '',
+        verified
+      ].filter(Boolean).join(' · ');
+    }
     const fmt = (value, suffix = '') => value === null || value === undefined || value === '' ? '—' : \`\${value}\${suffix}\`;
     function compactNumber(value) {
       const number = Number(value);
@@ -8860,15 +9253,45 @@ function dashboardHtml() {
       completed: '今日已签',
       not_required: '无需签到'
     };
+    const verificationTierOrder = ['real_verified', 'probe_only', 'unavailable'];
+    const verificationTierLabels = {
+      real_verified: '真实请求验证',
+      probe_only: '一层检测通过',
+      unavailable: '不可用 / 未验证'
+    };
+    const verificationTierDescriptions = {
+      real_verified: '近期真实 Codex Model Interaction Request 已成功。',
+      probe_only: '第一层 Health Probe 已通过，但还没有新鲜真实请求成功证据。',
+      unavailable: '没有通过真实请求验证，也没有通过第一层 Health Probe。'
+    };
+    const verificationFilterLabels = {
+      all: '全部',
+      real_verified: verificationTierLabels.real_verified,
+      probe_only: verificationTierLabels.probe_only,
+      unavailable: verificationTierLabels.unavailable
+    };
     if (!signinFilterLabels[signinFilter]) signinFilter = 'all';
+    if (!verificationFilterLabels[verificationFilter]) verificationFilter = 'all';
     const signinFilterMatches = (upstream) => signinFilter === 'all' || signinStatusValue(upstream) === signinFilter;
+    function verificationTier(upstream) {
+      if (upstream.available && upstream.representative_availability?.verified === true) return 'real_verified';
+      if (upstream.available && upstream.health?.state === 'ok') return 'probe_only';
+      return 'unavailable';
+    }
+    const verificationFilterMatches = (upstream) => verificationFilter === 'all' || verificationTier(upstream) === verificationFilter;
     function setSigninFilter(nextFilter) {
       signinFilter = signinFilterLabels[nextFilter] ? nextFilter : 'all';
       localStorage.setItem('codexPoolSigninFilter', signinFilter);
-      cardsSignature = '';
+      cardsSignature = null;
       load();
     }
-    function updateSigninFilterControls(allItems = [], visibleItems = []) {
+    function setVerificationFilter(nextFilter) {
+      verificationFilter = verificationFilterLabels[nextFilter] ? nextFilter : 'all';
+      localStorage.setItem('codexPoolVerificationFilter', verificationFilter);
+      cardsSignature = null;
+      load();
+    }
+    function updateWorkbenchFilterControls(allItems = [], visibleItems = []) {
       const pendingCount = allItems.filter(signinPending).length;
       signinPendingCount.textContent = pendingCount;
       signinPendingMetric.title = pendingCount ? \`\${pendingCount} 个站点今日未签到\` : '今日没有待签到站点';
@@ -8876,9 +9299,17 @@ function dashboardHtml() {
         button.classList.toggle('active', button.dataset.signinFilter === signinFilter);
         button.setAttribute('aria-pressed', String(button.dataset.signinFilter === signinFilter));
       });
-      signinFilterCount.textContent = signinFilter === 'all'
-        ? \`显示全部 \${allItems.length} 个站点\`
-        : \`\${signinFilterLabels[signinFilter]}：\${visibleItems.length} / \${allItems.length} 个站点\`;
+      verificationFilterButtons.forEach((button) => {
+        const key = button.dataset.verificationFilter || 'all';
+        const count = key === 'all' ? allItems.length : allItems.filter((upstream) => verificationTier(upstream) === key).length;
+        button.classList.toggle('active', key === verificationFilter);
+        button.setAttribute('aria-pressed', String(key === verificationFilter));
+        button.title = key === 'all' ? \`全部 \${count} 个 Upstream\` : \`\${verificationFilterLabels[key]}：\${count} 个 Upstream\`;
+      });
+      const signinText = signinFilter === 'all' ? '签到：全部' : \`签到：\${signinFilterLabels[signinFilter]}\`;
+      const verificationText = verificationFilter === 'all' ? '验证：全部' : \`验证：\${verificationFilterLabels[verificationFilter]}\`;
+      signinFilterCount.textContent = \`\${verificationText}；\${signinText}\`;
+      verificationFilterCount.textContent = \`显示 \${visibleItems.length} / \${allItems.length} 个 Upstream\`;
     }
     function signinBadgeHtml(upstream) {
       const available = canSignin(upstream);
@@ -8903,12 +9334,17 @@ function dashboardHtml() {
       if (upstream.available) return 1;
       return 2;
     }
+    function verificationTierSortValue(upstream) {
+      const index = verificationTierOrder.indexOf(verificationTier(upstream));
+      return index < 0 ? verificationTierOrder.length : index;
+    }
     function availabilitySortValue(upstream) {
       const multiplier = numeric(upstream.availability?.multiplier, 1);
       const rate = upstream.availability?.rate;
       return multiplier * 1000 + (Number.isFinite(rate) ? rate : 0.9);
     }
     const sortedUpstreams = (items, activeModel = '') => [...items].sort((a, b) => (
+      verificationTierSortValue(a) - verificationTierSortValue(b) ||
       enabledBucket(a) - enabledBucket(b) ||
       usabilityBucket(a, activeModel) - usabilityBucket(b, activeModel) ||
       availabilitySortValue(b) - availabilitySortValue(a) ||
@@ -9066,11 +9502,16 @@ function dashboardHtml() {
       (u.keys || []).map((k) => \`\${k.label}:\${k.configured}\`).join(','),
       (u.keys || []).map((k) => \`\${k.label}:\${k.health?.state || ''}:\${k.health?.error || ''}:\${k.health?.warning || ''}\`).join(','),
       JSON.stringify(u.capabilities || {}),
+      JSON.stringify(u.request_interface || {}),
       u.health?.error || '',
       u.health?.warning || '',
       (u.health?.models || []).join(','),
+      verificationTier(u),
+      u.representative_availability?.state || '',
+      u.representative_availability?.verified ? 'verified' : 'not-verified',
       activeModel,
-      signinFilter
+      signinFilter,
+      verificationFilter
     ].join('|')).join('||');
     function keySummaryHtml(upstream) {
       return (upstream.keys || []).map((key) => {
@@ -9168,6 +9609,11 @@ function dashboardHtml() {
         fragment.innerHTML = protocolCapabilitiesHtml(upstream);
         protocolCapabilities.innerHTML = fragment.firstElementChild?.innerHTML || '';
       }
+      const requestApi = card.querySelector('[data-field="request_interface"]');
+      if (requestApi) {
+        requestApi.textContent = requestInterfaceLabel(upstream);
+        requestApi.title = requestInterfaceTitle(upstream);
+      }
       setMoney(card, '[data-field="balance"]', upstream.billing?.balance_amount, upstream.billing?.currency);
       setMoney(card, '[data-field="spent"]', upstream.billing?.used_amount, upstream.billing?.currency);
       setMoney(card, '[data-field="limit"]', upstream.billing?.limit_amount, upstream.billing?.currency, { unlimited: unlimitedBilling(upstream, 'limit') });
@@ -9195,6 +9641,7 @@ function dashboardHtml() {
         probeButton.disabled = probing || !upstream.enabled;
         setButtonLabel(probeButton, 'radar', !upstream.enabled ? '停用中' : probing ? '测试中' : '测试');
       }
+      renderInlineProbeResult(upstream.name);
       const claudeButton = card.querySelector('[data-claude-check]');
       if (claudeButton) {
         const checking = claudeCheckingUpstreams.has(upstream.name);
@@ -9238,6 +9685,76 @@ function dashboardHtml() {
         deleteButton.disabled = deleting;
         setButtonLabel(deleteButton, 'trash', deleting ? '删除中' : '删除');
       }
+    }
+    function workbenchCardHtml(u, activeModel, data, index) {
+      return \`
+        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'}" data-upstream="\${esc(u.name)}" data-verification-tier="\${verificationTier(u)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
+          <div class="workbench-cell">
+            <div class="name">\${esc(u.name)}</div>
+            <div class="url">\${esc(u.base_url)}</div>
+            <div class="keys">\${keySummaryHtml(u)}</div>
+            \${protocolCapabilitiesHtml(u)}
+            \${signinBadgeHtml(u)}
+          </div>
+          <div class="workbench-cell">
+            <div class="workbench-main"><span class="pill \${stateClass(u.health?.state)}" data-field="state">\${esc(u.health?.state || 'unknown')}</span></div>
+            <div class="mini-line">HTTP <strong data-field="http">\${fmt(u.health?.http_status)}</strong></div>
+            <div class="mini-line">Latency <strong data-field="latency">\${fmt(u.health?.latency_ms, 'ms')}</strong></div>
+          </div>
+          <div class="workbench-cell">
+            <div class="mini-line">Weight <strong data-field="weight">\${u.weight}</strong> -> <strong data-field="selection_weight">\${fmt(u.selection_weight)}</strong> · Score <strong data-field="selection_score">\${fmt(u.selection_score)}</strong></div>
+            \${availabilityHtml(u)}
+            <div class="mini-line">Models <strong data-field="models_count">\${fmt(u.health?.models_count)}</strong> · Active <strong>\${activeModel ? esc(activeModel) : 'Following request'}</strong></div>
+            <div class="mini-line">Request API <strong data-field="request_interface" title="\${esc(requestInterfaceTitle(u))}">\${esc(requestInterfaceLabel(u))}</strong></div>
+            <div class="mini-line">Codex Desktop Template <strong data-field="representative_template">\${representativeTemplateLabel(data)}</strong></div>
+            <div class="mini-line">Cooldown <strong data-field="cooldown">\${Math.ceil((u.cooldown_ms || 0) / 1000)}s</strong></div>
+            <div class="mini-line">Failures <strong data-field="failures">\${u.failures}</strong></div>
+          </div>
+          <div class="workbench-cell">
+            <div class="mini-line">Calls <strong data-field="calls">\${u.stats?.attempts || 0}</strong></div>
+            <div class="mini-line">Today <strong data-field="today_tokens" title="\${esc(tokenTitle('Today', u.usage?.today_tokens))}">\${fmtToken(u.usage?.today_tokens)}</strong></div>
+            <div class="mini-line">Total <strong data-field="total_tokens" title="Total \${fullToken(u.usage?.total_tokens || 0)} · Input \${fullToken(u.usage?.input_tokens || 0)} · Output \${fullToken(u.usage?.output_tokens || 0)}">\${fmtToken(u.usage?.total_tokens)}</strong></div>
+          </div>
+          <div class="workbench-cell" data-billing-fact title="\${esc(u.billing?.error || '')}">
+            <div class="mini-line">Billing <strong data-field="billing_state">\${esc(u.billing?.state || 'unknown')}</strong></div>
+            <div class="mini-line">Balance <strong class="money" data-field="balance" data-size="\${billingAmountSize(u, 'balance')}" title="\${esc(billingAmountTitle(u, 'balance'))}">\${billingAmountText(u, 'balance')}</strong></div>
+            <div class="mini-line">Limit <strong class="money" data-field="limit" data-size="\${billingAmountSize(u, 'limit')}" title="\${esc(billingAmountTitle(u, 'limit'))}">\${billingAmountText(u, 'limit')}</strong></div>
+            <div class="mini-line">Spent <strong class="money" data-field="spent" data-size="\${moneySize(u.billing?.used_amount, u.billing?.currency)}" title="\${esc(fullMoney(u.billing?.used_amount, u.billing?.currency))}">\${fmtMoney(u.billing?.used_amount, u.billing?.currency)}</strong></div>
+            \${billingErrorHtml(u)}
+            \${quotaLineHtml(u)}
+          </div>
+          <div class="workbench-actions">
+            <button class="ghost toggle-site \${u.enabled ? 'is-on' : 'is-off'}" type="button" data-toggle="\${esc(u.name)}" data-enabled="\${u.enabled ? 'true' : 'false'}" aria-pressed="\${u.enabled ? 'true' : 'false'}">\${icon(u.enabled ? 'pause' : 'play')}\${u.enabled ? '停用' : '启用'}</button>
+            <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
+            <button class="ghost claude-site" type="button" data-claude-check="\${esc(u.name)}" \${claudeCheckingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : claudeCheckingUpstreams.has(u.name) ? '检测中' : 'Claude'}</button>
+            <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('wallet')}\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
+            \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">\${icon('external')}签到</a>\` : ''}
+            <button class="ghost signin-action \${canSignin(u) ? '' : 'is-off'}" type="button" data-signin-available="\${esc(u.name)}" data-available="\${canSignin(u) ? 'true' : 'false'}" aria-pressed="\${canSignin(u) ? 'true' : 'false'}">\${icon(canSignin(u) ? 'x' : 'check')}\${canSignin(u) ? '设不可签' : '设可签'}</button>
+            <button class="ghost signin-action \${!canSignin(u) ? 'is-off' : signinCompleted(u) ? 'is-complete' : ''}" type="button" data-signin-complete="\${esc(u.name)}" \${!canSignin(u) ? 'disabled' : ''}>\${icon(!canSignin(u) || signinCompleted(u) ? 'x' : 'signin')}\${!canSignin(u) ? '不可签' : signinCompleted(u) ? '撤销' : '完成'}</button>
+            <button class="ghost delete-site" type="button" data-delete="\${esc(u.name)}" \${deletingUpstreams.has(u.name) ? 'disabled' : ''} aria-label="删除站点 \${esc(u.name)}">\${icon('trash')}\${deletingUpstreams.has(u.name) ? '删除中' : '删除'}</button>
+            \${claudeCardResultHtml(u.name)}
+          </div>
+          <div class="workbench-models-row">
+            <div class="model-strip-label">Discovered Models</div>
+            <div class="models" aria-label="\${esc(u.name)} discovered models">\${(u.health?.models || []).length ? (u.health.models || []).map(model => \`<button class="model-chip \${model === activeModel ? 'active' : ''}" type="button" data-model="\${esc(model)}" title="\${esc(model)}">\${esc(model)}</button>\`).join('') : '<span class="key">暂无模型列表</span>'}</div>
+          </div>
+          \${inlineProbeResultHtml(u.name)}
+        </article>\`;
+    }
+    function workbenchTierHeadHtml(tier, count) {
+      return \`<div class="verification-tier-head" data-tier="\${tier}"><strong>\${esc(verificationTierLabels[tier] || tier)} · \${count}</strong><span>\${esc(verificationTierDescriptions[tier] || '')}</span></div>\`;
+    }
+    function workbenchRowsHtml(items, activeModel, data) {
+      if (!items.length) return '';
+      let index = 0;
+      const body = [];
+      for (const tier of verificationTierOrder) {
+        const group = items.filter((upstream) => verificationTier(upstream) === tier);
+        if (!group.length) continue;
+        body.push(workbenchTierHeadHtml(tier, group.length));
+        body.push(...group.map((upstream) => workbenchCardHtml(upstream, activeModel, data, index++)));
+      }
+      return body.join('');
     }
     function renderRecentRequests(items) {
       const compatibilityText = (compatibility) => {
@@ -9370,7 +9887,7 @@ function dashboardHtml() {
       const knownModels = data.model?.known || [];
       const activeModel = data.model?.override || '';
       const allUps = sortedUpstreams(data.upstreams || [], activeModel);
-      const ups = allUps.filter(signinFilterMatches);
+      const ups = allUps.filter((upstream) => verificationFilterMatches(upstream) && signinFilterMatches(upstream));
       upstreamCache = new Map(allUps.map((upstream) => [upstream.name, upstream]));
       if (editingName && !upstreamCache.has(editingName)) resetEdit(false);
       const selectModels = activeModel && !knownModels.includes(activeModel) ? [activeModel, ...knownModels] : knownModels;
@@ -9381,7 +9898,7 @@ function dashboardHtml() {
       document.querySelector('#cooling').textContent = allUps.filter(u => u.cooldown_ms > 0).length;
       updateTokenBreakdown(data.usage || {});
       renderDailyUsage(data, allUps);
-      updateSigninFilterControls(allUps, ups);
+      updateWorkbenchFilterControls(allUps, ups);
       const nextModelOptionsSignature = selectModels.join('|');
       if (nextModelOptionsSignature !== modelOptionsSignature) {
         modelSelect.innerHTML = '<option value="">跟随 Codex 请求</option>' + selectModels.map((model) => \`<option value="\${esc(model)}">\${esc(model)}</option>\`).join('');
@@ -9405,57 +9922,7 @@ function dashboardHtml() {
       const nextCardsSignature = cardSignature(ups, activeModel);
       if (nextCardsSignature !== cardsSignature) {
         cards.classList.toggle('stable', Boolean(cardsSignature));
-        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + ups.map((u, index) => \`
-        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'}" data-upstream="\${esc(u.name)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
-          <div class="workbench-cell">
-            <div class="name">\${esc(u.name)}</div>
-            <div class="url">\${esc(u.base_url)}</div>
-            <div class="keys">\${keySummaryHtml(u)}</div>
-            \${protocolCapabilitiesHtml(u)}
-            \${signinBadgeHtml(u)}
-          </div>
-          <div class="workbench-cell">
-            <div class="workbench-main"><span class="pill \${stateClass(u.health?.state)}" data-field="state">\${esc(u.health?.state || 'unknown')}</span></div>
-            <div class="mini-line">HTTP <strong data-field="http">\${fmt(u.health?.http_status)}</strong></div>
-            <div class="mini-line">Latency <strong data-field="latency">\${fmt(u.health?.latency_ms, 'ms')}</strong></div>
-          </div>
-          <div class="workbench-cell">
-            <div class="mini-line">Weight <strong data-field="weight">\${u.weight}</strong> -> <strong data-field="selection_weight">\${fmt(u.selection_weight)}</strong> · Score <strong data-field="selection_score">\${fmt(u.selection_score)}</strong></div>
-            \${availabilityHtml(u)}
-            <div class="mini-line">Models <strong data-field="models_count">\${fmt(u.health?.models_count)}</strong> · Active <strong>\${activeModel ? esc(activeModel) : 'Following request'}</strong></div>
-            <div class="mini-line">Codex Desktop Template <strong data-field="representative_template">\${representativeTemplateLabel(data)}</strong></div>
-            <div class="mini-line">Cooldown <strong data-field="cooldown">\${Math.ceil((u.cooldown_ms || 0) / 1000)}s</strong></div>
-            <div class="mini-line">Failures <strong data-field="failures">\${u.failures}</strong></div>
-          </div>
-          <div class="workbench-cell">
-            <div class="mini-line">Calls <strong data-field="calls">\${u.stats?.attempts || 0}</strong></div>
-            <div class="mini-line">Today <strong data-field="today_tokens" title="\${esc(tokenTitle('Today', u.usage?.today_tokens))}">\${fmtToken(u.usage?.today_tokens)}</strong></div>
-            <div class="mini-line">Total <strong data-field="total_tokens" title="Total \${fullToken(u.usage?.total_tokens || 0)} · Input \${fullToken(u.usage?.input_tokens || 0)} · Output \${fullToken(u.usage?.output_tokens || 0)}">\${fmtToken(u.usage?.total_tokens)}</strong></div>
-          </div>
-          <div class="workbench-cell" data-billing-fact title="\${esc(u.billing?.error || '')}">
-            <div class="mini-line">Billing <strong data-field="billing_state">\${esc(u.billing?.state || 'unknown')}</strong></div>
-            <div class="mini-line">Balance <strong class="money" data-field="balance" data-size="\${billingAmountSize(u, 'balance')}" title="\${esc(billingAmountTitle(u, 'balance'))}">\${billingAmountText(u, 'balance')}</strong></div>
-            <div class="mini-line">Limit <strong class="money" data-field="limit" data-size="\${billingAmountSize(u, 'limit')}" title="\${esc(billingAmountTitle(u, 'limit'))}">\${billingAmountText(u, 'limit')}</strong></div>
-            <div class="mini-line">Spent <strong class="money" data-field="spent" data-size="\${moneySize(u.billing?.used_amount, u.billing?.currency)}" title="\${esc(fullMoney(u.billing?.used_amount, u.billing?.currency))}">\${fmtMoney(u.billing?.used_amount, u.billing?.currency)}</strong></div>
-            \${billingErrorHtml(u)}
-            \${quotaLineHtml(u)}
-          </div>
-          <div class="workbench-actions">
-            <button class="ghost toggle-site \${u.enabled ? 'is-on' : 'is-off'}" type="button" data-toggle="\${esc(u.name)}" data-enabled="\${u.enabled ? 'true' : 'false'}" aria-pressed="\${u.enabled ? 'true' : 'false'}">\${icon(u.enabled ? 'pause' : 'play')}\${u.enabled ? '停用' : '启用'}</button>
-            <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
-            <button class="ghost claude-site" type="button" data-claude-check="\${esc(u.name)}" \${claudeCheckingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : claudeCheckingUpstreams.has(u.name) ? '检测中' : 'Claude'}</button>
-            <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('wallet')}\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
-            \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">\${icon('external')}签到</a>\` : ''}
-            <button class="ghost signin-action \${canSignin(u) ? '' : 'is-off'}" type="button" data-signin-available="\${esc(u.name)}" data-available="\${canSignin(u) ? 'true' : 'false'}" aria-pressed="\${canSignin(u) ? 'true' : 'false'}">\${icon(canSignin(u) ? 'x' : 'check')}\${canSignin(u) ? '设不可签' : '设可签'}</button>
-            <button class="ghost signin-action \${!canSignin(u) ? 'is-off' : signinCompleted(u) ? 'is-complete' : ''}" type="button" data-signin-complete="\${esc(u.name)}" \${!canSignin(u) ? 'disabled' : ''}>\${icon(!canSignin(u) || signinCompleted(u) ? 'x' : 'signin')}\${!canSignin(u) ? '不可签' : signinCompleted(u) ? '撤销' : '完成'}</button>
-            <button class="ghost delete-site" type="button" data-delete="\${esc(u.name)}" \${deletingUpstreams.has(u.name) ? 'disabled' : ''} aria-label="删除站点 \${esc(u.name)}">\${icon('trash')}\${deletingUpstreams.has(u.name) ? '删除中' : '删除'}</button>
-            \${claudeCardResultHtml(u.name)}
-          </div>
-          <div class="workbench-models-row">
-            <div class="model-strip-label">Discovered Models</div>
-            <div class="models" aria-label="\${esc(u.name)} discovered models">\${(u.health?.models || []).length ? (u.health.models || []).map(model => \`<button class="model-chip \${model === activeModel ? 'active' : ''}" type="button" data-model="\${esc(model)}" title="\${esc(model)}">\${esc(model)}</button>\`).join('') : '<span class="key">暂无模型列表</span>'}</div>
-          </div>
-        </article>\`).join('') : \`<div class="empty panel">\${allUps.length ? '暂无符合筛选的站点。' : '暂无站点。'}</div>\`;
+        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + workbenchRowsHtml(ups, activeModel, data) : \`<div class="empty panel">\${allUps.length ? '暂无符合筛选的 Upstream。' : '暂无 Upstream。'}</div>\`;
         cardsSignature = nextCardsSignature;
       } else {
         ups.forEach((upstream) => updateCard(upstream, activeModel));
@@ -9464,6 +9931,7 @@ function dashboardHtml() {
       markEditingCard();
     }
     async function probeAll() {
+      rememberAllInlineProbeRunning();
       renderProbeResult({ probe_status: 'running', summary: { total_count: upstreamCache.size, enabled_count: [...upstreamCache.values()].filter((upstream) => upstream.enabled).length } }, { mode: 'all', title: '全部测试结果', responseOk: true, error: '测试中' });
       try {
         const response = await fetch('/pool/probe', { method: 'POST', headers: authHeaders() });
@@ -9492,6 +9960,7 @@ function dashboardHtml() {
     }
     async function probeOne(name) {
       probingUpstreams.add(name);
+      rememberInlineProbeRunning(name);
       const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
       const button = card?.querySelector('[data-probe]');
       if (button) {
@@ -9771,6 +10240,9 @@ function dashboardHtml() {
     signinFilterButtons.forEach((button) => {
       button.addEventListener('click', () => setSigninFilter(button.dataset.signinFilter || 'all'));
     });
+    verificationFilterButtons.forEach((button) => {
+      button.addEventListener('click', () => setVerificationFilter(button.dataset.verificationFilter || 'all'));
+    });
     function showPendingSignin() {
       setSigninFilter('pending');
     }
@@ -9840,7 +10312,7 @@ function dashboardHtml() {
         setModel(button.dataset.model || '');
         return;
       }
-      if (event.target.closest('a, button, input, select, label')) return;
+      if (event.target.closest('a, button, input, select, label, .probe-inline')) return;
       const card = event.target.closest('[data-upstream]');
       if (!card) return;
       const upstream = upstreamCache.get(card.dataset.upstream);
@@ -9848,7 +10320,7 @@ function dashboardHtml() {
     });
     cards.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter' && event.key !== ' ') return;
-      if (event.target.closest('button, a, input, select, label')) return;
+      if (event.target.closest('button, a, input, select, label, .probe-inline')) return;
       const card = event.target.closest('[data-upstream]');
       if (!card) return;
       const upstream = upstreamCache.get(card.dataset.upstream);
@@ -9936,6 +10408,8 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     codex_oauth: upstream.codexOAuth,
     request_mode: upstream.requestMode,
     resolved_request_mode: upstream.resolvedRequestMode || undefined,
+    request_interface: requestInterfaceForUpstream(upstream),
+    route_strategies: normalizeRouteStrategies(upstream.routeStrategies),
     oauth_expires_at: upstream.oauthExpiresAt || undefined,
     oauth_client_id: upstream.oauthClientId || undefined,
     oauth_email: upstream.oauthEmail || undefined,
@@ -11152,7 +11626,11 @@ export function createPoolServer(config, options = {}) {
           preferredModel: requestedModel,
           allowUnknownModelFallback: networkAttempt > 1,
           candidateFilter: activeRequiresNativeResponses
-            ? (upstream) => canAttemptNativeResponses(pathname, upstream, requestedModel)
+            ? (upstream) => {
+                if (canAttemptNativeResponses(pathname, upstream, requestedModel)) return true;
+                return routeStrategyUsesChatCompletions(routeStrategyForUpstream(upstream, requestedModel)) &&
+                  compatibilityAdapterAllowed(state, requestedModel);
+              }
             : null
         });
         if (!candidate && activeRequiresNativeResponses && !compatibilityPlan && pathname === '/v1/responses') {
@@ -11175,9 +11653,31 @@ export function createPoolServer(config, options = {}) {
         const { upstream, key } = candidate;
         tried.add(`${upstream.name}:${key.index}`);
         const attemptedModel = requestedModel;
+        const learnedRouteStrategy = routeStrategyForUpstream(upstream, attemptedModel);
         const routePlan = planProtocolRoute({ pathname, upstream, model: attemptedModel, requiresNativeResponses: activeRequiresNativeResponses });
         const { useAnthropicAdapter, canUseChatAdapter, allowChatCompletionsAdapter, useCodexOAuth } = routePlan;
+        const forceNativeResponses = routeStrategyUsesNativeResponses(learnedRouteStrategy);
+        const forceChatCompletions = !forceNativeResponses && canUseChatAdapter && routeStrategyUsesChatCompletions(learnedRouteStrategy);
         let { useChatCompletionsAdapter } = routePlan;
+        if (forceChatCompletions) {
+          if (activeRequiresNativeResponses && !compatibilityPlan) {
+            compatibilityPlan = buildAdapterCompatibilityPlan({
+              req,
+              body: originalBody,
+              model: attemptedModel,
+              state,
+              options: responsesJsonOptions,
+              trigger: 'learned_route_strategy'
+            });
+            if (compatibilityPlan) {
+              activeRequiresNativeResponses = false;
+              activeBody = compatibilityPlan.strippedBody;
+            }
+          }
+          if (!activeRequiresNativeResponses) useChatCompletionsAdapter = true;
+        } else if (forceNativeResponses) {
+          useChatCompletionsAdapter = false;
+        }
 
         const attempt = networkAttempt;
         networkAttempt += 1;
@@ -11201,7 +11701,7 @@ export function createPoolServer(config, options = {}) {
             : useChatCompletionsAdapter || originalBodyIsJson
               ? buildJsonRequestHeaders(targetUrl, key.value, req.headers)
               : undefined;
-        const routeTrace = requestRouteTrace({
+        let routeTrace = requestRouteTrace({
           pathname,
           useAnthropicAdapter,
           useChatCompletionsAdapter,
@@ -11212,7 +11712,7 @@ export function createPoolServer(config, options = {}) {
           unsupportedInputTypes,
           unsupportedFieldTypes
         });
-        const compatibility = compatibilitySummary(compatibilityPlan, routeTrace);
+        let compatibility = compatibilitySummary(compatibilityPlan, routeTrace);
         let requestHeadersForAttempt = requestHeaders;
         let requestMethod = useAnthropicAdapter || useChatCompletionsAdapter ? 'POST' : req.method;
         let attemptTimeoutMs = timeoutMs;
@@ -11246,36 +11746,53 @@ export function createPoolServer(config, options = {}) {
         });
         if (
           result.type === 'retry' &&
-          allowChatCompletionsAdapter &&
+          canUseChatAdapter &&
           !useChatCompletionsAdapter &&
           upstream.requestMode === 'auto'
         ) {
-          useChatCompletionsAdapter = true;
-          targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
-          body = buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel);
-          requestHeadersForAttempt = buildJsonRequestHeaders(targetUrl, key.value, req.headers);
-          requestMethod = 'POST';
-          Object.assign(routeTrace, requestRouteTrace({
-            pathname,
-            useChatCompletionsAdapter: true,
-            requiresNativeResponses: activeRequiresNativeResponses,
-            unsupportedToolTypes,
-            unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
-            unsupportedInputTypes,
-            unsupportedFieldTypes
-          }));
-          result = await requestTrackedUpstream({
-            req,
-            body,
-            targetUrl,
-            upstream,
-            key,
-            timeoutMs,
-            allowRetry,
-            retryableStatus: state.retry.retryableStatus,
-            method: requestMethod,
-            headers: requestHeadersForAttempt
-          });
+          if (activeRequiresNativeResponses && !compatibilityPlan) {
+            compatibilityPlan = buildAdapterCompatibilityPlan({
+              req,
+              body: originalBody,
+              model: attemptedModel,
+              state,
+              options: responsesJsonOptions,
+              trigger: 'native_responses_failed'
+            });
+            if (compatibilityPlan) {
+              activeRequiresNativeResponses = false;
+              activeBody = compatibilityPlan.strippedBody;
+            }
+          }
+          if (!activeRequiresNativeResponses) {
+            useChatCompletionsAdapter = true;
+            targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
+            body = buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel);
+            requestHeadersForAttempt = buildJsonRequestHeaders(targetUrl, key.value, req.headers);
+            requestMethod = 'POST';
+            routeTrace = requestRouteTrace({
+              pathname,
+              useChatCompletionsAdapter: true,
+              requiresNativeResponses: activeRequiresNativeResponses,
+              unsupportedToolTypes,
+              unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
+              unsupportedInputTypes,
+              unsupportedFieldTypes
+            });
+            compatibility = compatibilitySummary(compatibilityPlan, routeTrace);
+            result = await requestTrackedUpstream({
+              req,
+              body,
+              targetUrl,
+              upstream,
+              key,
+              timeoutMs,
+              allowRetry,
+              retryableStatus: state.retry.retryableStatus,
+              method: requestMethod,
+              headers: requestHeadersForAttempt
+            });
+          }
         }
 
         if (result.type === 'response') {
@@ -11420,6 +11937,25 @@ export function createPoolServer(config, options = {}) {
               if (protocol) {
                 if (upstream.requestMode === 'auto' && (protocol === 'chat_completions' || protocol === 'responses')) {
                   upstream.resolvedRequestMode = protocol;
+                }
+                const learnedStrategy = protocol === 'chat_completions'
+                  ? compatibility
+                    ? 'chat_completions_compatibility'
+                    : 'chat_completions'
+                  : protocol === 'responses'
+                    ? 'responses'
+                    : protocol === 'anthropic_messages'
+                      ? compatibility
+                        ? 'anthropic_messages_compatibility'
+                        : 'anthropic_messages'
+                      : protocol === 'codex_oauth_responses'
+                        ? 'codex_oauth_responses'
+                        : '';
+                if (learnedStrategy) {
+                  learnRouteStrategy(upstream, attemptedModel, learnedStrategy, {
+                    source: 'real_traffic',
+                    reason: routeTrace?.adapter || ''
+                  });
                 }
                 upstream.cooldownUntil = 0;
                 upstream.failures = 0;

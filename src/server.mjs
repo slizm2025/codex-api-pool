@@ -700,6 +700,116 @@ function jsonResponse(res, statusCode, payload) {
   res.end(body);
 }
 
+function errorDisplay({ layer, category, severity = 'blocked', title, message, action = '' }) {
+  return {
+    layer,
+    category,
+    severity,
+    title,
+    message,
+    action
+  };
+}
+
+function noUpstreamsConfiguredDisplay() {
+  return errorDisplay({
+    layer: 'configuration',
+    category: 'no_upstreams_configured',
+    title: 'No Upstreams configured',
+    message: 'No Upstreams are configured in the Pool Configuration.',
+    action: 'Add at least one enabled Upstream with a configured Upstream Key.'
+  });
+}
+
+function noAvailableCandidateDisplay() {
+  return errorDisplay({
+    layer: 'configuration',
+    category: 'no_available_candidate',
+    title: 'No available Upstream candidate',
+    message: 'Selection could not find an enabled Upstream with an available Upstream Key for this request.',
+    action: 'Check Disabled Upstreams, missing Upstream Keys, Cooldown, Health State, and Model Override compatibility.'
+  });
+}
+
+function upstreamFailureDisplay(attempt = {}) {
+  const status = Number(attempt?.status || 0);
+  const reason = String(attempt?.reason || '');
+  const upstream = attempt?.upstream ? `Upstream ${attempt.upstream}` : 'The selected Upstream';
+  if (status === 429 || /rate.?limit|quota|retry-after/i.test(reason)) {
+    return errorDisplay({
+      layer: 'upstream',
+      category: 'rate_limit',
+      severity: 'retryable',
+      title: 'Upstream rate limit',
+      message: `${upstream} rejected the request with a rate limit response${status ? ` (HTTP ${status})` : ''}.`,
+      action: 'Wait for Retry-After or Cooldown to expire, reduce request rate, or enable another compatible Upstream.'
+    });
+  }
+  if (status === 0 && /timeout|timed out/i.test(reason)) {
+    return errorDisplay({
+      layer: 'upstream',
+      category: 'timeout',
+      severity: 'retryable',
+      title: 'Upstream timeout',
+      message: `${upstream} did not respond before the API Pool request timeout.`,
+      action: 'Check upstream latency, proxy/network connectivity, or increase request_timeout_ms if appropriate.'
+    });
+  }
+  if (status === 0) {
+    return errorDisplay({
+      layer: 'upstream',
+      category: 'network',
+      severity: 'retryable',
+      title: 'Upstream network error',
+      message: `${upstream} could not be reached by the API Pool.`,
+      action: 'Check DNS, TLS, proxy settings, and upstream base_url connectivity.'
+    });
+  }
+  if (status === 401 || status === 403 || /unauthorized|forbidden|invalid[_ -]?api[_ -]?key|permission/i.test(reason)) {
+    return errorDisplay({
+      layer: 'upstream',
+      category: 'auth',
+      title: 'Upstream authentication failed',
+      message: `${upstream} rejected the configured Upstream Key${status ? ` (HTTP ${status})` : ''}.`,
+      action: 'Verify the Upstream Key, account permissions, and auth mode for this Upstream.'
+    });
+  }
+  if (status >= 500 || (status >= 521 && status <= 524)) {
+    return errorDisplay({
+      layer: 'upstream',
+      category: 'server',
+      severity: 'retryable',
+      title: 'Upstream server error',
+      message: `${upstream} returned a server-side failure${status ? ` (HTTP ${status})` : ''}.`,
+      action: 'Try again later, check the upstream status page, or enable another compatible Upstream.'
+    });
+  }
+  return errorDisplay({
+    layer: 'upstream',
+    category: 'unknown',
+    severity: 'degraded',
+    title: 'Upstream request failed',
+    message: `${upstream} failed this request${status ? ` (HTTP ${status})` : ''}.`,
+    action: 'Inspect the attempt reason and upstream diagnostics for details.'
+  });
+}
+
+function requestCompatibilityDisplay() {
+  return errorDisplay({
+    layer: 'compatibility',
+    category: 'request_compatibility',
+    title: 'Native Responses Route required',
+    message: 'This request contains Responses-only Features that require a Native Responses Route, but no compatible Upstream is currently available.',
+    action: 'Enable a native /v1/responses Upstream, remove the Responses-only Features, or enable Adapter Compatibility Mode when lossy conversion is acceptable.'
+  });
+}
+
+function requestFailureDisplay({ attempts = [], nativeResponsesFailure = false } = {}) {
+  if (nativeResponsesFailure) return requestCompatibilityDisplay();
+  const lastAttempt = attempts[attempts.length - 1] || null;
+  return lastAttempt ? upstreamFailureDisplay(lastAttempt) : noAvailableCandidateDisplay();
+}
+
 async function readBody(req, maxBytes) {
   const chunks = [];
   let total = 0;
@@ -8074,12 +8184,6 @@ function dashboardHtml() {
     .signin-filter, .verification-filter { min-height: 32px; padding: 6px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.32); }
     .signin-filter.active, .verification-filter.active { color: var(--paper); background: var(--ink); border-color: var(--ink); }
     .signin-count { color: var(--muted); font-size: 12px; line-height: 1.35; }
-    .verification-tier-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.38); color: var(--muted); font-size: 12px; line-height: 1.35; }
-    .verification-tier-head strong { color: var(--ink); font-size: 13px; }
-    .verification-tier-head span { overflow-wrap: anywhere; }
-    .verification-tier-head[data-tier="real_verified"] { border-left: 4px solid var(--good); }
-    .verification-tier-head[data-tier="probe_only"] { border-left: 4px solid var(--cold); }
-    .verification-tier-head[data-tier="unavailable"] { border-left: 4px solid var(--bad); }
     .probe-site { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.28); }
     .probe-site[disabled] { cursor: wait; opacity: .68; transform: none; }
     .probe-inline { grid-column: 1 / -1; display: grid; gap: 8px; border-top: 1px dashed var(--line); padding-top: 10px; cursor: default; }
@@ -8996,6 +9100,18 @@ function dashboardHtml() {
       }
       return payload;
     }
+    function confirmAddUpstream(payload) {
+      if (payload.replace) return true;
+      const keyMode = payload.keys?.[0]?.value ? '明文 Key' : '环境变量';
+      return window.confirm([
+        '确认添加这个上游？',
+        '',
+        \`名称：\${payload.name}\`,
+        \`Base URL：\${payload.base_url}\`,
+        \`密钥模式：\${keyMode}\`,
+        '确认后会写入 Upstream Pool Configuration，并立即执行探测。'
+      ].join('\\n'));
+    }
     function protocolSupportValue(upstream = {}) {
       const capabilities = upstream.capabilities || {};
       const assumed = (name) => capabilities[name]?.source === 'user_declared' && capabilities[name]?.status === 'assumed';
@@ -9253,16 +9369,10 @@ function dashboardHtml() {
       completed: '今日已签',
       not_required: '无需签到'
     };
-    const verificationTierOrder = ['real_verified', 'probe_only', 'unavailable'];
     const verificationTierLabels = {
       real_verified: '真实请求验证',
       probe_only: '一层检测通过',
       unavailable: '不可用 / 未验证'
-    };
-    const verificationTierDescriptions = {
-      real_verified: '近期真实 Codex Model Interaction Request 已成功。',
-      probe_only: '第一层 Health Probe 已通过，但还没有新鲜真实请求成功证据。',
-      unavailable: '没有通过真实请求验证，也没有通过第一层 Health Probe。'
     };
     const verificationFilterLabels = {
       all: '全部',
@@ -9328,33 +9438,17 @@ function dashboardHtml() {
     function enabledBucket(upstream) {
       return upstream.enabled ? 0 : 1;
     }
-    function usabilityBucket(upstream, activeModel) {
-      if (!upstream.enabled) return 3;
-      if (upstream.available && upstreamSupportsModel(upstream, activeModel)) return 0;
-      if (upstream.available) return 1;
-      return 2;
+    function stableOrderIndex(upstream, fallback) {
+      return numeric(upstream.config_index, fallback);
     }
-    function verificationTierSortValue(upstream) {
-      const index = verificationTierOrder.indexOf(verificationTier(upstream));
-      return index < 0 ? verificationTierOrder.length : index;
-    }
-    function availabilitySortValue(upstream) {
-      const multiplier = numeric(upstream.availability?.multiplier, 1);
-      const rate = upstream.availability?.rate;
-      return multiplier * 1000 + (Number.isFinite(rate) ? rate : 0.9);
-    }
-    const sortedUpstreams = (items, activeModel = '') => [...items].sort((a, b) => (
-      verificationTierSortValue(a) - verificationTierSortValue(b) ||
-      enabledBucket(a) - enabledBucket(b) ||
-      usabilityBucket(a, activeModel) - usabilityBucket(b, activeModel) ||
-      availabilitySortValue(b) - availabilitySortValue(a) ||
-      numeric(b.availability?.samples) - numeric(a.availability?.samples) ||
-      numeric(b.selection_score, numeric(b.selection_weight, b.weight)) - numeric(a.selection_score, numeric(a.selection_weight, a.weight)) ||
-      numeric(b.selection_weight, b.weight) - numeric(a.selection_weight, a.weight) ||
-      numeric(a.failures) - numeric(b.failures) ||
-      numeric(a.ewma_latency_ms, Number.MAX_SAFE_INTEGER) - numeric(b.ewma_latency_ms, Number.MAX_SAFE_INTEGER) ||
-      String(a.name).localeCompare(String(b.name))
-    ));
+    const sortedUpstreams = (items) => [...items]
+      .map((upstream, index) => ({ upstream, index }))
+      .sort((a, b) => (
+        enabledBucket(a.upstream) - enabledBucket(b.upstream) ||
+        stableOrderIndex(a.upstream, a.index) - stableOrderIndex(b.upstream, b.index) ||
+        String(a.upstream.name).localeCompare(String(b.upstream.name))
+      ))
+      .map(({ upstream }) => upstream);
     function availabilityPercent(upstream) {
       const rate = upstream.availability?.rate;
       return Number.isFinite(rate) ? \`\${(rate * 100).toFixed(1)}%\` : '—';
@@ -9405,6 +9499,13 @@ function dashboardHtml() {
     const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key', 'missing_model_override', 'models_unsupported', 'unexpected_status'].includes(upstream.health?.state || '');
     function requestFailureText(request) {
       if (!request || request.outcome === 'ok') return '';
+      if (request.error_display?.title || request.error_display?.message) {
+        return [
+          request.error_display.title || '',
+          request.error_display.message || '',
+          request.error_display.action || ''
+        ].filter(Boolean).join(': ');
+      }
       const upstream = request.upstream ? ' on ' + request.upstream : '';
       const status = request.status ? 'HTTP ' + request.status : 'request failed';
       const reason = request.reason ? ': ' + request.reason : '';
@@ -9741,20 +9842,8 @@ function dashboardHtml() {
           \${inlineProbeResultHtml(u.name)}
         </article>\`;
     }
-    function workbenchTierHeadHtml(tier, count) {
-      return \`<div class="verification-tier-head" data-tier="\${tier}"><strong>\${esc(verificationTierLabels[tier] || tier)} · \${count}</strong><span>\${esc(verificationTierDescriptions[tier] || '')}</span></div>\`;
-    }
     function workbenchRowsHtml(items, activeModel, data) {
-      if (!items.length) return '';
-      let index = 0;
-      const body = [];
-      for (const tier of verificationTierOrder) {
-        const group = items.filter((upstream) => verificationTier(upstream) === tier);
-        if (!group.length) continue;
-        body.push(workbenchTierHeadHtml(tier, group.length));
-        body.push(...group.map((upstream) => workbenchCardHtml(upstream, activeModel, data, index++)));
-      }
-      return body.join('');
+      return items.map((upstream, index) => workbenchCardHtml(upstream, activeModel, data, index)).join('');
     }
     function renderRecentRequests(items) {
       const compatibilityText = (compatibility) => {
@@ -10342,6 +10431,7 @@ function dashboardHtml() {
         return;
       }
       const payload = applyClaudeSuggestion(formClaudePayload());
+      if (!confirmAddUpstream(payload)) return;
       const response = await fetch('/pool/upstreams', {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...authHeaders() },
@@ -10351,7 +10441,7 @@ function dashboardHtml() {
       const apiNote = result.api_detected || payload.api ? \`，协议：\${result.api || payload.api}\` : '';
       const probeNote = response.ok ? probeStatusNote(result) : '';
       setToast(response.ok
-        ? \`\${payload.replace ? '已保存' : '已添加'}：\${result.upstream}，探测状态：\${result.health?.state}\${probeNote}\${apiNote}\`
+        ? \`\${payload.replace ? '保存成功' : '添加成功'}：\${result.upstream}，探测状态：\${result.health?.state}\${probeNote}\${apiNote}\`
         : \`\${payload.replace ? '保存失败' : '添加失败'}：\${result.error}\`);
       if (response.ok) resetEdit();
       await load();
@@ -10398,6 +10488,7 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
   const effectiveHealthState = healthProbeEffectiveState(upstream.health, state.modelOverride);
   return {
     name: upstream.name,
+    config_index: upstream.index,
     base_url: upstream.baseUrl,
     site_url: upstream.siteUrl,
     signin_available: upstream.signinAvailable,
@@ -11573,7 +11664,7 @@ export function createPoolServer(config, options = {}) {
       }
 
       if (state.upstreams.length === 0) {
-        return jsonResponse(res, 503, { error: 'no upstreams configured' });
+        return jsonResponse(res, 503, { error: 'no upstreams configured', error_display: noUpstreamsConfiguredDisplay() });
       }
 
       const originalBody = await readBody(req, maxBodyBytes);
@@ -12087,6 +12178,7 @@ export function createPoolServer(config, options = {}) {
         unsupportedInputTypes,
         unsupportedFieldTypes
       });
+      const failureDisplay = requestFailureDisplay({ attempts, nativeResponsesFailure });
       if (modelInteractionRequest) {
         rememberRequest(state, {
           method: req.method,
@@ -12101,6 +12193,7 @@ export function createPoolServer(config, options = {}) {
           retried: attempts.length > 1,
           outcome: 'failed',
           reason: failureReason,
+          error_display: failureDisplay,
           route: failureRouteTrace,
           ...(compatibilityPlan ? { compatibility: compatibilitySummary(compatibilityPlan, failureRouteTrace) } : {})
         });
@@ -12109,6 +12202,7 @@ export function createPoolServer(config, options = {}) {
 
       const failurePayload = {
         error: failureReason,
+        error_display: failureDisplay,
         attempts
       };
       if (nativeResponsesFailure) {

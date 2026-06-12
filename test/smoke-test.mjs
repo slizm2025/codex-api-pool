@@ -1,6 +1,7 @@
 import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
+import vm from 'node:vm';
 import zlib from 'node:zlib';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -92,6 +93,288 @@ function createConnectProxy() {
     clientSocket.on('error', () => targetSocket.destroy());
   });
   return server;
+}
+
+function createClassList(element) {
+  const classes = new Set();
+  return {
+    add: (...items) => items.forEach((item) => classes.add(String(item))),
+    remove: (...items) => items.forEach((item) => classes.delete(String(item))),
+    contains: (item) => classes.has(String(item)),
+    toggle: (item, force) => {
+      const name = String(item);
+      const enabled = force === undefined ? !classes.has(name) : Boolean(force);
+      if (enabled) classes.add(name);
+      else classes.delete(name);
+      element.className = [...classes].join(' ');
+      return enabled;
+    }
+  };
+}
+
+class DashboardHarnessElement {
+  constructor(id = '', tagName = 'div') {
+    this.id = id;
+    this.tagName = tagName.toUpperCase();
+    this.dataset = {};
+    this.style = {};
+    this.attributes = {};
+    this.className = '';
+    this.classList = createClassList(this);
+    this.children = [];
+    this.disabled = false;
+    this.hidden = false;
+    this.checked = false;
+    this.value = '';
+    this.title = '';
+    this.renderedOrders = [];
+    this._innerHTML = '';
+    this._textContent = '';
+  }
+
+  set innerHTML(value) {
+    this._innerHTML = String(value ?? '');
+    if (this.id === 'cards') {
+      this.renderedOrders.push([...this._innerHTML.matchAll(/data-upstream="([^"]+)"/g)].map((match) => match[1]));
+    }
+  }
+
+  get innerHTML() {
+    return this._innerHTML;
+  }
+
+  set textContent(value) {
+    this._textContent = String(value ?? '');
+  }
+
+  get textContent() {
+    return this._textContent;
+  }
+
+  get firstElementChild() {
+    return this.children[0] || null;
+  }
+
+  addEventListener() {}
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+
+  appendChild(child) {
+    this.children.push(child);
+    return child;
+  }
+
+  remove() {}
+
+  click() {}
+
+  insertAdjacentHTML(position, html) {
+    this._innerHTML = position === 'afterbegin'
+      ? String(html ?? '') + this._innerHTML
+      : this._innerHTML + String(html ?? '');
+  }
+
+  closest() {
+    return null;
+  }
+
+  querySelector() {
+    return null;
+  }
+
+  querySelectorAll() {
+    return [];
+  }
+}
+
+class DashboardHarnessDocument {
+  constructor() {
+    this.elements = new Map();
+    this.body = this.element('body');
+    this.signinFilterButtons = ['all', 'pending', 'completed', 'not_required'].map((value) => {
+      const button = new DashboardHarnessElement('', 'button');
+      button.dataset.signinFilter = value;
+      return button;
+    });
+    this.verificationFilterButtons = ['all', 'real_verified', 'probe_only', 'unavailable'].map((value) => {
+      const button = new DashboardHarnessElement('', 'button');
+      button.dataset.verificationFilter = value;
+      return button;
+    });
+    this.seedForm();
+  }
+
+  element(id, tagName = 'div') {
+    if (!this.elements.has(id)) this.elements.set(id, new DashboardHarnessElement(id, tagName));
+    return this.elements.get(id);
+  }
+
+  seedForm() {
+    const form = this.element('addForm', 'form');
+    form.elements = {
+      name: new DashboardHarnessElement('', 'input'),
+      base_url: new DashboardHarnessElement('', 'input'),
+      site_url: new DashboardHarnessElement('', 'input'),
+      weight: new DashboardHarnessElement('', 'input'),
+      signin_available: new DashboardHarnessElement('', 'input'),
+      key_mode: new DashboardHarnessElement('', 'select'),
+      key_env: new DashboardHarnessElement('', 'input'),
+      key_value: new DashboardHarnessElement('', 'input'),
+      protocol_support: new DashboardHarnessElement('', 'select')
+    };
+    form.reset = () => {
+      for (const element of Object.values(form.elements)) {
+        element.value = '';
+        element.checked = false;
+      }
+    };
+  }
+
+  createElement(tagName) {
+    return new DashboardHarnessElement('', tagName);
+  }
+
+  querySelector(selector) {
+    if (selector === 'body') return this.body;
+    if (selector.startsWith('#')) return this.element(selector.slice(1));
+    return null;
+  }
+
+  querySelectorAll(selector) {
+    if (selector === '[data-signin-filter]') return this.signinFilterButtons;
+    if (selector === '[data-verification-filter]') return this.verificationFilterButtons;
+    return [];
+  }
+}
+
+function dashboardStatusFixture(upstreams, overrides = {}) {
+  return {
+    ok: true,
+    listen: '127.0.0.1:0',
+    public_prefix: '/v1',
+    model: { override: '', known: [] },
+    compatibility: {
+      adapter_mode: {
+        strip_responses_only_features: false,
+        adapters: { anthropic_messages: false, chat_completions: false }
+      }
+    },
+    representative_templates: {},
+    recent_requests: [],
+    usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0, daily: {} },
+    billing: {},
+    upstreams,
+    ...overrides
+  };
+}
+
+function dashboardUpstreamFixture(name, configIndex, overrides = {}) {
+  const available = overrides.available ?? true;
+  const healthState = overrides.health?.state || (available ? 'ok' : 'rate_limited');
+  return {
+    name,
+    config_index: configIndex,
+    base_url: `https://${name}.example/v1`,
+    site_url: '',
+    signin_available: false,
+    signin_status: 'not_required',
+    signin_completed: false,
+    signin_completed_date: '',
+    request_interface: { label: 'Pending Verification' },
+    enabled: true,
+    weight: 1,
+    selection_weight: 1,
+    selection_score: available ? 1 : 0,
+    representative_availability: { state: 'missing', verified: false },
+    available,
+    cooldown_ms: available ? 0 : 30000,
+    in_flight: 0,
+    successes: 0,
+    failures: 0,
+    ewma_latency_ms: 0,
+    last_status: 0,
+    last_error: '',
+    stats: { attempts: 0 },
+    availability: {
+      samples: 0,
+      successes: 0,
+      failures: 0,
+      rate: null,
+      multiplier: 1,
+      window_size: 50,
+      min_samples: 10,
+      recent: []
+    },
+    usage: { today_tokens: 0, total_tokens: 0, input_tokens: 0, output_tokens: 0, by_day: {} },
+    quota: {},
+    billing: {},
+    capabilities: {},
+    health: {
+      state: healthState,
+      raw_state: healthState,
+      checked_at: null,
+      latency_ms: 0,
+      http_status: 0,
+      error: '',
+      warning: '',
+      models: [],
+      models_count: 0
+    },
+    keys: [
+      {
+        label: 'TEST_UPSTREAM_KEY',
+        configured: true,
+        health: { state: 'unknown', error: '', warning: '' }
+      }
+    ],
+    ...overrides
+  };
+}
+
+async function renderDashboardWorkbenchOrders(dashboardHtmlText, statuses) {
+  const script = [...dashboardHtmlText.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).join('\n');
+  if (!script) throw new Error('expected dashboard HTML to include executable script');
+  const document = new DashboardHarnessDocument();
+  let statusIndex = 0;
+  const storage = new Map();
+  const context = {
+    document,
+    console,
+    CSS: { escape: (value) => String(value).replace(/["\\]/g, '\\$&') },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, String(value)),
+      removeItem: (key) => storage.delete(key)
+    },
+    navigator: { clipboard: { writeText: async () => {} } },
+    window: { confirm: () => true },
+    setInterval: () => 0,
+    clearInterval: () => {},
+    fetch: async (url) => {
+      if (url !== '/pool/status') {
+        return { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '' };
+      }
+      const status = statuses[Math.min(statusIndex, statuses.length - 1)];
+      return {
+        ok: true,
+        status: 200,
+        json: async () => JSON.parse(JSON.stringify(status))
+      };
+    }
+  };
+  vm.createContext(context);
+  vm.runInContext(script, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  const cards = document.element('cards');
+  const initialOrder = cards.renderedOrders.at(-1) || [];
+  const initialDiagnosticReason = document.element('diagnosticReason').textContent;
+  statusIndex = 1;
+  await context.load();
+  const refreshedOrder = cards.renderedOrders.at(-1) || [];
+  const refreshedDiagnosticReason = document.element('diagnosticReason').textContent;
+  return { initialOrder, refreshedOrder, initialDiagnosticReason, refreshedDiagnosticReason };
 }
 
 const lateTlsErrorKey = `-----BEGIN PRIVATE KEY-----
@@ -971,6 +1254,11 @@ const recoveringRawchat = createFakeUpstream('recovering-rawchat', ({ req, res, 
   }));
 });
 
+const rateLimitedOnly = createFakeUpstream('rate-limited-only', ({ res }) => {
+  res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '2' });
+  res.end(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'temporary upstream rate limit' } }));
+});
+
 const anthropicModels = createFakeUpstream('anthropic-models', ({ req, res, body }) => {
   if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -1142,6 +1430,7 @@ const cloudflareTimeoutInfo = await listen(cloudflareTimeout);
 const streamAbortInfo = await listen(streamAbort);
 const nextModelSiteInfo = await listen(nextModelSite);
 const recoveringRawchatInfo = await listen(recoveringRawchat);
+const rateLimitedOnlyInfo = await listen(rateLimitedOnly);
 const anthropicModelsInfo = await listen(anthropicModels);
 const dualProtocolModelsInfo = await listen(dualProtocolModels);
 const codexOauthBackendInfo = await listen(codexOauthBackend);
@@ -1220,8 +1509,68 @@ try {
   if (dashboard.text.includes('signinSortBucket')) {
     throw new Error('expected sign-in status to stay out of upstream sorting');
   }
-  if (!dashboard.text.includes('enabledBucket(a) - enabledBucket(b)') || !dashboard.text.includes('usabilityBucket(a, activeModel) - usabilityBucket(b, activeModel)')) {
-    throw new Error('expected upstream sorting to group enabled sites first, then usable enabled sites');
+  const stableWorkbenchOrder = await renderDashboardWorkbenchOrders(dashboard.text, [
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('alpha', 0, { selection_score: 1, selection_weight: 1 }),
+      dashboardUpstreamFixture('beta', 1, { selection_score: 25, selection_weight: 25 }),
+      dashboardUpstreamFixture('gamma', 2, { selection_score: 50, selection_weight: 50 })
+    ]),
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('alpha', 0, {
+        available: false,
+        selection_score: 0,
+        availability: { samples: 50, successes: 0, failures: 50, rate: 0, multiplier: 0.08, window_size: 50, min_samples: 10, recent: Array(50).fill(false) },
+        health: { state: 'rate_limited', raw_state: 'rate_limited', checked_at: null, latency_ms: 900, http_status: 429, error: 'rate limited', warning: '', models: [], models_count: 0 }
+      }),
+      dashboardUpstreamFixture('beta', 1, {
+        selection_score: 999,
+        selection_weight: 999,
+        availability: { samples: 50, successes: 50, failures: 0, rate: 1, multiplier: 1.4, window_size: 50, min_samples: 10, recent: Array(50).fill(true) },
+        representative_availability: { state: 'fresh', verified: true }
+      }),
+      dashboardUpstreamFixture('gamma', 2, { selection_score: 2, selection_weight: 2 })
+    ])
+  ]);
+  const expectedStableOrder = 'alpha,beta,gamma';
+  if (stableWorkbenchOrder.initialOrder.join(',') !== expectedStableOrder || stableWorkbenchOrder.refreshedOrder.join(',') !== expectedStableOrder) {
+    throw new Error(`expected Dashboard Workbench row order to stay stable across dynamic Runtime State changes: ${JSON.stringify(stableWorkbenchOrder)}`);
+  }
+  const classifiedDiagnostic = await renderDashboardWorkbenchOrders(dashboard.text, [
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('rate-limited-only', 0)
+    ], {
+      recent_requests: [
+        {
+          method: 'POST',
+          path: '/v1/responses',
+          upstream: 'rate-limited-only',
+          status: 502,
+          durationMs: null,
+          outcome: 'failed',
+          reason: 'all upstream attempts failed',
+          error_display: {
+            layer: 'upstream',
+            category: 'rate_limit',
+            severity: 'retryable',
+            title: 'Upstream rate limit',
+            message: 'Upstream rate-limited-only rejected the request with a rate limit response (HTTP 429).',
+            action: 'Wait for Retry-After or Cooldown to expire.'
+          }
+        }
+      ]
+    })
+  ]);
+  if (
+    !classifiedDiagnostic.initialDiagnosticReason.includes('Upstream rate limit') ||
+    !classifiedDiagnostic.initialDiagnosticReason.includes('rate-limited-only')
+  ) {
+    throw new Error(`expected Top Diagnostic Bar to prefer classified error display text: ${JSON.stringify(classifiedDiagnostic)}`);
+  }
+  const initialStatus = await getJson(`${poolInfo.url}/pool/status`, 'pool-secret');
+  const badStatus = initialStatus.json.upstreams?.find((upstream) => upstream.name === 'bad');
+  const goodStatus = initialStatus.json.upstreams?.find((upstream) => upstream.name === 'good');
+  if (badStatus?.config_index !== 0 || goodStatus?.config_index !== 1) {
+    throw new Error(`expected status payload to expose stable upstream config_index values: ${initialStatus.text}`);
   }
   const availabilityHistorySourceIndex = dashboard.text.indexOf('...history.map((ok) =>');
   const availabilityEmptySourceIndex = dashboard.text.indexOf('...Array.from({ length: emptyCount }');
@@ -1273,7 +1622,7 @@ try {
       request_timeout_ms: 5000
     },
     retry: {
-      max_attempts: 1,
+      max_attempts: 2,
       failure_threshold: 1,
       base_cooldown_ms: 1000,
       key_cooldown_ms: 1000
@@ -1299,6 +1648,86 @@ try {
     }
   } finally {
     await close(authFailPool);
+  }
+
+  const emptyPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
+    upstreams: []
+  });
+  const emptyPoolInfo = await listen(emptyPool);
+  try {
+    const noUpstreams = await requestJson(emptyPoolInfo.url, 'pool-secret');
+    if (
+      noUpstreams.response.status !== 503 ||
+      noUpstreams.json.error !== 'no upstreams configured' ||
+      noUpstreams.json.error_display?.layer !== 'configuration' ||
+      noUpstreams.json.error_display?.category !== 'no_upstreams_configured' ||
+      !String(noUpstreams.json.error_display?.message || '').includes('No Upstreams are configured')
+    ) {
+      throw new Error(`expected no-upstreams response to keep legacy error and add display classification: ${noUpstreams.text}`);
+    }
+  } finally {
+    await close(emptyPool);
+  }
+
+  const rateLimitDisplayPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 2,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 50 },
+    upstreams: [
+      { name: 'rate-limited-only', base_url: `${rateLimitedOnlyInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const rateLimitDisplayInfo = await listen(rateLimitDisplayPool);
+  try {
+    const rateLimitFailure = await requestJson(rateLimitDisplayInfo.url, 'pool-secret');
+    if (
+      rateLimitFailure.response.status !== 502 ||
+      rateLimitFailure.json.error !== 'all upstream attempts failed' ||
+      rateLimitFailure.json.error_display?.layer !== 'upstream' ||
+      rateLimitFailure.json.error_display?.category !== 'rate_limit' ||
+      !String(rateLimitFailure.json.error_display?.message || '').includes('rate-limited-only') ||
+      !String(rateLimitFailure.json.error_display?.action || '').includes('Retry-After')
+    ) {
+      throw new Error(`expected rate-limited upstream failure to add display classification without changing legacy error: ${rateLimitFailure.text}`);
+    }
+    const rateLimitStatus = (await getJson(`${rateLimitDisplayInfo.url}/pool/status`, 'pool-secret')).json;
+    const latestRateLimitRequest = rateLimitStatus.recent_requests?.[0];
+    if (
+      latestRateLimitRequest?.reason !== 'all upstream attempts failed' ||
+      latestRateLimitRequest?.error_display?.layer !== 'upstream' ||
+      latestRateLimitRequest?.error_display?.category !== 'rate_limit'
+    ) {
+      throw new Error(`expected recent request to keep reason and add rate-limit display classification: ${JSON.stringify(latestRateLimitRequest)}`);
+    }
+  } finally {
+    await close(rateLimitDisplayPool);
   }
 
   const result = await requestJson(poolInfo.url, 'pool-secret');
@@ -2052,6 +2481,9 @@ try {
       json.unsupported_tool_types?.[0] !== 'web_search_preview' ||
       !String(json.error || '').includes('no compatible upstream candidate') ||
       json.attempts?.length !== 0 ||
+      json.error_display?.layer !== 'compatibility' ||
+      json.error_display?.category !== 'request_compatibility' ||
+      !String(json.error_display?.message || '').includes('Native Responses Route') ||
       json.incompatible_upstreams?.[0]?.upstream !== 'explicit-chat-only' ||
       !String(json.incompatible_upstreams?.[0]?.reason || '').includes('request_mode=chat_completions') ||
       chatOnlyResponsesHits !== 0 ||
@@ -5799,6 +6231,7 @@ try {
   await close(pool);
   await close(dualProtocolModels);
   await close(anthropicModels);
+  await close(rateLimitedOnly);
   await close(recoveringRawchat);
   await close(billingLoginHtmlUpstream);
   await close(billingBlockedUpstream);

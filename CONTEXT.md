@@ -28,6 +28,14 @@ _Avoid_: circuit breaker, fuse, disabled
 A user-controlled state that keeps an Upstream out of request selection until it is explicitly enabled again.
 _Avoid_: cooldown, failed, unavailable
 
+**Active Upstream**:
+An Upstream that is allowed to participate in Selection when its keys, Health State, cooldown, model support, and other eligibility checks also allow it.
+_Avoid_: available upstream, healthy upstream, enabled site
+
+**Quarantined Upstream**:
+A user-isolated Upstream that is kept out of Selection until it is manually returned to active use, while remaining available for operational checks.
+_Avoid_: disabled, inactive, boxed site, unstable site
+
 **Health State**:
 The API Pool's latest classification of an Upstream's observed availability, such as `ok`, `missing_key`, `rate_limited`, `server_error`, `network_error`, or `timeout`.
 _Avoid_: status, state, result
@@ -193,5 +201,5 @@ A Management Dashboard action that is low-risk or easily reversible, such as ref
 _Avoid_: harmless action, button action, quick action
 
 **Confirmed Dashboard Action**:
-A Management Dashboard action that should require explicit confirmation because it can affect Selection, Pool Configuration, or secret handling, such as disabling an Upstream, replacing existing Upstream configuration, or saving a plaintext Upstream Key.
+A Management Dashboard action that should require explicit confirmation because it can affect Selection, Pool Configuration, or secret handling, such as disabling an Upstream, moving an Upstream into or out of Quarantine, replacing existing Upstream configuration, or saving a plaintext Upstream Key.
 _Avoid_: dangerous action, admin action, destructive action

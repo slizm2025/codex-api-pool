@@ -14,6 +14,18 @@
 - Management API probe 失败时会在本次响应中返回 `health.upstream_result`，包含上游状态码、响应头、响应体、错误和 retry-after，便于后续判断。
 - 基于真实 rawchat 上游复测修正 auto request-mode 学习条件：只有解析到具体模型输出的真实请求才会写入 `resolvedRequestMode` 和 `real_traffic` 证据，避免 `HTTP 200 + code/msg/data:null` 这类商家业务错误把上游误学习为 chat-only 并短路后续真实请求验证；同时 success accounting 现在会解析 gzip/br/deflate JSON/SSE 响应体。
 
+### Dashboard 稳定排序
+
+- Upstream Workbench 默认排序改为启用状态分组后按 Pool Configuration 顺序稳定展示；`selection_score`、`selection_weight`、Availability、失败次数、延迟和 Verification Tier 继续展示/筛选，但不再让行在刷新时频繁换位。
+- `/pool/status.upstreams[]` 新增 `config_index`，让 Management Dashboard 能在 Runtime State 变化时保留配置顺序。
+- smoke 测试新增 Dashboard 渲染级行为覆盖，验证动态 Runtime State 大幅变化后 Workbench 行顺序仍保持稳定。
+
+### API Pool 报错展示分类
+
+- 模型请求失败响应新增只读 `error_display` 投影，按 `layer/category/severity/title/message/action` 描述错误来源；现有 `error`、`reason`、`attempts`、HTTP status、Retry、Cooldown 和 Selection 逻辑保持不变。
+- 覆盖无 Upstream 配置、无可用候选、上游 rate limit/auth/timeout/network/server failure，以及 Native Responses Route 兼容性失败等展示分类。
+- Recent Request Timeline 记录同一 `error_display`，Top Diagnostic Bar 优先展示分类后的可读文案，缺失时继续回退旧 `reason`。
+
 ### 验证
 
 已通过：

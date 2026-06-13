@@ -701,6 +701,22 @@ function jsonResponse(res, statusCode, payload) {
   res.end(body);
 }
 
+function anthropicErrorResponse(res, statusCode, errorType, message) {
+  const payload = {
+    type: 'error',
+    error: {
+      type: errorType,
+      message: message
+    }
+  };
+  const body = Buffer.from(`${JSON.stringify(payload, null, 2)}\n`);
+  res.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': body.length
+  });
+  res.end(body);
+}
+
 function errorDisplay({ layer, category, severity = 'blocked', title, message, action = '' }) {
   return {
     layer,
@@ -852,9 +868,13 @@ function jsonObjectFromRequestBody(req, body, options = {}) {
 function buildJsonRequestHeaders(targetUrl, keyValue, incomingHeaders = {}) {
   const headers = sanitizeRequestHeaders(incomingHeaders, keyValue, targetUrl);
   for (const name of Object.keys(headers)) {
-    if (name.toLowerCase() === 'content-type') delete headers[name];
+    const lowerName = name.toLowerCase();
+    if (lowerName === 'content-type' || lowerName === 'content-length') {
+      delete headers[name];
+    }
   }
   headers['content-type'] = 'application/json';
+  // Note: content-length will be set automatically by http.request based on the body
   return headers;
 }
 
@@ -2332,6 +2352,612 @@ function unsupportedResponsesToolTypesFromBody(req, body, options = {}) {
   return payload ? unsupportedResponsesToolTypesFromPayload(payload) : [];
 }
 
+// Messages-only Features detection
+const COMPUTER_USE_TOOL_TYPES = new Set([
+  'computer_20241022',
+  'text_editor_20241022',
+  'bash_20241022'
+]);
+
+function messagesOnlyFeaturesFromPayload(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const features = new Set();
+
+  // Check system-level cache_control
+  if (Array.isArray(payload.system)) {
+    for (const block of payload.system) {
+      if (block && typeof block === 'object' && block.cache_control) {
+        features.add('cache_control');
+        break;
+      }
+    }
+  }
+
+  // Check messages for cache_control and thinking blocks
+  if (Array.isArray(payload.messages)) {
+    for (const message of payload.messages) {
+      if (!message || typeof message !== 'object') continue;
+
+      // Message-level cache_control
+      if (message.cache_control) {
+        features.add('cache_control');
+      }
+
+      // Content blocks
+      if (Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (!block || typeof block !== 'object') continue;
+
+          // Thinking blocks
+          if (block.type === 'thinking') {
+            features.add('thinking');
+          }
+
+          // Content-level cache_control
+          if (block.cache_control) {
+            features.add('cache_control');
+          }
+        }
+      }
+    }
+  }
+
+  // Check tools for Computer Use and cache_control
+  if (Array.isArray(payload.tools)) {
+    for (const tool of payload.tools) {
+      if (!tool || typeof tool !== 'object') continue;
+
+      // Computer Use tools - report the specific tool type for clearer diagnostics
+      if (typeof tool.type === 'string' && COMPUTER_USE_TOOL_TYPES.has(tool.type)) {
+        features.add(tool.type);
+      }
+
+      // Tool-level cache_control
+      if (tool.cache_control) {
+        features.add('cache_control');
+      }
+    }
+  }
+
+  return [...features];
+}
+
+function messagesOnlyFeaturesFromBody(req, body, options = {}) {
+  const payload = jsonObjectFromRequestBody(req, body, options);
+  return payload ? messagesOnlyFeaturesFromPayload(payload) : [];
+}
+
+// Messages → Chat Completions conversion
+function anthropicMessagesToChatMessages(messages, options = {}) {
+  if (!Array.isArray(messages)) return [];
+  const stripFeatures = options.stripMessagesOnlyFeatures || false;
+  const chatMessages = [];
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const content = message.content;
+
+    // Handle string content
+    if (typeof content === 'string') {
+      chatMessages.push({ role, content });
+      continue;
+    }
+
+    // Handle array content
+    if (!Array.isArray(content)) continue;
+
+    let textParts = [];
+    let toolCalls = [];
+
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+
+      // Strip thinking blocks if enabled
+      if (block.type === 'thinking' && stripFeatures) {
+        continue;
+      }
+
+      // Text blocks
+      if (block.type === 'text') {
+        textParts.push(block.text || '');
+      }
+
+      // Image blocks
+      else if (block.type === 'image') {
+        // Convert to OpenAI image_url format
+        const source = block.source;
+        if (source && source.type === 'base64') {
+          textParts.push({
+            type: 'image_url',
+            image_url: {
+              url: `data:${source.media_type || 'image/jpeg'};base64,${source.data}`
+            }
+          });
+        } else if (source && source.type === 'url') {
+          textParts.push({
+            type: 'image_url',
+            image_url: { url: source.url }
+          });
+        }
+      }
+
+      // Tool use blocks (Anthropic → Chat tool_calls)
+      else if (block.type === 'tool_use') {
+        toolCalls.push({
+          id: block.id || `call_${now().toString(36)}`,
+          type: 'function',
+          function: {
+            name: block.name || 'unknown',
+            arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input || {})
+          }
+        });
+      }
+
+      // Tool result blocks (Anthropic user message with tool_result → Chat tool message)
+      else if (block.type === 'tool_result') {
+        chatMessages.push({
+          role: 'tool',
+          tool_call_id: block.tool_use_id || '',
+          content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content || '')
+        });
+      }
+    }
+
+    // Build chat message
+    if (toolCalls.length > 0) {
+      // Assistant message with tool calls
+      const textContent = textParts.filter(p => typeof p === 'string').join('\n').trim();
+      chatMessages.push({
+        role: 'assistant',
+        content: textContent || null,
+        tool_calls: toolCalls
+      });
+    } else if (textParts.length > 0) {
+      // Regular message with text/images
+      const hasImages = textParts.some(p => typeof p === 'object');
+      if (hasImages) {
+        // Convert to content array format
+        const contentArray = textParts.flatMap(p => {
+          if (typeof p === 'string') {
+            return p ? [{ type: 'text', text: p }] : [];
+          }
+          return [p]; // Already in { type: 'image_url', image_url: {...} } format
+        });
+        chatMessages.push({ role, content: contentArray });
+      } else {
+        // Simple text content
+        const text = textParts.join('\n').trim();
+        if (text) chatMessages.push({ role, content: text });
+      }
+    }
+  }
+
+  return chatMessages;
+}
+
+function anthropicSystemToChatSystem(system, options = {}) {
+  const stripFeatures = options.stripMessagesOnlyFeatures || false;
+
+  // Handle string system
+  if (typeof system === 'string') {
+    return system.trim();
+  }
+
+  // Handle array system
+  if (Array.isArray(system)) {
+    const textParts = [];
+    for (const block of system) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'text') {
+        textParts.push(block.text || '');
+      }
+      // Strip cache_control (handled by checking for it separately)
+    }
+    return textParts.join('\n').trim();
+  }
+
+  return '';
+}
+
+function anthropicToolsToChatTools(tools, options = {}) {
+  if (!Array.isArray(tools)) return null;
+  const stripFeatures = options.stripMessagesOnlyFeatures || false;
+
+  const chatTools = [];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== 'object') continue;
+
+    // Strip Computer Use tools if enabled
+    if (stripFeatures && COMPUTER_USE_TOOL_TYPES.has(tool.type)) {
+      continue;
+    }
+
+    // Only convert standard tools
+    if (!tool.name || !tool.input_schema) continue;
+
+    chatTools.push({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: tool.input_schema || { type: 'object', properties: {} }
+      }
+    });
+  }
+
+  return chatTools.length > 0 ? chatTools : null;
+}
+
+function anthropicToolChoiceToChatToolChoice(toolChoice) {
+  if (!toolChoice) return undefined;
+
+  if (typeof toolChoice === 'object') {
+    const type = toolChoice.type;
+
+    if (type === 'auto') return 'auto';
+    if (type === 'any') return 'required';
+    if (type === 'tool' && toolChoice.name) {
+      return {
+        type: 'function',
+        function: { name: toolChoice.name }
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function buildChatCompletionsFromMessages(body, model, options = {}) {
+  let payload;
+  try {
+    payload = JSON.parse(body.toString('utf8') || '{}');
+  } catch (error) {
+    const err = new Error(`invalid JSON body: ${error.message}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const stripFeatures = options.stripMessagesOnlyFeatures || false;
+
+  // Convert messages
+  const chatMessages = anthropicMessagesToChatMessages(payload.messages, { stripMessagesOnlyFeatures: stripFeatures });
+
+  // Convert system prompt and prepend as system message
+  const systemText = anthropicSystemToChatSystem(payload.system, { stripMessagesOnlyFeatures: stripFeatures });
+  const finalMessages = [
+    ...(systemText ? [{ role: 'system', content: systemText }] : []),
+    ...chatMessages
+  ];
+
+  // Build Chat Completions payload
+  const chat = {
+    model: model || payload.model,
+    messages: finalMessages.length > 0 ? finalMessages : [{ role: 'user', content: '' }],
+    stream: Boolean(payload.stream)
+  };
+
+  // Convert tools
+  const chatTools = anthropicToolsToChatTools(payload.tools, { stripMessagesOnlyFeatures: stripFeatures });
+  if (chatTools) chat.tools = chatTools;
+
+  // Convert tool_choice
+  const chatToolChoice = anthropicToolChoiceToChatToolChoice(payload.tool_choice);
+  if (chatToolChoice !== undefined) chat.tool_choice = chatToolChoice;
+
+  // Max tokens
+  if (typeof payload.max_tokens === 'number') {
+    chat.max_completion_tokens = payload.max_tokens;
+  }
+
+  // Temperature, top_p
+  if (typeof payload.temperature === 'number') chat.temperature = payload.temperature;
+  if (typeof payload.top_p === 'number') chat.top_p = payload.top_p;
+
+  // Stop sequences
+  if (Array.isArray(payload.stop_sequences)) {
+    chat.stop = payload.stop_sequences;
+  }
+
+  // Output format
+  if (payload.output_config?.format?.type === 'json_schema') {
+    chat.response_format = {
+      type: 'json_schema',
+      json_schema: payload.output_config.format.json_schema
+    };
+  }
+
+  // Metadata → user
+  if (payload.metadata?.user_id) {
+    chat.user = payload.metadata.user_id;
+  }
+
+  // Stream options
+  if (chat.stream && !chat.stream_options) {
+    chat.stream_options = { include_usage: true };
+  }
+
+  return Buffer.from(JSON.stringify(chat));
+}
+
+// Chat Completions → Messages response conversion
+
+function chatFinishReasonToMessagesStopReason(finishReason) {
+  if (!finishReason) return 'end_turn';
+
+  switch (finishReason) {
+    case 'stop': return 'end_turn';
+    case 'length': return 'max_tokens';
+    case 'tool_calls': return 'tool_use';
+    case 'content_filter': return 'stop_sequence';
+    default: return 'end_turn';
+  }
+}
+
+function chatToolCallsToAnthropicContent(toolCalls) {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+
+  return toolCalls.map(toolCall => {
+    let input = {};
+    try {
+      input = typeof toolCall.function?.arguments === 'string'
+        ? JSON.parse(toolCall.function.arguments)
+        : toolCall.function?.arguments || {};
+    } catch {
+      input = {};
+    }
+
+    return {
+      type: 'tool_use',
+      id: toolCall.id || `toolu_${now().toString(36)}`,
+      name: toolCall.function?.name || 'unknown',
+      input
+    };
+  });
+}
+
+function chatCompletionToMessagesJson(body, model) {
+  let completion;
+  try {
+    completion = JSON.parse(body.toString('utf8') || '{}');
+  } catch {
+    return body;
+  }
+
+  const choice = completion.choices?.[0];
+  if (!choice) return body;
+
+  const message = choice.message || {};
+  const content = [];
+
+  // Add text content
+  if (typeof message.content === 'string' && message.content) {
+    content.push({
+      type: 'text',
+      text: message.content
+    });
+  }
+
+  // Add tool calls
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    content.push(...chatToolCallsToAnthropicContent(message.tool_calls));
+  }
+
+  // Build Messages response
+  const messagesResponse = {
+    id: completion.id?.replace('chatcmpl-', 'msg_') || `msg_${now().toString(36)}`,
+    type: 'message',
+    role: 'assistant',
+    content,
+    model: completion.model || model || '',
+    stop_reason: chatFinishReasonToMessagesStopReason(choice.finish_reason),
+    stop_sequence: null,
+    usage: {
+      input_tokens: completion.usage?.prompt_tokens || 0,
+      output_tokens: completion.usage?.completion_tokens || 0
+    }
+  };
+
+  return Buffer.from(JSON.stringify(messagesResponse));
+}
+
+function createChatToMessagesStreamAdapter(res, model) {
+  let buffer = '';
+  let messageId = `msg_${now().toString(36)}`;
+  let messageStarted = false;
+  let contentBlockIndex = 0;
+  let currentContentBlock = null;
+  let toolCallsBuffer = new Map(); // id -> { name, arguments }
+  let finishReason = null;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let responseModel = model || '';
+
+  function ensureMessageStarted() {
+    if (messageStarted) return;
+    messageStarted = true;
+
+    res.write('event: message_start\n');
+    res.write(`data: ${JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: responseModel,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    })}\n\n`);
+  }
+
+  function startContentBlock(type, data = {}) {
+    ensureMessageStarted();
+    currentContentBlock = { type, index: contentBlockIndex, ...data };
+
+    res.write('event: content_block_start\n');
+    res.write(`data: ${JSON.stringify({
+      type: 'content_block_start',
+      index: contentBlockIndex,
+      content_block: type === 'text'
+        ? { type: 'text', text: '' }
+        : { type: 'tool_use', id: data.id, name: data.name, input: {} }
+    })}\n\n`);
+  }
+
+  function writeTextDelta(text) {
+    if (!currentContentBlock || currentContentBlock.type !== 'text') {
+      startContentBlock('text');
+    }
+
+    res.write('event: content_block_delta\n');
+    res.write(`data: ${JSON.stringify({
+      type: 'content_block_delta',
+      index: contentBlockIndex,
+      delta: { type: 'text_delta', text }
+    })}\n\n`);
+  }
+
+  function writeToolUseDelta(partialJson) {
+    res.write('event: content_block_delta\n');
+    res.write(`data: ${JSON.stringify({
+      type: 'content_block_delta',
+      index: contentBlockIndex,
+      delta: { type: 'input_json_delta', partial_json: partialJson }
+    })}\n\n`);
+  }
+
+  function stopContentBlock() {
+    if (currentContentBlock) {
+      res.write('event: content_block_stop\n');
+      res.write(`data: ${JSON.stringify({
+        type: 'content_block_stop',
+        index: contentBlockIndex
+      })}\n\n`);
+
+      contentBlockIndex++;
+      currentContentBlock = null;
+    }
+  }
+
+  function writeMessageStop() {
+    stopContentBlock();
+
+    res.write('event: message_delta\n');
+    res.write(`data: ${JSON.stringify({
+      type: 'message_delta',
+      delta: {
+        stop_reason: chatFinishReasonToMessagesStopReason(finishReason),
+        stop_sequence: null
+      },
+      usage: { output_tokens: totalOutputTokens }
+    })}\n\n`);
+
+    res.write('event: message_stop\n');
+    res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+  }
+
+  function handleChunk(chunk) {
+    const { payload } = parseSseEvent(chunk);
+    if (!payload || payload === '[DONE]') {
+      if (payload === '[DONE]') {
+        writeMessageStop();
+      }
+      return;
+    }
+
+    let event;
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      return;
+    }
+
+    // Extract model and ID
+    if (event.id) {
+      messageId = event.id.replace('chatcmpl-', 'msg_');
+    }
+    if (event.model) {
+      responseModel = event.model;
+    }
+
+    const choice = event.choices?.[0];
+    if (!choice) return;
+
+    const delta = choice.delta || {};
+
+    // Handle role (message start)
+    if (delta.role && !messageStarted) {
+      ensureMessageStarted();
+    }
+
+    // Handle text content
+    if (typeof delta.content === 'string' && delta.content) {
+      writeTextDelta(delta.content);
+    }
+
+    // Handle tool calls
+    if (Array.isArray(delta.tool_calls)) {
+      for (const toolCall of delta.tool_calls) {
+        const index = toolCall.index || 0;
+        const id = toolCall.id || `toolu_${index}`;
+
+        if (!toolCallsBuffer.has(id)) {
+          // New tool call - stop previous content block and start new one
+          stopContentBlock();
+
+          const name = toolCall.function?.name || 'unknown';
+          toolCallsBuffer.set(id, { name, arguments: '' });
+
+          startContentBlock('tool_use', { id, name });
+        }
+
+        // Accumulate arguments
+        if (toolCall.function?.arguments) {
+          const toolData = toolCallsBuffer.get(id);
+          toolData.arguments += toolCall.function.arguments;
+          writeToolUseDelta(toolCall.function.arguments);
+        }
+      }
+    }
+
+    // Handle finish reason
+    if (choice.finish_reason) {
+      finishReason = choice.finish_reason;
+    }
+
+    // Handle usage (if present in streaming)
+    if (event.usage) {
+      totalInputTokens = event.usage.prompt_tokens || 0;
+      totalOutputTokens = event.usage.completion_tokens || 0;
+    }
+  }
+
+  return {
+    write(chunk) {
+      buffer += chunk.toString('utf8');
+      for (;;) {
+        const boundary = findSseBoundary(buffer);
+        if (!boundary) break;
+        const eventText = buffer.slice(0, boundary.index + boundary.length);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        handleChunk(eventText);
+      }
+    },
+    end() {
+      if (buffer) {
+        handleChunk(buffer);
+        buffer = '';
+      }
+      writeMessageStop();
+      res.end();
+    }
+  };
+}
+
 const CONVERTIBLE_RESPONSES_INPUT_ITEM_TYPES = new Set([
   'message',
   'function_call',
@@ -3747,16 +4373,18 @@ function normalizeCompatibilityConfig(input = {}) {
   const adapterMode = input?.adapter_mode && typeof input.adapter_mode === 'object' && !Array.isArray(input.adapter_mode)
     ? input.adapter_mode
     : {};
-  const enabled = booleanOption(adapterMode.strip_responses_only_features, false);
+  const stripResponsesOnlyFeatures = booleanOption(adapterMode.strip_responses_only_features, false);
+  const stripMessagesOnlyFeatures = booleanOption(adapterMode.strip_messages_only_features, false);
   const adapters = adapterMode.adapters && typeof adapterMode.adapters === 'object' && !Array.isArray(adapterMode.adapters)
     ? adapterMode.adapters
     : {};
   return {
     adapterMode: {
-      stripResponsesOnlyFeatures: enabled,
+      stripResponsesOnlyFeatures,
+      stripMessagesOnlyFeatures,
       adapters: {
-        anthropicMessages: adapters.anthropic_messages === undefined ? enabled : booleanOption(adapters.anthropic_messages, false),
-        chatCompletions: adapters.chat_completions === undefined ? enabled : booleanOption(adapters.chat_completions, false)
+        anthropicMessages: adapters.anthropic_messages === undefined ? stripResponsesOnlyFeatures : booleanOption(adapters.anthropic_messages, false),
+        chatCompletions: adapters.chat_completions === undefined ? (stripResponsesOnlyFeatures || stripMessagesOnlyFeatures) : booleanOption(adapters.chat_completions, false)
       }
     }
   };
@@ -6057,6 +6685,7 @@ function finishResponseAttempt({ state, upstream, key, method, pathname, incomin
   rememberRequest(state, {
     method,
     path: pathname,
+    entry_protocol: 'responses',
     ...requestDebugFields(incomingHeaders),
     upstream: upstream.name,
     key: key.label,
@@ -12111,6 +12740,384 @@ export function createPoolServer(config, options = {}) {
         return await handlePoolApi(req, res, config, state, options, statsPath, runtime);
       }
 
+      // Handle Messages API entry point
+      if (pathname === '/v1/messages') {
+        if (!isAuthorized(req, config)) {
+          return anthropicErrorResponse(res, 401, 'authentication_error', 'unauthorized: invalid API pool token');
+        }
+
+        if (state.upstreams.length === 0) {
+          return anthropicErrorResponse(res, 503, 'overloaded_error', 'no upstreams configured');
+        }
+
+        const originalBody = await readBody(req, maxBodyBytes);
+        let payload;
+        try {
+          payload = JSON.parse(originalBody.toString('utf8') || '{}');
+        } catch (error) {
+          return anthropicErrorResponse(res, 400, 'invalid_request_error', `invalid JSON body: ${error.message}`);
+        }
+
+        // Validate required fields
+        if (!payload.model || typeof payload.model !== 'string') {
+          return anthropicErrorResponse(res, 400, 'invalid_request_error', 'missing required field: model');
+        }
+        if (!Array.isArray(payload.messages)) {
+          return anthropicErrorResponse(res, 400, 'invalid_request_error', 'missing required field: messages');
+        }
+        if (typeof payload.max_tokens !== 'number' || payload.max_tokens <= 0) {
+          return anthropicErrorResponse(res, 400, 'invalid_request_error', 'missing or invalid required field: max_tokens');
+        }
+
+        // Check for Messages-only Features when no Anthropic upstream is available
+        const originalModel = payload.model;
+        const requestedModel = state.modelOverride || originalModel;
+
+        // Check if we have any Anthropic-capable upstreams
+        const hasAnthropicUpstream = state.upstreams.some(upstream => {
+          if (!upstream.enabled || upstream.quarantined) return false;
+          const api = upstream.api || 'openai';
+          return api === 'anthropic' || api === 'both';
+        });
+
+        // Check for adapter mode configuration
+        const adapterModeEnabled = Boolean(state.compatibility?.adapterMode?.adapters?.chatCompletions);
+        const stripMessagesOnlyFeatures = Boolean(state.compatibility?.adapterMode?.stripMessagesOnlyFeatures);
+
+        // Detect Messages-only features
+        const messagesOnlyFeatures = messagesOnlyFeaturesFromBody(req, originalBody, { inferJsonLike: false });
+        const hasMessagesOnlyFeatures = messagesOnlyFeatures.length > 0;
+
+        // Decide routing strategy
+        const canUseAdapter = !hasAnthropicUpstream && adapterModeEnabled;
+        const needsAdapter = canUseAdapter || (hasMessagesOnlyFeatures && !hasAnthropicUpstream);
+
+        // Block if we have Messages-only features but can't handle them
+        if (hasMessagesOnlyFeatures && !hasAnthropicUpstream && !adapterModeEnabled) {
+          const featureList = messagesOnlyFeatures.join(', ');
+          return anthropicErrorResponse(
+            res,
+            422,
+            'invalid_request_error',
+            `Request contains Messages-only features that cannot be converted to available upstreams: ${featureList}. Enable adapter compatibility mode to strip these features.`
+          );
+        }
+
+        if (hasMessagesOnlyFeatures && !hasAnthropicUpstream && !stripMessagesOnlyFeatures) {
+          const featureList = messagesOnlyFeatures.join(', ');
+          return anthropicErrorResponse(
+            res,
+            422,
+            'invalid_request_error',
+            `Request contains Messages-only features: ${featureList}. Enable strip_messages_only_features in compatibility mode.`
+          );
+        }
+
+        const tried = new Set();
+        const maxAttempts = Math.max(1, state.retry.maxAttempts);
+
+        let networkAttempt = 1;
+        while (networkAttempt <= maxAttempts) {
+          const routingAt = now();
+
+          // Select upstream based on routing strategy
+          const candidate = chooseCandidate(state, tried, {
+            preferredModel: requestedModel,
+            allowUnknownModelFallback: networkAttempt > 1,
+            candidateFilter: canUseAdapter
+              ? null  // Allow any upstream when using adapter
+              : (upstream) => {
+                  // Only select Anthropic-capable upstreams for native forwarding
+                  const api = upstream.api || 'openai';
+                  return api === 'anthropic' || api === 'both';
+                }
+          });
+
+          if (!candidate) break;
+
+          const { upstream, key } = candidate;
+          tried.add(`${upstream.name}:${key.index}`);
+
+          const attempt = networkAttempt;
+          networkAttempt += 1;
+          const allowRetry = attempt < maxAttempts;
+
+          // Determine if we need to use the adapter for this upstream
+          const upstreamApi = upstream.api || 'openai';
+          const useAdapter = upstreamApi === 'openai' || (upstreamApi === 'both' && canUseAdapter);
+
+          let targetUrl, requestBody, requestHeaders;
+
+          if (useAdapter) {
+            // Adapter path: Messages → Chat Completions
+            targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
+            try {
+              requestBody = buildChatCompletionsFromMessages(
+                rewriteModelInBody(req, originalBody, requestedModel, { inferJsonLike: false }),
+                requestedModel,
+                { stripMessagesOnlyFeatures }
+              );
+            } catch (error) {
+              recordFailure(state, upstream, key, `conversion error: ${error.message}`, 0, null);
+              if (!allowRetry) {
+                persistStats(state, statsPath);
+                return anthropicErrorResponse(res, 500, 'api_error', `Request conversion failed: ${error.message}`);
+              }
+              continue;
+            }
+            requestHeaders = buildJsonRequestHeaders(targetUrl, key.value, req.headers);
+          } else {
+            // Native path: Messages → Messages
+            targetUrl = joinUrlPath(upstream.baseUrl, anthropicMessagesPathForBaseUrl(upstream.baseUrl));
+            requestBody = rewriteModelInBody(req, originalBody, requestedModel, { inferJsonLike: false });
+            requestHeaders = buildAnthropicRequestHeaders(targetUrl, key.value, req.headers, upstream.probeHeaders);
+          }
+
+          try {
+            // Choose http or https based on targetUrl protocol
+            const protocol = new URL(targetUrl).protocol === 'https:' ? https : http;
+            const upstreamReq = protocol.request(targetUrl, {
+              method: 'POST',
+              headers: requestHeaders,
+              timeout: timeoutMs
+            });
+
+            const attemptStart = now();
+            let streamingBoundaryReached = false;
+            const isStreaming = payload.stream === true;
+
+            upstreamReq.on('response', (response) => {
+              const statusCode = response.statusCode || 500;
+
+              if (statusCode >= 200 && statusCode < 300) {
+                streamingBoundaryReached = true;
+                recordSuccess(upstream, attemptStart, statusCode);
+
+                // Record request for Dashboard
+                const routingStrategy = useAdapter
+                  ? 'messages_to_chat_completions'
+                  : 'native_messages';
+
+                rememberRequest(state, {
+                  method: 'POST',
+                  path: '/v1/messages',
+                  entry_protocol: 'messages',
+                  routing_strategy: routingStrategy,
+                  upstream: upstream.name,
+                  key: key.label,
+                  model: requestedModel,
+                  status: statusCode,
+                  streaming: isStreaming,
+                  retried: attempt > 1,
+                  succeeded: true
+                });
+
+                // Handle response conversion if using adapter
+                if (useAdapter) {
+                  const contentType = response.headers['content-type'] || '';
+
+                  if (isStreaming && contentType.includes('text/event-stream')) {
+                    // Streaming adapter: Chat SSE → Messages SSE
+                    res.writeHead(200, {
+                      'content-type': 'text/event-stream',
+                      'cache-control': 'no-cache',
+                      'connection': 'keep-alive'
+                    });
+
+                    const adapter = createChatToMessagesStreamAdapter(res, requestedModel);
+                    response.on('data', (chunk) => adapter.write(chunk));
+                    response.on('end', () => adapter.end());
+                    response.on('error', (err) => {
+                      console.error('Streaming adapter error:', err);
+                      if (!res.writableEnded) res.end();
+                    });
+                  } else {
+                    // JSON adapter: Chat JSON → Messages JSON
+                    let responseBody = Buffer.alloc(0);
+                    response.on('data', (chunk) => {
+                      responseBody = Buffer.concat([responseBody, chunk]);
+                    });
+                    response.on('end', () => {
+                      try {
+                        const convertedBody = chatCompletionToMessagesJson(responseBody, requestedModel);
+                        res.writeHead(200, {
+                          'content-type': 'application/json',
+                          'content-length': convertedBody.length
+                        });
+                        res.end(convertedBody);
+                      } catch (error) {
+                        console.error('Response conversion error:', error);
+                        anthropicErrorResponse(res, 500, 'api_error', 'Response conversion failed');
+                      }
+                    });
+                  }
+                } else {
+                  // Native forwarding: pass through as-is
+                  res.writeHead(statusCode, response.headers);
+                  response.pipe(res);
+                }
+              } else {
+                // Error response
+                let errorBody = '';
+                response.setEncoding('utf8');
+                response.on('data', (chunk) => { errorBody += chunk; });
+                response.on('end', () => {
+                  recordFailure(state, upstream, key, `HTTP ${statusCode}`, statusCode, response.headers['retry-after']);
+
+                  // Record failed request for Dashboard (only if not retrying)
+                  if (!allowRetry || streamingBoundaryReached) {
+                    const routingStrategy = useAdapter
+                      ? 'messages_to_chat_completions'
+                      : 'native_messages';
+
+                    rememberRequest(state, {
+                      method: 'POST',
+                      path: '/v1/messages',
+                      entry_protocol: 'messages',
+                      routing_strategy: routingStrategy,
+                      upstream: upstream.name,
+                      key: key.label,
+                      model: requestedModel,
+                      status: statusCode,
+                      streaming: isStreaming,
+                      retried: attempt > 1,
+                      succeeded: false,
+                      reason: `HTTP ${statusCode}`
+                    });
+                  }
+
+                  if (allowRetry && !streamingBoundaryReached) {
+                    return; // Will retry in next loop iteration
+                  }
+
+                  // Return error (convert if using adapter)
+                  if (useAdapter) {
+                    // Try to convert OpenAI error to Anthropic format
+                    try {
+                      const openaiError = JSON.parse(errorBody);
+                      const message = openaiError.error?.message || errorBody;
+                      anthropicErrorResponse(res, statusCode, 'api_error', message);
+                    } catch {
+                      res.writeHead(statusCode, { 'content-type': 'text/plain' });
+                      res.end(errorBody);
+                    }
+                  } else {
+                    res.writeHead(statusCode, response.headers);
+                    res.end(errorBody);
+                  }
+                });
+              }
+            });
+
+            upstreamReq.on('error', (error) => {
+              if (!streamingBoundaryReached) {
+                recordFailure(state, upstream, key, error.message, 0, null);
+
+                // Record failed request for Dashboard (only if not retrying)
+                if (!allowRetry) {
+                  const routingStrategy = useAdapter
+                    ? 'messages_to_chat_completions'
+                    : 'native_messages';
+
+                  rememberRequest(state, {
+                    method: 'POST',
+                    path: '/v1/messages',
+                    entry_protocol: 'messages',
+                    routing_strategy: routingStrategy,
+                    upstream: upstream.name,
+                    key: key.label,
+                    model: requestedModel,
+                    status: 0,
+                    streaming: isStreaming,
+                    retried: attempt > 1,
+                    succeeded: false,
+                    reason: error.message
+                  });
+                }
+
+                if (allowRetry) {
+                  return; // Will retry in next loop iteration
+                }
+              }
+
+              if (!res.headersSent) {
+                return anthropicErrorResponse(res, 502, 'api_error', `upstream request failed: ${error.message}`);
+              }
+            });
+
+            upstreamReq.on('timeout', () => {
+              upstreamReq.destroy();
+              if (!streamingBoundaryReached) {
+                recordFailure(state, upstream, key, 'timeout', 0, null);
+
+                // Record timeout for Dashboard (only if not retrying)
+                if (!allowRetry) {
+                  const routingStrategy = useAdapter
+                    ? 'messages_to_chat_completions'
+                    : 'native_messages';
+
+                  rememberRequest(state, {
+                    method: 'POST',
+                    path: '/v1/messages',
+                    entry_protocol: 'messages',
+                    routing_strategy: routingStrategy,
+                    upstream: upstream.name,
+                    key: key.label,
+                    model: requestedModel,
+                    status: 504,
+                    streaming: isStreaming,
+                    retried: attempt > 1,
+                    succeeded: false,
+                    reason: 'timeout'
+                  });
+                }
+              }
+              if (!res.headersSent) {
+                return anthropicErrorResponse(res, 504, 'timeout_error', 'upstream request timeout');
+              }
+            });
+
+            upstreamReq.write(requestBody);
+            upstreamReq.end();
+
+            // Wait for response to complete
+            await new Promise((resolve, reject) => {
+              upstreamReq.on('error', reject);
+              res.on('finish', resolve);
+              res.on('error', reject);
+            });
+
+            persistStats(state, statsPath);
+            return; // Success, exit handler
+          } catch (error) {
+            recordFailure(state, upstream, key, error.message, 0, null);
+            if (!allowRetry) {
+              persistStats(state, statsPath);
+              return anthropicErrorResponse(res, 502, 'api_error', `upstream request failed: ${error.message}`);
+            }
+            // Continue to next attempt
+          }
+        }
+
+        // No candidates or all attempts failed
+        rememberRequest(state, {
+          method: 'POST',
+          path: '/v1/messages',
+          entry_protocol: 'messages',
+          routing_strategy: hasAnthropicUpstream ? 'native_messages' : (adapterModeEnabled ? 'messages_to_chat_completions' : 'none'),
+          upstream: null,
+          key: null,
+          model: requestedModel,
+          status: 503,
+          streaming: payload.stream === true,
+          retried: networkAttempt > 1,
+          succeeded: false,
+          reason: 'no available upstreams'
+        });
+        persistStats(state, statsPath);
+        return anthropicErrorResponse(res, 503, 'overloaded_error', 'no available upstreams for Messages API');
+      }
+
       if (!isAuthorized(req, config)) {
         return jsonResponse(res, 401, { error: 'unauthorized: invalid Codex API pool token' });
       }
@@ -12405,6 +13412,7 @@ export function createPoolServer(config, options = {}) {
                 rememberRequest(state, {
                   method: req.method,
                   path: pathname,
+                  entry_protocol: 'responses',
                   ...requestDebugFields(incomingHeaderSample),
                   upstream: upstream.name,
                   key: key.label,
@@ -12436,6 +13444,7 @@ export function createPoolServer(config, options = {}) {
               rememberRequest(state, {
                 method: req.method,
                 path: pathname,
+                entry_protocol: 'responses',
                 ...requestDebugFields(incomingHeaderSample),
                 upstream: upstream.name,
                 key: key.label,
@@ -12597,6 +13606,7 @@ export function createPoolServer(config, options = {}) {
           rememberRequest(state, {
             method: req.method,
             path: pathname,
+            entry_protocol: 'responses',
             ...requestDebugFields(incomingHeaderSample),
             upstream: upstream.name,
             key: key.label,
@@ -12649,6 +13659,7 @@ export function createPoolServer(config, options = {}) {
         rememberRequest(state, {
           method: req.method,
           path: pathname,
+          entry_protocol: 'responses',
           ...requestDebugFields(incomingHeaderSample),
           upstream: lastAttempt?.upstream || null,
           key: lastAttempt?.key || null,
@@ -12751,7 +13762,10 @@ export async function loadConfig(configPath = process.env.CODEX_POOL_CONFIG || D
 export const __testInternals = {
   openHttpProxyTunnel,
   guardHttp2SessionSocket,
-  runCurlTest
+  runCurlTest,
+  buildChatCompletionsFromMessages,
+  chatCompletionToMessagesJson,
+  createChatToMessagesStreamAdapter
 };
 
 export async function start(configPath) {

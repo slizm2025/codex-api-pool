@@ -1,15 +1,15 @@
 # Codex API Pool
 
-This context describes the local API pool used by Codex to reach OpenAI-compatible upstream services with failover, cooldown, and health awareness.
+This context describes the local API pool used by Codex and Claude Desktop to reach multiple upstream services with failover, cooldown, and health awareness.
 
 ## Language
 
 **API Pool**:
-A local OpenAI-compatible proxy that selects among multiple upstream services, retries eligible failures, cools down unhealthy options, and forwards requests for Codex.
+A local multi-protocol proxy that selects among multiple upstream services, retries eligible failures, cools down unhealthy options, and forwards requests from Codex and Claude Desktop. Supports Responses, Chat Completions, and Anthropic Messages as client entry protocols.
 _Avoid_: proxy, router, gateway, key pool, site pool
 
 **Upstream**:
-An external OpenAI-compatible API service that the API Pool can send model requests to. An Upstream has a base URL, weight, keys, health state, cooldown state, and optional billing or quota information.
+An external API service that the API Pool can send model requests to. An Upstream has a base URL, weight, keys, health state, cooldown state, protocol capability (OpenAI-compatible, Anthropic Messages, or both), and optional billing or quota information.
 _Avoid_: provider, site, API site, station, vendor
 
 **Pool Token**:
@@ -68,6 +68,10 @@ _Avoid_: stream retry, resume, continuation
 A Model Interaction Request path where the API Pool can forward a Responses request to an Upstream without translating it to another model API family. A Native Responses Route preserves Responses-only Features.
 _Avoid_: native model, original model, full model
 
+**Native Messages Route**:
+A Model Interaction Request path where the API Pool can forward an Anthropic Messages request to an Upstream without translating it to another model API family. A Native Messages Route preserves Messages-only Features.
+_Avoid_: native model, original model, full model
+
 **Native Responses Recheck**:
 A time-bounded recovery attempt that lets an Upstream with a learned non-native Forwarding Strategy try a Native Responses Route again for the same Requested Model, so temporary lack of native support does not become permanent.
 _Avoid_: permanent retry, manual reset, endpoint polling
@@ -86,6 +90,10 @@ _Avoid_: permanent model setting, global routing mode, provider type
 
 **Responses-only Feature**:
 A request feature that belongs to the Responses API shape and cannot be represented losslessly by a non-native adapter such as Chat Completions or Anthropic Messages.
+_Avoid_: native tool call, unsupported tool, extra field
+
+**Messages-only Feature**:
+A request feature that belongs to the Anthropic Messages API shape and cannot be represented losslessly by a non-native adapter such as Responses or Chat Completions, such as cache_control, extended thinking blocks, or Anthropic-specific tool parameters.
 _Avoid_: native tool call, unsupported tool, extra field
 
 **Adapter Compatibility Mode**:

@@ -1,5 +1,19 @@
 # 更新日志
 
+## 2026-06-13 CST
+
+新增 Claude Desktop Messages API 支持（ADR-0004 Phase 1-2），让 Claude Desktop 可以通过本地 API Pool 复用多上游 failover、cooldown 和 Selection。
+
+- 新增 `/v1/messages` 入口，接受 Anthropic Messages API 请求，使用与 `/v1/responses` 相同的 Pool Token 鉴权，但返回 Anthropic 形状的错误（`{"type":"error","error":{"type","message"}}`）。
+- 原生转发：当存在 `api: "anthropic"` 或 `api: "both"` 的上游时，直接把 Messages 请求转发到上游 `/v1/messages`，支持 JSON 与 SSE 流式响应，并应用 Model Override。
+- Messages-only Features 检测：识别 `cache_control`（system/message/content/tool 级）、`thinking` 内容块、Computer Use 工具（`computer_20241022`、`text_editor_20241022`、`bash_20241022`）。当没有原生 Anthropic 上游且兼容模式未启用时返回 `422`，错误信息列出具体检测到的特性类型。
+- Messages → Chat Completions 适配器：当只有 OpenAI 上游且 `compatibility.adapter_mode.adapters.chat_completions` 启用时，将 Messages 请求转换为 Chat Completions（messages、system、tools、tool_choice、max_tokens、temperature、top_p、stop_sequences、output_config、metadata.user_id 等字段映射），转发后再把 Chat 响应（JSON 与 SSE）转换回 Messages 形状。
+- `compatibility.adapter_mode` 扩展 `strip_messages_only_features` 字段；启用后在适配转换时剥离 thinking 块和 Computer Use 工具。
+- Dashboard 可观测性（Phase 4）：`/pool/status` 的 `recent_requests[]` 新增 `entry_protocol` 字段（`"messages"` 或 `"responses"`），Messages 入口新增 `routing_strategy` 字段（`"native_messages"` 或 `"messages_to_chat_completions"`），便于区分流量来源和路由决策。
+- 修复请求体协议选择：根据 `targetUrl.protocol` 动态选择 `http` 或 `https` 发起上游请求，不再硬编码 `https`，使 http 上游（含本地测试）可用。
+- 修复 Content-Length 截断 bug：`buildJsonRequestHeaders` 现在会移除入站 `content-length`，由 `http.request` 按转换后的请求体重新计算，避免转换后请求体被上游按旧长度截断。
+- 测试覆盖：Messages 入口鉴权/校验、原生转发、特性检测、Messages↔Chat 双向转换单元测试、HTTP/HTTPS 协议选择、Content-Length 回归、Dashboard 可观测性、端到端集成（原生/适配/422/剥离）。
+
 ## 2026-06-12 CST
 
 本次更新按 Representative Model Probe 架构复审结果继续收敛实现边界，目标是减少健康探测、真实请求、Selection 和 Dashboard 之间的重复判断。

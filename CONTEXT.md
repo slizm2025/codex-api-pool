@@ -72,6 +72,10 @@ _Avoid_: native model, original model, full model
 The model API family that current evidence says an Upstream can successfully serve for a Requested Model, such as Responses, Chat Completions, Anthropic Messages, or Codex OAuth Responses. Once learned, it guides later Model Interaction Requests so the API Pool keeps using the interface that has been proven for that Upstream until stronger evidence changes it.
 _Avoid_: endpoint guess, route preference, protocol hint
 
+**Protocol Capability**:
+Evidence that an Upstream can or cannot serve a model API family, gathered from Pool Configuration, Health Probes, user declarations, or real model traffic. Protocol Capability describes what an Upstream supports; it does not by itself say which interface the next Model Interaction Request will use.
+_Avoid_: request interface, forwarding strategy, current route
+
 **Forwarding Strategy**:
 The learned way the API Pool sends future Model Interaction Requests for the same Upstream and Requested Model after real traffic succeeds, such as Native Responses, Chat Completions, or Chat Completions with Adapter Compatibility Mode.
 _Avoid_: permanent model setting, global routing mode, provider type

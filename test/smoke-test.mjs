@@ -128,13 +128,14 @@ class DashboardHarnessElement {
     this.value = '';
     this.title = '';
     this.renderedOrders = [];
+    this.listeners = new Map();
     this._innerHTML = '';
     this._textContent = '';
   }
 
   set innerHTML(value) {
     this._innerHTML = String(value ?? '');
-    if (this.id === 'cards') {
+    if (this.id === 'cards' || this.id === 'quarantineCards') {
       this.renderedOrders.push([...this._innerHTML.matchAll(/data-upstream="([^"]+)"/g)].map((match) => match[1]));
     }
   }
@@ -155,7 +156,11 @@ class DashboardHarnessElement {
     return this.children[0] || null;
   }
 
-  addEventListener() {}
+  addEventListener(type, handler) {
+    const key = String(type);
+    if (!this.listeners.has(key)) this.listeners.set(key, []);
+    this.listeners.get(key).push(handler);
+  }
 
   setAttribute(name, value) {
     this.attributes[name] = String(value);
@@ -168,7 +173,17 @@ class DashboardHarnessElement {
 
   remove() {}
 
-  click() {}
+  click() {
+    const event = {
+      target: this,
+      currentTarget: this,
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      }
+    };
+    for (const handler of this.listeners.get('click') || []) handler(event);
+  }
 
   insertAdjacentHTML(position, html) {
     this._innerHTML = position === 'afterbegin'
@@ -198,7 +213,7 @@ class DashboardHarnessDocument {
       button.dataset.signinFilter = value;
       return button;
     });
-    this.verificationFilterButtons = ['all', 'real_verified', 'probe_only', 'unavailable'].map((value) => {
+    this.verificationFilterButtons = ['all', 'real_verified', 'probe_only', 'real_pending', 'unavailable'].map((value) => {
       const button = new DashboardHarnessElement('', 'button');
       button.dataset.verificationFilter = value;
       return button;
@@ -333,7 +348,7 @@ function dashboardUpstreamFixture(name, configIndex, overrides = {}) {
   };
 }
 
-async function renderDashboardWorkbenchOrders(dashboardHtmlText, statuses) {
+async function renderDashboardWorkbenchOrders(dashboardHtmlText, statuses, options = {}) {
   const script = [...dashboardHtmlText.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).join('\n');
   if (!script) throw new Error('expected dashboard HTML to include executable script');
   const document = new DashboardHarnessDocument();
@@ -368,13 +383,45 @@ async function renderDashboardWorkbenchOrders(dashboardHtmlText, statuses) {
   vm.runInContext(script, context);
   await new Promise((resolve) => setImmediate(resolve));
   const cards = document.element('cards');
+  const quarantineCards = document.element('quarantineCards');
+  const quarantineToggle = document.element('quarantineToggle');
   const initialOrder = cards.renderedOrders.at(-1) || [];
+  const initialQuarantineOrder = quarantineCards.renderedOrders.at(-1) || [];
+  const initialWorkbenchHtml = cards.innerHTML;
+  const initialQuarantineHtml = quarantineCards.innerHTML;
+  const initialQuarantineHidden = quarantineCards.hidden;
+  const initialQuarantineExpanded = quarantineToggle.attributes['aria-expanded'] || '';
   const initialDiagnosticReason = document.element('diagnosticReason').textContent;
+  if (options.openQuarantine) {
+    quarantineToggle.click();
+  }
+  const openedQuarantineOrder = quarantineCards.renderedOrders.at(-1) || [];
+  const openedQuarantineHtml = quarantineCards.innerHTML;
+  const openedQuarantineHidden = quarantineCards.hidden;
+  const openedQuarantineExpanded = quarantineToggle.attributes['aria-expanded'] || '';
   statusIndex = 1;
   await context.load();
   const refreshedOrder = cards.renderedOrders.at(-1) || [];
+  const refreshedQuarantineOrder = quarantineCards.renderedOrders.at(-1) || [];
+  const refreshedQuarantineHidden = quarantineCards.hidden;
   const refreshedDiagnosticReason = document.element('diagnosticReason').textContent;
-  return { initialOrder, refreshedOrder, initialDiagnosticReason, refreshedDiagnosticReason };
+  return {
+    initialOrder,
+    refreshedOrder,
+    initialQuarantineOrder,
+    refreshedQuarantineOrder,
+    openedQuarantineOrder,
+    initialWorkbenchHtml,
+    initialQuarantineHtml,
+    openedQuarantineHtml,
+    initialQuarantineHidden,
+    openedQuarantineHidden,
+    refreshedQuarantineHidden,
+    initialQuarantineExpanded,
+    openedQuarantineExpanded,
+    initialDiagnosticReason,
+    refreshedDiagnosticReason
+  };
 }
 
 const lateTlsErrorKey = `-----BEGIN PRIVATE KEY-----
@@ -1136,6 +1183,31 @@ const billingUpstream = createFakeUpstream('billing-site', ({ req, res, body }) 
   res.end(JSON.stringify({ ok: true, body: body ? JSON.parse(body) : null }));
 });
 
+let quarantinedBillingHits = 0;
+let quarantinedBillingRequests = [];
+const quarantinedBillingUpstream = createFakeUpstream('billing-quarantined', ({ req, res, body }) => {
+  quarantinedBillingRequests.push(req.url);
+  if (req.url.startsWith('/v1/dashboard/billing/subscription')) {
+    quarantinedBillingHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ hard_limit_usd: 50 }));
+    return;
+  }
+  if (req.url.startsWith('/v1/dashboard/billing/usage?')) {
+    quarantinedBillingHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ total_usage: 2000 }));
+    return;
+  }
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'billing-model' }] }));
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, body: body ? JSON.parse(body) : null }));
+});
+
 const billingHugeLimitUpstream = createFakeUpstream('billing-huge-limit', ({ req, res }) => {
   if (req.url.startsWith('/dashboard/billing/')) {
     res.writeHead(403, { 'content-type': 'application/json' });
@@ -1423,6 +1495,7 @@ const cachedChatThenNativeInfo = await listen(cachedChatThenNative);
 const nativeFeatureBlockedInfo = await listen(nativeFeatureBlocked);
 const anthropicMessagesInfo = await listen(anthropicMessages);
 const billingInfo = await listen(billingUpstream);
+const quarantinedBillingInfo = await listen(quarantinedBillingUpstream);
 const billingHugeLimitInfo = await listen(billingHugeLimitUpstream);
 const billingBlockedInfo = await listen(billingBlockedUpstream);
 const billingLoginHtmlInfo = await listen(billingLoginHtmlUpstream);
@@ -1470,6 +1543,7 @@ try {
   const requiredDashboardRegions = [
     'data-dashboard-region="top-diagnostic-bar"',
     'data-dashboard-region="upstream-workbench"',
+    'data-dashboard-region="quarantine-box"',
     'data-dashboard-region="recent-request-timeline"',
     'data-dashboard-region="upstream-editor"',
     'id="poolDiagnostic"',
@@ -1481,6 +1555,11 @@ try {
     'function updateTopDiagnostic(data, ups, activeModel)',
     "eligible.length === 0 ? 'blocked' : degraded ? 'degraded' : 'usable'",
     'class="workbench-list"',
+    'id="quarantineCards"',
+    'id="quarantineToggle"',
+    'aria-expanded="false"',
+    '隔离区',
+    'data-quarantine',
     'class="workbench-head"',
     'class="card workbench-row panel',
     'Upstream Workbench rows',
@@ -1509,6 +1588,16 @@ try {
   if (dashboard.text.includes('signinSortBucket')) {
     throw new Error('expected sign-in status to stay out of upstream sorting');
   }
+  const quarantineActionLayout = await renderDashboardWorkbenchOrders(dashboard.text, [
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('layout-alpha', 0)
+    ])
+  ]);
+  const safeActionGroup = quarantineActionLayout.initialWorkbenchHtml.match(/<div class="workbench-actions" data-action-group="safe">([\s\S]*?)<\/div>\s*<\/div>\s*<div class="workbench-models-row">/)?.[1] || '';
+  const confirmedActionGroup = quarantineActionLayout.initialWorkbenchHtml.match(/<div class="workbench-confirmed-actions" data-action-group="confirmed">([\s\S]*?)<\/div>\s*<div class="workbench-actions" data-action-group="safe">/)?.[1] || '';
+  if (!safeActionGroup || !confirmedActionGroup || !confirmedActionGroup.includes('data-quarantine="layout-alpha"') || safeActionGroup.includes('data-quarantine=')) {
+    throw new Error(`expected quarantine action to be isolated from ordinary Workbench actions: ${quarantineActionLayout.initialWorkbenchHtml}`);
+  }
   const stableWorkbenchOrder = await renderDashboardWorkbenchOrders(dashboard.text, [
     dashboardStatusFixture([
       dashboardUpstreamFixture('alpha', 0, { selection_score: 1, selection_weight: 1 }),
@@ -1534,6 +1623,56 @@ try {
   const expectedStableOrder = 'alpha,beta,gamma';
   if (stableWorkbenchOrder.initialOrder.join(',') !== expectedStableOrder || stableWorkbenchOrder.refreshedOrder.join(',') !== expectedStableOrder) {
     throw new Error(`expected Dashboard Workbench row order to stay stable across dynamic Runtime State changes: ${JSON.stringify(stableWorkbenchOrder)}`);
+  }
+  const realPendingWorkbench = await renderDashboardWorkbenchOrders(dashboard.text, [
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('advanced-curl', 0, {
+        available: true,
+        selection_score: 1,
+        selection_weight: 1,
+        health: { state: 'advanced_curl_required', raw_state: 'advanced_curl_required', checked_at: null, latency_ms: 580, http_status: 400, error: 'requires real Codex context', warning: '', models: ['gpt-5.5'], models_count: 1 }
+      }),
+      dashboardUpstreamFixture('probe-ok', 1, {
+        available: true,
+        selection_score: 1,
+        selection_weight: 1,
+        health: { state: 'ok', raw_state: 'ok', checked_at: null, latency_ms: 120, http_status: 200, error: '', warning: '', models: ['gpt-5.5'], models_count: 1 }
+      }),
+      dashboardUpstreamFixture('blocked', 2, { available: false, selection_score: 0 })
+    ])
+  ]);
+  if (
+    !realPendingWorkbench.initialWorkbenchHtml.includes('data-upstream="advanced-curl" data-verification-tier="real_pending"') ||
+    !realPendingWorkbench.initialWorkbenchHtml.includes('data-upstream="probe-ok" data-verification-tier="probe_only"') ||
+    !realPendingWorkbench.initialWorkbenchHtml.includes('data-upstream="blocked" data-verification-tier="unavailable"') ||
+    !dashboard.text.includes('data-verification-filter="real_pending"') ||
+    !dashboard.text.includes('可选待真实验证')
+  ) {
+    throw new Error(`expected advanced-curl selectable upstreams to have a real-pending dashboard tier: ${realPendingWorkbench.initialWorkbenchHtml}`);
+  }
+  const quarantineWorkbench = await renderDashboardWorkbenchOrders(dashboard.text, [
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('active-alpha', 0),
+      dashboardUpstreamFixture('quarantined-beta', 1, { available: false, quarantined: true })
+    ]),
+    dashboardStatusFixture([
+      dashboardUpstreamFixture('active-alpha', 0),
+      dashboardUpstreamFixture('quarantined-beta', 1, { available: false, quarantined: true })
+    ])
+  ], { openQuarantine: true });
+  if (
+    quarantineWorkbench.initialOrder.join(',') !== 'active-alpha' ||
+    quarantineWorkbench.initialQuarantineOrder.length !== 0 ||
+    quarantineWorkbench.initialQuarantineHidden !== true ||
+    quarantineWorkbench.initialQuarantineExpanded !== 'false' ||
+    quarantineWorkbench.openedQuarantineOrder.join(',') !== 'quarantined-beta' ||
+    quarantineWorkbench.openedQuarantineHidden !== false ||
+    quarantineWorkbench.openedQuarantineExpanded !== 'true' ||
+    quarantineWorkbench.refreshedOrder.join(',') !== 'active-alpha' ||
+    quarantineWorkbench.refreshedQuarantineOrder.join(',') !== 'quarantined-beta' ||
+    quarantineWorkbench.refreshedQuarantineHidden !== false
+  ) {
+    throw new Error(`expected Dashboard quarantine box to open as a drawer: ${JSON.stringify(quarantineWorkbench)}`);
   }
   const classifiedDiagnostic = await renderDashboardWorkbenchOrders(dashboard.text, [
     dashboardStatusFixture([
@@ -2368,7 +2507,9 @@ try {
     if (
       afterSite?.request_interface?.type !== 'responses' ||
       afterSite?.request_interface?.source !== 'real_traffic' ||
-      afterSite?.request_interface?.path !== '/v1/responses'
+      afterSite?.request_interface?.path !== '/v1/responses' ||
+      afterSite?.request_interface?.supported?.[0]?.type !== 'responses' ||
+      afterSite?.request_interface?.using?.type !== 'responses'
     ) {
       throw new Error(`expected successful native Responses traffic to determine the request interface: ${JSON.stringify(afterSite?.request_interface)}`);
     }
@@ -3007,9 +3148,11 @@ try {
       !String(firstBlockedFeatureResponse.headers.get('x-codex-api-pool-stripped') || '').includes('inputs=reasoning') ||
       nativeFeatureBlockedResponsesHits !== 1 ||
       nativeFeatureBlockedChatHits !== 1 ||
-      firstBlockedFeatureSite?.route_strategies?.['test-model']?.strategy !== 'chat_completions_compatibility'
+      firstBlockedFeatureSite?.route_strategies?.['test-model']?.strategy !== 'chat_completions_compatibility' ||
+      firstBlockedFeatureSite?.request_interface?.supported?.[0]?.type !== 'chat_completions' ||
+      firstBlockedFeatureSite?.request_interface?.using?.type !== 'chat_completions_compatibility'
     ) {
-      throw new Error(`expected native feature block to fall back to lossy Chat and learn strategy: ${firstBlockedFeatureResponse.status} ${firstBlockedFeatureText} responses=${nativeFeatureBlockedResponsesHits} chat=${nativeFeatureBlockedChatHits} site=${JSON.stringify(firstBlockedFeatureSite?.route_strategies)}`);
+      throw new Error(`expected native feature block to fall back to lossy Chat and learn strategy: ${firstBlockedFeatureResponse.status} ${firstBlockedFeatureText} responses=${nativeFeatureBlockedResponsesHits} chat=${nativeFeatureBlockedChatHits} site=${JSON.stringify(firstBlockedFeatureSite)}`);
     }
 
     const secondBlockedFeatureResponse = await fetch(`${nativeFeatureBlockedPoolInfo.url}/v1/responses`, {
@@ -3278,6 +3421,8 @@ try {
       chatOnlySite?.resolved_request_mode !== 'chat_completions' ||
       chatOnlySite?.request_interface?.type !== 'chat_completions' ||
       chatOnlySite?.request_interface?.path !== '/v1/chat/completions' ||
+      chatOnlySite?.request_interface?.supported?.[0]?.type !== 'chat_completions' ||
+      chatOnlySite?.request_interface?.using?.type !== 'chat_completions' ||
       chatOnlySite?.usage?.total_tokens !== 18 ||
       chatOnlySite?.usage?.input_tokens !== 9 ||
       chatOnlySite?.usage?.output_tokens !== 9
@@ -4136,6 +4281,44 @@ try {
     await close(billingPool);
   }
 
+  const quarantinedBillingPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    billing: { concurrency: 2, timeout_ms: 1000 },
+    upstreams: [
+      { name: 'billing-active', base_url: `${billingInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
+      { name: 'billing-quarantined', base_url: `${quarantinedBillingInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }], quarantined: true }
+    ]
+  });
+  const quarantinedBillingPoolInfo = await listen(quarantinedBillingPool);
+  try {
+    quarantinedBillingHits = 0;
+    quarantinedBillingRequests = [];
+    const billingAll = await postJson(`${quarantinedBillingPoolInfo.url}/pool/billing`, 'pool-secret', {});
+    if (billingAll.response.status !== 200 || quarantinedBillingRequests.length !== 0) {
+      throw new Error(`expected pool billing refresh to skip quarantined upstreams: requests=${JSON.stringify(quarantinedBillingRequests)} body=${billingAll.text}`);
+    }
+    const quarantinedBillingResult = await postJson(`${quarantinedBillingPoolInfo.url}/pool/upstreams/billing-quarantined/billing`, 'pool-secret', {});
+    if (quarantinedBillingResult.response.status !== 200 || quarantinedBillingRequests.length === 0) {
+      throw new Error(`expected single quarantined billing refresh to run: requests=${JSON.stringify(quarantinedBillingRequests)} body=${quarantinedBillingResult.text}`);
+    }
+  } finally {
+    await close(quarantinedBillingPool);
+  }
+
   const hugeLimitBillingPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -4313,8 +4496,140 @@ try {
     if (enableResult.response.status !== 200 || enableResult.json.enabled !== true || enableResult.json.probe_ok !== true || enableResult.json.probe_status !== 'ok' || enableResult.json.health?.state !== 'ok') {
       throw new Error(`expected upstream enable to probe and restore health: ${enableResult.text}`);
     }
+
+    const quarantineResult = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/quarantine`, 'pool-secret', { quarantined: true });
+    if (quarantineResult.response.status !== 200 || quarantineResult.json.quarantined !== true) {
+      throw new Error(`expected upstream quarantine to persist: ${quarantineResult.text}`);
+    }
+    const quarantinedStatus = (await getJson(`${toggleInfo.url}/pool/status`, 'pool-secret')).json;
+    const quarantinedPreferred = quarantinedStatus.upstreams.find((upstream) => upstream.name === 'preferred-off');
+    if (!quarantinedPreferred || quarantinedPreferred.enabled !== true || quarantinedPreferred.quarantined !== true || quarantinedPreferred.available !== false) {
+      throw new Error(`expected quarantined upstream to remain enabled, visible, and unavailable for Selection: ${JSON.stringify(quarantinedStatus.upstreams)}`);
+    }
+    if (quarantinedStatus.model?.known?.includes('added-model-b')) {
+      throw new Error(`expected quarantined upstream models to stay out of active model choices: ${JSON.stringify(quarantinedStatus.model)}`);
+    }
+    try {
+      Math.random = () => 0;
+      const quarantinedRoute = await requestJson(toggleInfo.url, 'pool-secret');
+      if (quarantinedRoute.response.status !== 200 || quarantinedRoute.response.headers.get('x-codex-api-pool-upstream') !== 'fallback-good') {
+        throw new Error(`expected quarantined preferred upstream to be skipped: ${quarantinedRoute.response.status} ${quarantinedRoute.text}`);
+      }
+    } finally {
+      Math.random = originalRandom;
+    }
+    const quarantinedProbe = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/probe`, 'pool-secret', {});
+    if (quarantinedProbe.response.status !== 200 || quarantinedProbe.json.probe_ok !== true || quarantinedProbe.json.health?.state !== 'ok') {
+      throw new Error(`expected quarantined upstream to remain probeable: ${quarantinedProbe.text}`);
+    }
+    const restoreFromQuarantine = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/quarantine`, 'pool-secret', { quarantined: false });
+    if (restoreFromQuarantine.response.status !== 200 || restoreFromQuarantine.json.quarantined !== false || restoreFromQuarantine.json.probe_ok !== true) {
+      throw new Error(`expected restoring quarantined upstream to probe and return Active: ${restoreFromQuarantine.text}`);
+    }
+    const restoredStatus = (await getJson(`${toggleInfo.url}/pool/status`, 'pool-secret')).json;
+    const restoredPreferred = restoredStatus.upstreams.find((upstream) => upstream.name === 'preferred-off');
+    if (!restoredPreferred || restoredPreferred.quarantined !== false || restoredPreferred.available !== true) {
+      throw new Error(`expected restored upstream to participate in Selection: ${JSON.stringify(restoredPreferred)}`);
+    }
+    if (!restoredStatus.model?.known?.includes('added-model-b')) {
+      throw new Error(`expected restored upstream models to return to active model choices: ${JSON.stringify(restoredStatus.model)}`);
+    }
+    const requarantineResult = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/quarantine`, 'pool-secret', { quarantined: true });
+    if (requarantineResult.response.status !== 200 || requarantineResult.json.quarantined !== true) {
+      throw new Error(`expected upstream to re-enter quarantine: ${requarantineResult.text}`);
+    }
+    const disableQuarantined = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/enabled`, 'pool-secret', { enabled: false });
+    if (disableQuarantined.response.status !== 200 || disableQuarantined.json.enabled !== false) {
+      throw new Error(`expected disabling quarantined upstream to succeed: ${disableQuarantined.text}`);
+    }
+    const reenableQuarantined = await postJson(`${toggleInfo.url}/pool/upstreams/preferred-off/enabled`, 'pool-secret', { enabled: true });
+    if (reenableQuarantined.response.status !== 200 || reenableQuarantined.json.enabled !== true || reenableQuarantined.json.probe_ok !== true) {
+      throw new Error(`expected re-enabling quarantined upstream to probe: ${reenableQuarantined.text}`);
+    }
+    const reenabledStatus = (await getJson(`${toggleInfo.url}/pool/status`, 'pool-secret')).json;
+    const reenabledPreferred = reenabledStatus.upstreams.find((upstream) => upstream.name === 'preferred-off');
+    if (!reenabledPreferred || reenabledPreferred.quarantined !== false || reenabledPreferred.available !== true) {
+      throw new Error(`expected enabled upstream to return Active instead of Quarantine: ${JSON.stringify(reenabledPreferred)}`);
+    }
   } finally {
     await close(togglePool);
+  }
+
+  const quarantinedBatchPool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    model_override: 'test-model',
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'active-good', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
+      { name: 'quarantined-bad', base_url: `${badInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }], quarantined: true }
+    ]
+  });
+  const quarantinedBatchInfo = await listen(quarantinedBatchPool);
+  try {
+    const quarantinedBatchProbe = await postJson(`${quarantinedBatchInfo.url}/pool/probe`, 'pool-secret', {});
+    const quarantinedResult = quarantinedBatchProbe.json.probe_results?.find((item) => item.upstream === 'quarantined-bad');
+    if (
+      quarantinedBatchProbe.response.status !== 200 ||
+      quarantinedBatchProbe.json.probe_ok !== true ||
+      quarantinedBatchProbe.json.probe_status !== 'ok' ||
+      quarantinedBatchProbe.json.summary?.enabled_count !== 1 ||
+      quarantinedBatchProbe.json.summary?.quarantined_count !== 1 ||
+      quarantinedBatchProbe.json.summary?.failed_count !== 0 ||
+      !quarantinedResult ||
+      quarantinedResult.health?.httpStatus !== 503
+    ) {
+      throw new Error(`expected manual batch probe to test quarantined upstreams without failing active summary: ${quarantinedBatchProbe.text}`);
+    }
+  } finally {
+    await close(quarantinedBatchPool);
+  }
+
+  const quarantinedAutomaticProbePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    model_override: 'test-model',
+    health: { enabled: true, path: '/models', timeout_ms: 1000, interval_ms: 10000 },
+    upstreams: [
+      { name: 'auto-active-good', base_url: `${goodInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] },
+      { name: 'auto-quarantined-bad', base_url: `${badInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }], quarantined: true }
+    ]
+  });
+  const quarantinedAutomaticProbeInfo = await listen(quarantinedAutomaticProbePool);
+  try {
+    await sleep(750);
+    const automaticProbeStatus = (await getJson(`${quarantinedAutomaticProbeInfo.url}/pool/status`, 'pool-secret')).json;
+    const automaticActive = automaticProbeStatus.upstreams.find((upstream) => upstream.name === 'auto-active-good');
+    const automaticQuarantined = automaticProbeStatus.upstreams.find((upstream) => upstream.name === 'auto-quarantined-bad');
+    if (automaticActive?.health?.state !== 'ok' || automaticQuarantined?.health?.state !== 'unknown' || automaticQuarantined?.health?.checked_at) {
+      throw new Error(`expected automatic Health Probe to skip quarantined upstreams: ${JSON.stringify(automaticProbeStatus.upstreams)}`);
+    }
+  } finally {
+    await close(quarantinedAutomaticProbePool);
   }
 
   const preAddModelResult = await postJson(`${poolInfo.url}/pool/model`, 'pool-secret', { model: 'added-model-a' });
@@ -4521,7 +4836,8 @@ try {
         apiUrl: `${addedInfo.url}/v1`,
         siteUrl: `${addedInfo.url}/panel`,
         token: 'plaintext-import-key',
-        weight: 4
+        weight: 4,
+        quarantined: true
       },
       {
         name: 'added-site',
@@ -4536,7 +4852,7 @@ try {
 
   const statusAfterImport = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
   const imported = statusAfterImport.upstreams.find((upstream) => upstream.name === 'cpa-json-site');
-  if (!imported || imported.base_url !== `${addedInfo.url}/v1` || imported.site_url !== `${addedInfo.url}/panel` || imported.weight !== 4 || imported.keys?.[0]?.label !== 'CPA_JSON_SITE_API_KEY') {
+  if (!imported || imported.base_url !== `${addedInfo.url}/v1` || imported.site_url !== `${addedInfo.url}/panel` || imported.weight !== 4 || imported.quarantined !== true || imported.keys?.[0]?.label !== 'CPA_JSON_SITE_API_KEY') {
     throw new Error(`expected cpa/sub2api JSON import to normalize upstream fields: ${JSON.stringify(imported)}`);
   }
 
@@ -4555,8 +4871,8 @@ try {
   }
   const statusAfterImportReplace = (await getJson(`${poolInfo.url}/pool/status`, 'pool-secret')).json;
   const importedReplaced = statusAfterImportReplace.upstreams.find((upstream) => upstream.name === 'cpa-json-site');
-  if (!importedReplaced || importedReplaced.weight !== 5 || importedReplaced.keys?.[0]?.configured !== true) {
-    throw new Error(`expected import replace to update weight and env key: ${JSON.stringify(importedReplaced)}`);
+  if (!importedReplaced || importedReplaced.weight !== 5 || importedReplaced.quarantined !== true || importedReplaced.keys?.[0]?.configured !== true) {
+    throw new Error(`expected import replace to update weight/env key and preserve quarantine: ${JSON.stringify(importedReplaced)}`);
   }
 
   const deleteImported = await deleteJson(`${poolInfo.url}/pool/upstreams/cpa-json-site`, 'pool-secret');
@@ -4621,6 +4937,7 @@ try {
         name: 'slizm@example.test',
         platform: 'openai',
         type: 'oauth',
+        quarantined: true,
         credentials: {
           access_token: oauthAccountJwt
         },
@@ -4646,6 +4963,7 @@ try {
     || accountUpstream.api !== 'openai'
     || accountUpstream.codex_oauth !== true
     || accountUpstream.request_mode !== 'codex_oauth'
+    || accountUpstream.quarantined !== true
     || accountUpstream.oauth_expires_at !== '2099-01-01T00:00:00.000Z'
     || accountUpstream.oauth_client_id !== 'app_test_chatgpt_web'
     || accountUpstream.chatgpt_account_id !== 'jwt-chatgpt-acc'
@@ -4653,7 +4971,7 @@ try {
     || accountUpstream.oauth_plan_type !== 'team'
     || accountUpstream.keys?.[0]?.configured !== true
   ) {
-    throw new Error(`expected OAuth account export to normalize into a Codex OAuth upstream: ${JSON.stringify(accountUpstream)}`);
+    throw new Error(`expected OAuth account export to normalize into a quarantined Codex OAuth upstream: ${JSON.stringify(accountUpstream)}`);
   }
 
   const addProxyToAccount = await postJson(`${poolInfo.url}/pool/upstreams`, 'pool-secret', {
@@ -6236,6 +6554,7 @@ try {
   await close(billingLoginHtmlUpstream);
   await close(billingBlockedUpstream);
   await close(billingHugeLimitUpstream);
+  await close(quarantinedBillingUpstream);
   await close(billingUpstream);
   await close(anthropicMessages);
   await close(cachedChatThenNative);

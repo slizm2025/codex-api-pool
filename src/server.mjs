@@ -1149,6 +1149,20 @@ const ROUTE_STRATEGY_NAMES = new Set([
   'anthropic_messages_compatibility',
   'codex_oauth_responses'
 ]);
+const REQUEST_PROTOCOL_METADATA = {
+  responses: { label: 'Responses', shortLabel: 'Responses', path: '/v1/responses' },
+  chat_completions: { label: 'Chat Completions', shortLabel: 'Chat', path: '/v1/chat/completions' },
+  anthropic_messages: { label: 'Anthropic Messages', shortLabel: 'Messages', path: '/v1/messages' },
+  codex_oauth_responses: { label: 'Codex OAuth Responses', shortLabel: 'Codex OAuth', path: '/backend-api/codex/responses' }
+};
+const ROUTE_STRATEGY_METADATA = {
+  responses: REQUEST_PROTOCOL_METADATA.responses,
+  chat_completions: REQUEST_PROTOCOL_METADATA.chat_completions,
+  chat_completions_compatibility: { ...REQUEST_PROTOCOL_METADATA.chat_completions, label: 'Chat Completions + Compatibility', shortLabel: 'Chat + Compat' },
+  anthropic_messages: REQUEST_PROTOCOL_METADATA.anthropic_messages,
+  anthropic_messages_compatibility: { ...REQUEST_PROTOCOL_METADATA.anthropic_messages, label: 'Anthropic Messages + Compatibility', shortLabel: 'Messages + Compat' },
+  codex_oauth_responses: REQUEST_PROTOCOL_METADATA.codex_oauth_responses
+};
 
 function routeStrategyModelKey(model) {
   return String(model || '').trim() || '__default__';
@@ -1209,39 +1223,99 @@ function learnRouteStrategy(upstream, model, strategy, { source = 'real_traffic'
   };
 }
 
-function requestInterfaceForUpstream(upstream = {}) {
+function requestProtocolType(protocol, upstream = {}, configuredMode = '') {
+  return protocol === 'responses' && (configuredMode === 'codex_oauth' || upstream.codexOAuth || upstream.codex_oauth)
+    ? 'codex_oauth_responses'
+    : protocol;
+}
+
+function requestProtocolView(protocol, capability = {}, upstream = {}, configuredMode = '') {
+  const type = requestProtocolType(protocol, upstream, configuredMode);
+  const metadata = REQUEST_PROTOCOL_METADATA[type] || REQUEST_PROTOCOL_METADATA[protocol] || { label: protocol, shortLabel: protocol, path: '' };
+  return {
+    type,
+    protocol,
+    label: metadata.label,
+    short_label: metadata.shortLabel || metadata.label,
+    path: metadata.path || '',
+    status: capability.status || 'unknown',
+    source: capability.source || '',
+    checked_at: capability.checked_at || null,
+    model: capability.model || '',
+    http_status: capability.http_status || 0,
+    reason: capability.reason || ''
+  };
+}
+
+function supportedRequestProtocols(upstream = {}, configuredMode = '') {
+  const capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+  return PROTOCOL_CAPABILITY_NAMES
+    .map((protocol) => requestProtocolView(protocol, capabilities[protocol] || {}, upstream, configuredMode))
+    .filter((item) => ['verified', 'assumed'].includes(item.status));
+}
+
+function currentRequestProtocolForUpstream(upstream = {}, activeModel = '') {
+  const model = String(activeModel || '').trim();
+  if (!model) {
+    return {
+      type: 'by_requested_model',
+      label: 'By Requested Model',
+      short_label: 'By model',
+      source: 'request',
+      model: '',
+      reason: 'Dashboard is following each incoming Requested Model.'
+    };
+  }
+  const strategy = routeStrategyForUpstream(upstream, model);
+  if (!strategy) {
+    return {
+      type: 'not_learned',
+      label: 'Not Learned',
+      short_label: 'Not learned',
+      source: 'none',
+      model,
+      reason: 'No successful real traffic has learned a Forwarding Strategy for this Requested Model.'
+    };
+  }
+  const strategyName = String(strategy.strategy || '');
+  const metadata = ROUTE_STRATEGY_METADATA[strategyName] || { label: strategyName || 'Unknown', shortLabel: strategyName || 'Unknown', path: '' };
+  return {
+    type: strategyName,
+    strategy: strategyName,
+    label: metadata.label,
+    short_label: metadata.shortLabel || metadata.label,
+    path: metadata.path || '',
+    source: strategy.source || '',
+    model: strategy.model && strategy.model !== '__default__' ? strategy.model : model,
+    checked_at: strategy.checked_at || null,
+    reason: strategy.reason || ''
+  };
+}
+
+function requestInterfaceForUpstream(upstream = {}, activeModel = '') {
   const configuredMode = upstream.requestMode || normalizeRequestMode(upstream.request_mode, upstream.codexOAuth);
   const resolvedMode = upstream.resolvedRequestMode || upstream.resolved_request_mode || '';
-  const labels = {
-    responses: 'Responses',
-    chat_completions: 'Chat Completions',
-    anthropic_messages: 'Anthropic Messages'
-  };
-  const paths = {
-    responses: '/v1/responses',
-    chat_completions: '/v1/chat/completions',
-    anthropic_messages: '/v1/messages'
-  };
   const capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+  const supported = supportedRequestProtocols(upstream, configuredMode);
+  const using = currentRequestProtocolForUpstream(upstream, activeModel);
   const verifiedProtocols = PROTOCOL_CAPABILITY_NAMES
-    .map((protocol) => ({ protocol, capability: capabilities[protocol] || {} }))
+    .map((protocol) => ({ protocol, capability: capabilities[protocol] || {}, view: requestProtocolView(protocol, capabilities[protocol] || {}, upstream, configuredMode) }))
     .filter((item) => item.capability.status === 'verified' && ['probe', 'real_traffic'].includes(item.capability.source));
 
   if (verifiedProtocols.length === 1) {
-    const { protocol, capability } = verifiedProtocols[0];
-    const type = protocol === 'responses' && (configuredMode === 'codex_oauth' || upstream.codexOAuth || upstream.codex_oauth)
-      ? 'codex_oauth_responses'
-      : protocol;
+    const { capability, view } = verifiedProtocols[0];
     return {
-      type,
-      label: type === 'codex_oauth_responses' ? 'Codex OAuth Responses' : labels[protocol],
+      type: view.type,
+      label: view.label,
       source: capability.source,
-      path: paths[protocol],
+      path: view.path,
       configured_mode: configuredMode || 'auto',
       resolved_mode: resolvedMode || '',
       checked_at: capability.checked_at || null,
       model: capability.model || '',
-      http_status: capability.http_status || 0
+      http_status: capability.http_status || 0,
+      supported,
+      using
     };
   }
   if (verifiedProtocols.length > 1) {
@@ -1252,14 +1326,9 @@ function requestInterfaceForUpstream(upstream = {}) {
       path: '',
       configured_mode: configuredMode || 'auto',
       resolved_mode: resolvedMode || '',
-      verified: Object.fromEntries(verifiedProtocols.map(({ protocol, capability }) => [protocol, {
-        label: labels[protocol],
-        path: paths[protocol],
-        source: capability.source,
-        checked_at: capability.checked_at || null,
-        model: capability.model || '',
-        http_status: capability.http_status || 0
-      }]))
+      supported,
+      using,
+      verified: Object.fromEntries(verifiedProtocols.map(({ protocol, view }) => [protocol, view]))
     };
   }
   return {
@@ -1268,7 +1337,9 @@ function requestInterfaceForUpstream(upstream = {}) {
     source: 'pending',
     path: '',
     configured_mode: configuredMode || 'auto',
-    resolved_mode: ''
+    resolved_mode: '',
+    supported,
+    using
   };
 }
 
@@ -3525,6 +3596,7 @@ function createUpstreamState(upstream, index) {
     index,
     name: upstream.name || `upstream-${index + 1}`,
     enabled: upstream.enabled !== false,
+    quarantined: upstream.enabled !== false && upstream.quarantined === true,
     baseUrl: upstream.base_url,
     siteUrl,
     signinAvailable: booleanOption(signinAvailableValue(upstream), Boolean(siteUrl)),
@@ -4019,6 +4091,8 @@ function copyRuntimeState(target, source, { preserveHealth, availabilityConfig }
       state: 'disabled',
       error: 'upstream disabled'
     };
+  } else if (target.billing?.state === 'disabled' && target.billing?.error === 'upstream disabled') {
+    target.billing = emptyBillingState();
   }
 
   for (const key of target.keys) {
@@ -4051,6 +4125,7 @@ function keyAvailable(keyState, at) {
 
 function upstreamAvailable(upstream, at, expectedModel = undefined) {
   return upstream.enabled
+    && !upstream.quarantined
     && upstream.baseUrl
     && healthAllowsSelection(upstream, expectedModel)
     && !codexOAuthExpired(upstream, at)
@@ -4128,6 +4203,7 @@ function nativeResponsesCandidateDiagnostics(state, pathname, model, tried = new
   return state.upstreams.map((upstream) => {
     let reason = '';
     if (!upstream.enabled) reason = 'upstream is disabled';
+    else if (upstream.quarantined) reason = 'upstream is quarantined';
     else if (!upstream.baseUrl) reason = 'upstream has no base_url';
     else if (codexOAuthExpired(upstream, at)) reason = 'Codex OAuth token is expired';
     else if (!healthAllowsSelection(upstream, model)) reason = 'health state does not allow selection for requested model';
@@ -6401,7 +6477,9 @@ function healthProbeStatus(health, expectedModel = undefined) {
 }
 
 function healthProbeSummary(upstreams = [], expectedModel = undefined) {
-  const enabled = upstreams.filter((upstream) => upstream.enabled);
+  const active = upstreams.filter((upstream) => upstream.enabled && !upstream.quarantined);
+  const quarantined = upstreams.filter((upstream) => upstream.enabled && upstream.quarantined);
+  const disabled = upstreams.filter((upstream) => !upstream.enabled);
   const stateCounts = {};
   let okCount = 0;
   let failedCount = 0;
@@ -6414,23 +6492,26 @@ function healthProbeSummary(upstreams = [], expectedModel = undefined) {
       skippedCount += 1;
       continue;
     }
+    if (upstream.quarantined) continue;
     if (status === 'ok') okCount += 1;
     else if (status === 'skipped') skippedCount += 1;
     else failedCount += 1;
   }
-  const probeStatus = enabled.length === 0
+  const probeStatus = active.length === 0
     ? 'skipped'
     : failedCount > 0
       ? 'failed'
-      : okCount === enabled.length
+      : okCount === active.length
         ? 'ok'
         : 'skipped';
   return {
     probe_ok: probeStatus === 'ok',
     probe_status: probeStatus,
     total_count: upstreams.length,
-    enabled_count: enabled.length,
-    disabled_count: upstreams.length - enabled.length,
+    enabled_count: active.length,
+    active_count: active.length,
+    quarantined_count: quarantined.length,
+    disabled_count: disabled.length,
     ok_count: okCount,
     failed_count: failedCount,
     skipped_count: skippedCount,
@@ -7960,7 +8041,8 @@ async function runHealthChecks(state, config, logger = console, probeOptions = {
   const probeResults = [];
   const probingPromise = (async () => {
     const concurrency = Math.max(1, Number(config.health?.concurrency || 4));
-    await mapWithConcurrency(state.upstreams.filter((upstream) => upstream.enabled), concurrency, async (upstream) => {
+    const probeCandidates = state.upstreams.filter((upstream) => upstream.enabled && (live || !upstream.quarantined));
+    await mapWithConcurrency(probeCandidates, concurrency, async (upstream) => {
       const health = await probeOneUpstream(state, upstream, config, probeOptions);
       probeResults.push({ upstream: upstream.name, health });
     });
@@ -7990,7 +8072,7 @@ async function runBillingChecks(state, config, logger = console) {
   state.billingProbing = true;
   try {
     const concurrency = Math.max(1, Number(config.billing?.concurrency || 3));
-    const upstreams = state.upstreams.filter((upstream) => upstream.enabled && upstream.billingConfig?.enabled !== false);
+    const upstreams = state.upstreams.filter((upstream) => upstream.enabled && !upstream.quarantined && upstream.billingConfig?.enabled !== false);
     await mapWithConcurrency(upstreams, concurrency, (upstream) => safeProbeOneBilling(upstream, config, logger));
   } catch (error) {
     logger.warn?.(`[billing] ${error.message}`);
@@ -8059,7 +8141,7 @@ function dashboardHtml() {
       pointer-events: none;
       background: linear-gradient(180deg, rgba(255,255,255,.64), rgba(255,255,255,0));
     }
-    .shell { position: relative; width: min(1240px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 48px; }
+    .shell { position: relative; width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 24px 0 48px; }
     header { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: end; margin-bottom: 16px; }
     h1 { font-size: clamp(28px, 3.4vw, 42px); line-height: 1; margin: 0; letter-spacing: 0; }
     .lede { color: var(--muted); font-size: 14px; line-height: 1.6; max-width: 620px; }
@@ -8101,7 +8183,7 @@ function dashboardHtml() {
       border-radius: 8px;
       box-shadow: 0 18px 48px rgba(31, 45, 39, .1);
     }
-    .dashboard-region { margin-top: 14px; }
+    .dashboard-region { margin-top: 12px; }
     .section-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 12px; }
     .section-head h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
     .section-head p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; max-width: 560px; }
@@ -8118,7 +8200,7 @@ function dashboardHtml() {
     .diagnostic-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
     .diagnostic-meta div { min-width: 0; }
     .diagnostic-meta strong { display: block; font-size: 13px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .summary { display: grid; grid-template-columns: repeat(6, minmax(118px, 1fr)); gap: 10px; }
     .metric { padding: 14px 16px; position: relative; overflow: hidden; border-left: 4px solid var(--accent); }
     .metric b { display: block; font-size: 28px; letter-spacing: 0; line-height: 1.05; }
     .metric span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; }
@@ -8130,13 +8212,18 @@ function dashboardHtml() {
     .token-breakdown strong { color: var(--ink); font-size: 12px; line-height: 1.35; }
     .grid { display: grid; gap: 8px; }
     .workbench-list { display: grid; gap: 8px; }
-    .workbench-head, .workbench-row { display: grid; grid-template-columns: minmax(180px, 1.15fr) 104px minmax(260px, 1.35fr) minmax(132px, .7fr) minmax(172px, .9fr) minmax(246px, 246px); gap: 12px; align-items: center; }
+    .workbench-list[hidden] { display: none; }
+    .operations-grid { display: grid; grid-template-areas: "workbench" "tools"; gap: 12px; align-items: start; }
+    .operations-main { grid-area: workbench; display: grid; gap: 12px; min-width: 0; align-content: start; }
+    .operations-stack { grid-area: tools; display: grid; grid-template-columns: minmax(320px, .7fr) minmax(280px, .45fr) minmax(280px, .45fr); gap: 12px; min-width: 0; align-content: start; }
+    .workbench-head, .workbench-row { display: grid; grid-template-columns: minmax(198px, 1.05fr) minmax(96px, .45fr) minmax(300px, 1.6fr) minmax(112px, .55fr) minmax(164px, .72fr) minmax(196px, .72fr); gap: 10px; align-items: center; }
     .workbench-head { padding: 0 12px 2px; color: var(--muted); font-size: 11px; letter-spacing: .11em; text-transform: uppercase; }
     .card { padding: 12px; min-height: 0; animation: rise .35s ease both; cursor: pointer; transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
     .workbench-list.stable .card { animation: none; }
     .card:hover { transform: translateY(-1px); border-color: var(--line-strong); box-shadow: 0 16px 42px rgba(31, 45, 39, .13); }
     .card.editing { border-color: rgba(18, 128, 92, .62); box-shadow: 0 0 0 4px var(--glow), 0 18px 48px rgba(31, 45, 39, .1); }
     .card.paused { border-style: dashed; opacity: .76; }
+    .card.quarantined { border-style: dashed; border-color: rgba(166,106,5,.42); background: rgba(255,251,239,.68); }
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
     .card-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 14px; }
     .name { font-size: 17px; font-weight: 700; letter-spacing: 0; line-height: 1.12; word-break: break-word; }
@@ -8165,10 +8252,12 @@ function dashboardHtml() {
     .availability-dot.is-failure { background: var(--bad); }
     .availability-dot.is-empty { background: rgba(23,33,29,.13); opacity: 1; }
     .billing-error strong { color: var(--warn); }
-    .workbench-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; align-self: stretch; align-content: start; }
+    .workbench-action-stack { display: grid; gap: 8px; align-self: stretch; align-content: start; }
+    .workbench-confirmed-actions { display: grid; grid-template-columns: 1fr; gap: 8px; padding-bottom: 8px; border-bottom: 1px dashed rgba(166,106,5,.28); }
+    .workbench-actions { display: grid; grid-template-columns: repeat(2, minmax(72px, 1fr)); gap: 7px; align-content: start; }
     .pill { border-radius: 999px; border: 1px solid currentColor; padding: 6px 10px; font-size: 12px; white-space: nowrap; }
-    .workbench-actions button, .workbench-actions .site-link { width: 100%; min-width: 0; min-height: 36px; padding: 7px 8px; font-size: 12px; box-shadow: none; }
-    .workbench-actions .ui-icon { width: 14px; height: 14px; flex-basis: 14px; }
+    .workbench-actions button, .workbench-actions .site-link, .workbench-confirmed-actions button { width: 100%; min-width: 0; min-height: 34px; padding: 7px 7px; font-size: 12px; box-shadow: none; }
+    .workbench-actions .ui-icon, .workbench-confirmed-actions .ui-icon { width: 14px; height: 14px; flex-basis: 14px; }
     .site-link { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line-strong); border-radius: 7px; padding: 7px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; background: rgba(255,255,255,.46); min-width: 58px; text-align: center; }
     .site-link:hover { background: var(--ink); color: var(--paper); }
     .signin-action { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.28); }
@@ -8213,6 +8302,11 @@ function dashboardHtml() {
     .toggle-site::before { content: none; }
     .toggle-site.is-off { color: var(--paper); background: var(--ink); border-color: var(--ink); }
     .toggle-site[disabled] { cursor: wait; opacity: .68; transform: none; }
+    .quarantine-site { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; color: var(--warn); border-color: rgba(166,106,5,.45); background: rgba(166,106,5,.08); }
+    .quarantine-site.is-restore { color: var(--good); border-color: rgba(18,128,92,.45); background: rgba(18,128,92,.08); }
+    .quarantine-site[disabled] { cursor: wait; opacity: .68; transform: none; }
+    .quarantine-drawer .section-head { align-items: center; }
+    .quarantine-drawer-toggle { min-width: 128px; justify-content: center; }
     .delete-site { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; color: var(--bad); border-color: rgba(180,59,50,.42); background: rgba(180,59,50,.07); }
     .delete-site:hover { color: var(--paper); background: var(--bad); border-color: var(--bad); }
     .delete-site[disabled] { cursor: wait; opacity: .68; transform: none; }
@@ -8254,10 +8348,17 @@ function dashboardHtml() {
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--glow); }
     .toggle-field input { width: 38px; justify-self: start; accent-color: var(--accent); }
     .token-input { width: 180px; }
-    .model-panel { padding: 14px; display: grid; grid-template-columns: minmax(220px, .8fr) minmax(180px, 1fr) repeat(3, minmax(110px, auto)) auto; gap: 14px; align-items: end; }
+    .model-panel { padding: 14px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 10px; align-items: end; }
+    .model-panel label:first-child, .model-panel #modelReadout, .model-panel #compatReadout { grid-column: 1 / -1; }
     .model-readout { color: var(--muted); font-size: 13px; line-height: 1.45; }
-    .curl-panel { padding: 16px; display: grid; grid-template-columns: minmax(210px, .8fr) minmax(150px, .42fr) minmax(150px, .42fr) minmax(150px, .42fr); gap: 10px; align-items: end; }
-    .curl-panel .section-head, .curl-wide, .curl-result { grid-column: 1 / -1; }
+    .curl-panel { padding: 16px; display: grid; grid-template-columns: minmax(210px, .85fr) minmax(128px, .38fr) minmax(128px, .38fr) minmax(128px, .38fr); gap: 10px; align-items: end; }
+    .curl-panel .section-head, .curl-panel summary, .curl-wide, .curl-result { grid-column: 1 / -1; }
+    .curl-panel summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; gap: 12px; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 2px; }
+    .curl-panel summary::-webkit-details-marker { display: none; }
+    .curl-summary-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .curl-summary-title h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
+    .curl-summary-meta { color: var(--muted); font-size: 12px; line-height: 1.35; text-align: right; }
+    .curl-panel[open] .curl-summary-meta { color: var(--accent); }
     .curl-body-grid { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }
     .curl-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     .curl-result { display: grid; gap: 10px; border-top: 1px solid var(--line); padding-top: 12px; }
@@ -8292,7 +8393,7 @@ function dashboardHtml() {
     .import-panel .section-head { grid-column: 1 / -1; }
     .requests { padding: 18px; }
     .requests-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 12px; }
-    .requests-head h2 { margin: 0; font-family: Didot, Bodoni 72, Georgia, serif; font-size: 28px; letter-spacing: 0; }
+    .requests-head h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
     .request-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; }
     .request-row { display: grid; grid-template-columns: 1.1fr .9fr 1.2fr 1.2fr .6fr; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: rgba(255,255,255,.48); font-size: 12px; }
     .request-row strong { font-size: 13px; overflow-wrap: anywhere; }
@@ -8319,8 +8420,8 @@ function dashboardHtml() {
     .toast { min-width: 0; overflow-wrap: anywhere; }
     .last-refresh { flex: 0 0 auto; color: rgba(99,112,107,.82); }
     .empty { padding: 24px; color: var(--muted); }
-    @media (max-width: 1100px) { .diagnostic-strip, .probe-diagnostics { grid-template-columns: 1fr; } .workbench-head { display: none; } .workbench-row { grid-template-columns: minmax(180px, 1.2fr) repeat(2, minmax(120px, 1fr)); } .facts { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 760px) { header, .summary, .model-panel, .curl-panel, .curl-body-grid, .curl-result-body, .import-panel, .grid, .workbench-row, .workbench-models-row, .probe-inline-grid, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .curl-actions { justify-content: flex-start; } .model-strip-label { padding-top: 0; } .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-history-day summary, .usage-site-row { grid-template-columns: 1fr 1fr; } .request-row, .probe-result-row { grid-template-columns: 1fr; } .probe-results-head { flex-direction: column; } .probe-results-actions { justify-content: flex-start; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
+    @media (max-width: 1240px) { .summary { grid-template-columns: repeat(3, minmax(128px, 1fr)); } .diagnostic-strip, .operations-stack, .probe-diagnostics { grid-template-columns: 1fr; } .workbench-head { display: none; } .workbench-row { grid-template-columns: minmax(210px, 1.2fr) minmax(100px, .5fr) minmax(260px, 1.3fr); } .workbench-action-stack { grid-column: 1 / -1; grid-template-columns: minmax(150px, .3fr) minmax(0, 1fr); align-items: start; } .workbench-confirmed-actions { padding: 0 8px 0 0; border-right: 1px dashed rgba(166,106,5,.28); border-bottom: 0; } .facts { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 760px) { .shell { width: min(100% - 20px, 1440px); padding-top: 16px; } header, .summary, .model-panel, .curl-panel, .curl-body-grid, .curl-result-body, .import-panel, .grid, .workbench-row, .workbench-models-row, .probe-inline-grid, form { grid-template-columns: 1fr; } .diagnostic-meta { grid-template-columns: 1fr; } .toolbar { justify-content: flex-start; } .token-input { width: 100%; } .section-head { align-items: flex-start; flex-direction: column; gap: 6px; } .curl-actions { justify-content: flex-start; } .model-strip-label { padding-top: 0; } .workbench-action-stack { grid-template-columns: 1fr; } .workbench-confirmed-actions { padding: 0 0 8px; border-right: 0; border-bottom: 1px dashed rgba(166,106,5,.28); } .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-history-day summary, .usage-site-row { grid-template-columns: 1fr 1fr; } .request-row, .probe-result-row { grid-template-columns: 1fr; } .probe-results-head { flex-direction: column; } .probe-results-actions { justify-content: flex-start; } .statusbar { align-items: flex-start; flex-direction: column; gap: 6px; } }
   </style>
 </head>
 <body>
@@ -8369,7 +8470,7 @@ function dashboardHtml() {
         </div>
       </div>
       <div class="summary">
-        <div class="metric"><span class="metric-label" data-icon="server">Upstreams</span><b id="total">0</b></div>
+        <div class="metric"><span class="metric-label" data-icon="server">Active</span><b id="total">0</b></div>
         <div class="metric"><span class="metric-label" data-icon="check">Available</span><b id="available">0</b></div>
         <div class="metric"><span class="metric-label" data-icon="heart">Healthy</span><b id="healthy">0</b></div>
         <div class="metric"><span class="metric-label" data-icon="timer">Cooling</span><b id="cooling">0</b></div>
@@ -8385,98 +8486,118 @@ function dashboardHtml() {
           </div>
         </div>
       </div>
-      <div class="model-panel panel">
-        <label>当前模型<select id="modelSelect"><option value="">跟随 Codex 请求</option></select></label>
-        <div class="model-readout" id="modelReadout">尚未完成模型探测。</div>
-        <label class="toggle-field">Adapter 兼容<input id="compatStrip" type="checkbox" /></label>
-        <label class="toggle-field">Anthropic<input id="compatAnthropic" type="checkbox" /></label>
-        <label class="toggle-field">Chat<input id="compatChat" type="checkbox" /></label>
-        <button class="ghost" id="clearModel" type="button" data-icon="x">清空覆盖</button>
-        <div class="model-readout" id="compatReadout">兼容模式未加载。</div>
-      </div>
-      <section class="curl-panel panel dashboard-region" data-dashboard-region="curl-debugger" aria-labelledby="curl-debugger-title">
-        <div class="section-head">
-          <div>
-            <h2 id="curl-debugger-title"><span class="title-mark" data-icon="activity"></span>Curl Debugger</h2>
-            <p>直接填 Base URL 和 API Key 发出一次原始请求，完整展示状态码、响应头和响应体。</p>
+    </section>
+
+    <div class="operations-grid dashboard-region">
+      <div class="operations-main">
+        <section data-dashboard-region="upstream-workbench" aria-labelledby="upstream-workbench-title">
+          <div class="section-head">
+            <h2 id="upstream-workbench-title"><span class="title-mark" data-icon="server"></span>Upstream Workbench</h2>
+            <p>扫描每个 Active Upstream 的 Health State、Cooldown、Usage、Billing、Quota 和安全操作。</p>
           </div>
+          <div class="workbench-toolbar">
+            <div class="workbench-filter-stack">
+              <div class="workbench-filter-line">
+                <span class="filter-label">验证层级</span>
+                <div class="verification-filters" role="group" aria-label="验证层级筛选">
+                  <button class="ghost verification-filter" type="button" data-verification-filter="all">全部</button>
+                  <button class="ghost verification-filter" type="button" data-verification-filter="real_verified">真实请求验证</button>
+                  <button class="ghost verification-filter" type="button" data-verification-filter="probe_only">一层检测通过</button>
+                  <button class="ghost verification-filter" type="button" data-verification-filter="real_pending">可选待真实验证</button>
+                  <button class="ghost verification-filter" type="button" data-verification-filter="unavailable">不可用</button>
+                </div>
+              </div>
+              <div class="workbench-filter-line">
+                <span class="filter-label">签到状态</span>
+                <div class="signin-filters" role="group" aria-label="签到状态筛选">
+                  <button class="ghost signin-filter" type="button" data-signin-filter="all">全部</button>
+                  <button class="ghost signin-filter" type="button" data-signin-filter="pending">今日未签</button>
+                  <button class="ghost signin-filter" type="button" data-signin-filter="completed">今日已签</button>
+                  <button class="ghost signin-filter" type="button" data-signin-filter="not_required">无需签到</button>
+                </div>
+              </div>
+            </div>
+            <div class="signin-count" id="signinFilterCount"></div>
+            <div class="signin-count" id="verificationFilterCount"></div>
+          </div>
+          <section id="cards" class="workbench-list" aria-label="Upstream Workbench rows"></section>
+        </section>
+
+        <section class="quarantine-drawer" data-dashboard-region="quarantine-box" aria-labelledby="quarantine-box-title">
+          <div class="section-head">
+            <div>
+              <h2 id="quarantine-box-title"><span class="title-mark" data-icon="shield"></span>隔离区 <span id="quarantineCount" class="status-badge warn">0</span></h2>
+              <p>Quarantined Upstreams 不参与 Selection；可手动测试、刷新余额，并在确认后恢复。</p>
+            </div>
+            <button id="quarantineToggle" class="ghost quarantine-drawer-toggle" type="button" aria-expanded="false" aria-controls="quarantineCards" data-icon="shield">打开隔离区</button>
+          </div>
+          <section id="quarantineCards" class="workbench-list" aria-label="Quarantined Upstream rows" hidden></section>
+        </section>
+      </div>
+
+      <aside class="operations-stack" aria-label="辅助操作">
+        <div class="model-panel panel">
+          <label>当前模型<select id="modelSelect"><option value="">跟随 Codex 请求</option></select></label>
+          <div class="model-readout" id="modelReadout">尚未完成模型探测。</div>
+          <label class="toggle-field">Adapter 兼容<input id="compatStrip" type="checkbox" /></label>
+          <label class="toggle-field">Anthropic<input id="compatAnthropic" type="checkbox" /></label>
+          <label class="toggle-field">Chat<input id="compatChat" type="checkbox" /></label>
+          <button class="ghost" id="clearModel" type="button" data-icon="x">清空覆盖</button>
+          <div class="model-readout" id="compatReadout">兼容模式未加载。</div>
+        </div>
+        <section id="probeResults" class="probe-results panel" aria-live="polite" hidden>
+          <div class="probe-results-head">
+            <div class="probe-results-title">
+              <span class="title-mark" data-icon="radar"></span>
+              <div>
+                <h2 id="probeResultsTitle">测试结果</h2>
+                <p id="probeResultsMeta">等待测试完成。</p>
+              </div>
+            </div>
+            <div class="probe-results-actions">
+              <button class="ghost" id="copyProbeResults" type="button" data-icon="download">复制 JSON</button>
+              <button class="ghost" id="clearProbeResults" type="button" data-icon="x">清空</button>
+            </div>
+          </div>
+          <div id="probeResultsSummary" class="probe-summary"></div>
+          <div id="probeResultsList" class="probe-result-list"></div>
+          <details class="probe-raw">
+            <summary>原始响应 JSON</summary>
+            <pre id="probeResultsRaw"></pre>
+          </details>
+        </section>
+        <details class="curl-panel panel" data-dashboard-region="curl-debugger" aria-labelledby="curl-debugger-title">
+          <summary>
+            <div class="curl-summary-title">
+              <span class="title-mark" data-icon="activity"></span>
+              <h2 id="curl-debugger-title">Curl Debugger</h2>
+            </div>
+            <div class="curl-summary-meta">高级原始请求</div>
+          </summary>
           <div class="curl-actions">
             <button class="ghost" id="sendCurlTest" type="button" data-icon="play">发送请求</button>
             <button class="ghost" id="copyCurlResult" type="button" data-icon="download" disabled>复制结果</button>
           </div>
-        </div>
-        <label>Base URL<input id="curlBaseUrl" placeholder="https://api.example.com" autocomplete="off" /></label>
-        <label>Path<input id="curlPath" value="/v1/models" autocomplete="off" /></label>
-        <label>Method<select id="curlMethod"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
-        <label>Auth<select id="curlAuthType"><option value="bearer">Bearer</option><option value="codex">Codex CLI</option><option value="x-api-key">X-API-Key</option><option value="anthropic">Anthropic</option><option value="none">None</option></select></label>
-        <label class="curl-wide">API Key<input id="curlApiKey" type="password" placeholder="sk-..." autocomplete="off" /></label>
-        <div class="curl-body-grid">
-          <label>Headers JSON<textarea id="curlHeaders" spellcheck="false" placeholder='{"OpenAI-Beta":"responses=experimental"}'></textarea></label>
-          <label>Body<textarea id="curlBody" spellcheck="false" placeholder='{"model":"gpt-5.5","input":"hello"}'></textarea></label>
-        </div>
-        <section id="curlResult" class="curl-result" aria-live="polite" hidden>
-          <div id="curlResultSummary" class="curl-result-summary"></div>
-          <div class="curl-result-body">
-            <div class="curl-code"><strong>Response Headers</strong><pre id="curlResultHeaders"></pre></div>
-            <div class="curl-code"><strong>Response Body</strong><pre id="curlResultBody"></pre></div>
+          <label>Base URL<input id="curlBaseUrl" placeholder="https://api.example.com" autocomplete="off" /></label>
+          <label>Path<input id="curlPath" value="/v1/models" autocomplete="off" /></label>
+          <label>Method<select id="curlMethod"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label>
+          <label>Auth<select id="curlAuthType"><option value="bearer">Bearer</option><option value="codex">Codex CLI</option><option value="x-api-key">X-API-Key</option><option value="anthropic">Anthropic</option><option value="none">None</option></select></label>
+          <label class="curl-wide">API Key<input id="curlApiKey" type="password" placeholder="sk-..." autocomplete="off" /></label>
+          <div class="curl-body-grid">
+            <label>Headers JSON<textarea id="curlHeaders" spellcheck="false" placeholder='{"OpenAI-Beta":"responses=experimental"}'></textarea></label>
+            <label>Body<textarea id="curlBody" spellcheck="false" placeholder='{"model":"gpt-5.5","input":"hello"}'></textarea></label>
           </div>
-          <div class="curl-code"><strong>Full Debug JSON</strong><pre id="curlResultRaw"></pre></div>
-        </section>
-      </section>
-      <section id="probeResults" class="probe-results panel" aria-live="polite" hidden>
-        <div class="probe-results-head">
-          <div class="probe-results-title">
-            <span class="title-mark" data-icon="radar"></span>
-            <div>
-              <h2 id="probeResultsTitle">测试结果</h2>
-              <p id="probeResultsMeta">等待测试完成。</p>
+          <section id="curlResult" class="curl-result" aria-live="polite" hidden>
+            <div id="curlResultSummary" class="curl-result-summary"></div>
+            <div class="curl-result-body">
+              <div class="curl-code"><strong>Response Headers</strong><pre id="curlResultHeaders"></pre></div>
+              <div class="curl-code"><strong>Response Body</strong><pre id="curlResultBody"></pre></div>
             </div>
-          </div>
-          <div class="probe-results-actions">
-            <button class="ghost" id="copyProbeResults" type="button" data-icon="download">复制 JSON</button>
-            <button class="ghost" id="clearProbeResults" type="button" data-icon="x">清空</button>
-          </div>
-        </div>
-        <div id="probeResultsSummary" class="probe-summary"></div>
-        <div id="probeResultsList" class="probe-result-list"></div>
-        <details class="probe-raw">
-          <summary>原始响应 JSON</summary>
-          <pre id="probeResultsRaw"></pre>
+            <div class="curl-code"><strong>Full Debug JSON</strong><pre id="curlResultRaw"></pre></div>
+          </section>
         </details>
-      </section>
-    </section>
-
-    <section class="dashboard-region" data-dashboard-region="upstream-workbench" aria-labelledby="upstream-workbench-title">
-      <div class="section-head">
-        <h2 id="upstream-workbench-title"><span class="title-mark" data-icon="server"></span>Upstream Workbench</h2>
-        <p>扫描每个 Upstream 的 Health State、Cooldown、Usage、Billing、Quota 和安全操作。</p>
-      </div>
-      <div class="workbench-toolbar">
-        <div class="workbench-filter-stack">
-          <div class="workbench-filter-line">
-            <span class="filter-label">验证层级</span>
-            <div class="verification-filters" role="group" aria-label="验证层级筛选">
-              <button class="ghost verification-filter" type="button" data-verification-filter="all">全部</button>
-              <button class="ghost verification-filter" type="button" data-verification-filter="real_verified">真实请求验证</button>
-              <button class="ghost verification-filter" type="button" data-verification-filter="probe_only">一层检测通过</button>
-              <button class="ghost verification-filter" type="button" data-verification-filter="unavailable">不可用 / 未验证</button>
-            </div>
-          </div>
-          <div class="workbench-filter-line">
-            <span class="filter-label">签到状态</span>
-            <div class="signin-filters" role="group" aria-label="签到状态筛选">
-              <button class="ghost signin-filter" type="button" data-signin-filter="all">全部</button>
-              <button class="ghost signin-filter" type="button" data-signin-filter="pending">今日未签</button>
-              <button class="ghost signin-filter" type="button" data-signin-filter="completed">今日已签</button>
-              <button class="ghost signin-filter" type="button" data-signin-filter="not_required">无需签到</button>
-            </div>
-          </div>
-        </div>
-        <div class="signin-count" id="signinFilterCount"></div>
-        <div class="signin-count" id="verificationFilterCount"></div>
-      </div>
-      <section id="cards" class="workbench-list" aria-label="Upstream Workbench rows"></section>
-    </section>
+      </aside>
+    </div>
 
     <section class="usage-history panel dashboard-region" data-dashboard-region="daily-token-usage" aria-labelledby="daily-token-usage-title">
       <div class="section-head">
@@ -8539,6 +8660,9 @@ function dashboardHtml() {
 
   <script>
     const cards = document.querySelector('#cards');
+    const quarantineCards = document.querySelector('#quarantineCards');
+    const quarantineCount = document.querySelector('#quarantineCount');
+    const quarantineToggle = document.querySelector('#quarantineToggle');
     const toast = document.querySelector('#toast');
     const lastRefresh = document.querySelector('#lastRefresh');
     const modelSelect = document.querySelector('#modelSelect');
@@ -8599,11 +8723,13 @@ function dashboardHtml() {
     let editingName = '';
     let upstreamCache = new Map();
     let cardsSignature = null;
+    let quarantineCardsSignature = null;
     let modelOptionsSignature = '';
     let latestStatus = null;
     let adminToken = localStorage.getItem('codexPoolAdminToken') || '';
     let signinFilter = localStorage.getItem('codexPoolSigninFilter') || 'all';
     let verificationFilter = localStorage.getItem('codexPoolVerificationFilter') || 'all';
+    let quarantineDrawerOpen = localStorage.getItem('codexPoolQuarantineOpen') === 'true';
     let latestProbeResult = null;
     let latestCurlResult = null;
     const upstreamProbeResults = new Map();
@@ -8839,7 +8965,7 @@ function dashboardHtml() {
       return '<div class="probe-inline" data-probe-result="' + esc(name) + '"' + (result ? '' : ' hidden') + '>' + inlineProbeResultBodyHtml(result) + '</div>';
     }
     function renderInlineProbeResult(name) {
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const node = card?.querySelector('[data-probe-result]');
       if (!node) return;
       const result = upstreamProbeResults.get(name);
@@ -8848,13 +8974,15 @@ function dashboardHtml() {
     }
     function clearInlineProbeResults() {
       upstreamProbeResults.clear();
-      cards.querySelectorAll('[data-probe-result]').forEach((node) => {
-        node.hidden = true;
-        node.innerHTML = '';
+      [cards, quarantineCards].forEach((container) => {
+        container.querySelectorAll('[data-probe-result]').forEach((node) => {
+          node.hidden = true;
+          node.innerHTML = '';
+        });
       });
     }
     function scrollInlineProbeResult(name) {
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const node = card?.querySelector('[data-probe-result]');
       if (node && !node.hidden) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
@@ -8882,9 +9010,13 @@ function dashboardHtml() {
     function renderProbeResult(payload, { mode, title, responseOk = true, error = '' } = {}) {
       const at = new Date().toISOString();
       latestProbeResult = { mode, title, responseOk, error, payload, at };
-      if (!probeResults) return;
       const rows = probeResultRows(payload, mode);
       rememberInlineProbeRows(rows, { mode, title, responseOk, error, at });
+      if (mode === 'one') {
+        if (rows[0]?.name) scrollInlineProbeResult(rows[0].name);
+        return;
+      }
+      if (!probeResults) return;
       probeResults.hidden = false;
       probeResultsTitle.textContent = title || '测试结果';
       probeResultsMeta.textContent = new Date().toLocaleString() + ' · ' + (responseOk ? '请求完成' : '请求失败') + (error ? ' · ' + error : '');
@@ -8905,7 +9037,6 @@ function dashboardHtml() {
           + '</div>';
       }).join('') : '<div class="empty">暂无测试明细。</div>';
       probeResultsRaw.textContent = JSON.stringify(latestProbeResult, null, 2);
-      if (mode === 'one' && rows[0]?.name) scrollInlineProbeResult(rows[0].name);
     }
     function clearProbeResult() {
       latestProbeResult = null;
@@ -9007,6 +9138,8 @@ function dashboardHtml() {
     function renderCurlResult(result, responseOk = true) {
       latestCurlResult = result || null;
       if (!curlResult) return;
+      const curlPanel = curlResult.closest('details');
+      if (curlPanel) curlPanel.open = true;
       curlResult.hidden = false;
       copyCurlResult.disabled = !latestCurlResult;
       const error = result?.error || '';
@@ -9173,12 +9306,41 @@ function dashboardHtml() {
         }).join('')
         + '</div>';
     }
+    function requestProtocolLabel(item = {}) {
+      return item.short_label || item.label || item.type || item.protocol || 'Unknown';
+    }
+    function requestInterfaceSupportsLabel(info = {}) {
+      const supported = Array.isArray(info.supported) ? info.supported : [];
+      if (supported.length > 0) return supported.map(requestProtocolLabel).join(', ');
+      if (info.verified) return Object.values(info.verified).map(requestProtocolLabel).join(', ') || 'Pending Verification';
+      return info.label && info.label !== 'Model Dependent' ? info.label : 'Pending Verification';
+    }
+    function requestInterfaceUsingLabel(info = {}) {
+      return requestProtocolLabel(info.using || { label: 'Not Learned' });
+    }
+    function requestProtocolTitle(prefix, item = {}) {
+      return [
+        prefix + ' ' + (item.label || item.short_label || item.type || item.protocol || 'Unknown'),
+        item.path || '',
+        item.status ? 'status=' + item.status : '',
+        item.source ? 'source=' + item.source : '',
+        item.model ? 'model=' + item.model : '',
+        item.http_status ? 'HTTP ' + item.http_status : '',
+        item.checked_at ? 'checked=' + item.checked_at : '',
+        item.reason || ''
+      ].filter(Boolean).join(' ');
+    }
     function requestInterfaceLabel(upstream) {
-      return upstream?.request_interface?.label || 'Pending Verification';
+      const info = upstream?.request_interface || {};
+      return 'Supports: ' + requestInterfaceSupportsLabel(info) + ' · Using: ' + requestInterfaceUsingLabel(info);
     }
     function requestInterfaceTitle(upstream) {
       const info = upstream?.request_interface || {};
-      const verified = info.verified ? Object.values(info.verified).map((item) => [item.label, item.path, item.source, item.model].filter(Boolean).join(' ')).join(' | ') : '';
+      const supported = Array.isArray(info.supported)
+        ? info.supported.map((item) => requestProtocolTitle('Supports', item)).join(' | ')
+        : '';
+      const using = info.using ? requestProtocolTitle('Using', info.using) : '';
+      const verified = info.verified ? Object.values(info.verified).map((item) => requestProtocolTitle('Verified', item)).join(' | ') : '';
       return [
         info.label || 'Pending Verification',
         info.path || '',
@@ -9188,6 +9350,8 @@ function dashboardHtml() {
         info.model ? 'model=' + info.model : '',
         info.http_status ? 'HTTP ' + info.http_status : '',
         info.checked_at ? 'checked=' + info.checked_at : '',
+        supported,
+        using,
         verified
       ].filter(Boolean).join(' · ');
     }
@@ -9372,12 +9536,14 @@ function dashboardHtml() {
     const verificationTierLabels = {
       real_verified: '真实请求验证',
       probe_only: '一层检测通过',
-      unavailable: '不可用 / 未验证'
+      real_pending: '可选待真实验证',
+      unavailable: '不可用'
     };
     const verificationFilterLabels = {
       all: '全部',
       real_verified: verificationTierLabels.real_verified,
       probe_only: verificationTierLabels.probe_only,
+      real_pending: verificationTierLabels.real_pending,
       unavailable: verificationTierLabels.unavailable
     };
     if (!signinFilterLabels[signinFilter]) signinFilter = 'all';
@@ -9386,6 +9552,7 @@ function dashboardHtml() {
     function verificationTier(upstream) {
       if (upstream.available && upstream.representative_availability?.verified === true) return 'real_verified';
       if (upstream.available && upstream.health?.state === 'ok') return 'probe_only';
+      if (upstream.available) return 'real_pending';
       return 'unavailable';
     }
     const verificationFilterMatches = (upstream) => verificationFilter === 'all' || verificationTier(upstream) === verificationFilter;
@@ -9513,9 +9680,11 @@ function dashboardHtml() {
     }
     function likelyDiagnosticReason(ups, activeModel, eligible, latestFailure) {
       const enabled = ups.filter((upstream) => upstream.enabled);
-      const available = ups.filter((upstream) => upstream.available);
-      const cooling = enabled.filter((upstream) => upstream.cooldown_ms > 0);
-      const missingKeys = enabled.filter((upstream) => !hasConfiguredKey(upstream));
+      const active = enabled.filter((upstream) => !upstream.quarantined);
+      const quarantined = enabled.filter((upstream) => upstream.quarantined);
+      const available = active.filter((upstream) => upstream.available);
+      const cooling = active.filter((upstream) => upstream.cooldown_ms > 0);
+      const missingKeys = active.filter((upstream) => !hasConfiguredKey(upstream));
       const disabled = ups.filter((upstream) => !upstream.enabled);
       const modelExcluded = activeModel
         ? available.filter((upstream) => {
@@ -9523,14 +9692,16 @@ function dashboardHtml() {
           return models.length > 0 && !models.includes(activeModel);
         })
         : [];
-      const hardFailures = enabled.filter(isHardHealthFailure);
+      const hardFailures = active.filter(isHardHealthFailure);
       if (ups.length === 0) return 'Blocked: no Upstreams configured.';
       if (enabled.length === 0) return 'Blocked: all Upstreams are Disabled.';
-      if (eligible.length === 0 && missingKeys.length === enabled.length) return 'Blocked: no configured Upstream Keys are available.';
+      if (active.length === 0 && quarantined.length > 0) return 'Blocked: all Active Upstreams are in Quarantine.';
+      if (eligible.length === 0 && missingKeys.length === active.length) return 'Blocked: no configured Upstream Keys are available.';
       if (eligible.length === 0 && modelExcluded.length > 0) return 'Blocked: Model Override ' + activeModel + ' is not a Discovered Model on any available Upstream.';
       if (eligible.length === 0 && cooling.length > 0) return 'Blocked: all Selection candidates are in Cooldown.';
       if (eligible.length === 0) return 'Blocked: zero Upstreams can currently participate in Selection.';
       if (latestFailure) return latestFailure;
+      if (quarantined.length > 0) return 'Degraded: ' + quarantined.length + ' Upstream' + (quarantined.length === 1 ? '' : 's') + ' in Quarantine.';
       if (disabled.length > 0) return 'Degraded: ' + disabled.length + ' Upstream' + (disabled.length === 1 ? '' : 's') + ' Disabled.';
       if (cooling.length > 0) return 'Degraded: ' + cooling.length + ' Upstream' + (cooling.length === 1 ? '' : 's') + ' in Cooldown.';
       if (missingKeys.length > 0) return 'Degraded: ' + missingKeys.length + ' enabled Upstream' + (missingKeys.length === 1 ? '' : 's') + ' missing configured Upstream Keys.';
@@ -9542,10 +9713,10 @@ function dashboardHtml() {
     function updateTopDiagnostic(data, ups, activeModel) {
       const eligible = ups.filter((upstream) => upstream.available && upstreamSupportsModel(upstream, activeModel));
       const latestFailure = requestFailureText((data.recent_requests || [])[0]);
-      const enabled = ups.filter((upstream) => upstream.enabled);
+      const active = ups.filter((upstream) => upstream.enabled && !upstream.quarantined);
       const degraded = eligible.length > 0 && (
-        eligible.length < enabled.length ||
-        ups.some((upstream) => !upstream.enabled || upstream.cooldown_ms > 0 || isHardHealthFailure(upstream)) ||
+        eligible.length < active.length ||
+        ups.some((upstream) => !upstream.enabled || upstream.quarantined || upstream.cooldown_ms > 0 || isHardHealthFailure(upstream)) ||
         Boolean(latestFailure)
       );
       const state = eligible.length === 0 ? 'blocked' : degraded ? 'degraded' : 'usable';
@@ -9577,6 +9748,7 @@ function dashboardHtml() {
       u.signin_completed ? 'signed-in' : '',
       u.signin_completed_date || '',
       u.enabled,
+      u.quarantined ? 'quarantined' : 'active',
       u.weight,
       u.usage?.today_tokens || 0,
       u.usage?.total_tokens || 0,
@@ -9641,6 +9813,10 @@ function dashboardHtml() {
       const node = root.querySelector(selector);
       if (node) node.textContent = value;
     }
+    function workbenchCard(name) {
+      const selector = \`[data-upstream="\${CSS.escape(name)}"]\`;
+      return cards.querySelector(selector) || quarantineCards.querySelector(selector);
+    }
     function billingErrorHtml(upstream) {
       const error = upstream.billing?.error || '';
       return error ? \`<div class="mini-line billing-error" title="\${esc(error)}">Reason <strong data-field="billing_error">\${esc(error)}</strong></div>\` : '';
@@ -9659,7 +9835,7 @@ function dashboardHtml() {
       node.dataset.size = moneySize(value, currency);
     }
     function updateCard(upstream, activeModel) {
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(upstream.name)}"]\`);
+      const card = workbenchCard(upstream.name);
       if (!card) return;
       const state = upstream.health?.state || 'unknown';
       const pill = card.querySelector('[data-field="state"]');
@@ -9763,6 +9939,14 @@ function dashboardHtml() {
         toggleButton.className = \`ghost toggle-site \${upstream.enabled ? 'is-on' : 'is-off'}\`;
         toggleButton.setAttribute('aria-pressed', String(upstream.enabled));
       }
+      const quarantineButton = card.querySelector('[data-quarantine]');
+      if (quarantineButton) {
+        quarantineButton.disabled = false;
+        quarantineButton.dataset.quarantined = upstream.quarantined ? 'true' : 'false';
+        setButtonLabel(quarantineButton, upstream.quarantined ? 'play' : 'shield', upstream.quarantined ? '恢复' : '隔离');
+        quarantineButton.className = \`ghost quarantine-site \${upstream.quarantined ? 'is-restore' : ''}\`;
+        quarantineButton.setAttribute('aria-pressed', String(upstream.quarantined));
+      }
       const signinButton = card.querySelector('[data-signin-complete]');
       if (signinButton) {
         const available = canSignin(upstream);
@@ -9789,7 +9973,7 @@ function dashboardHtml() {
     }
     function workbenchCardHtml(u, activeModel, data, index) {
       return \`
-        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'}" data-upstream="\${esc(u.name)}" data-verification-tier="\${verificationTier(u)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
+        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'} \${u.quarantined ? 'quarantined' : ''}" data-upstream="\${esc(u.name)}" data-verification-tier="\${verificationTier(u)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
           <div class="workbench-cell">
             <div class="name">\${esc(u.name)}</div>
             <div class="url">\${esc(u.base_url)}</div>
@@ -9824,15 +10008,20 @@ function dashboardHtml() {
             \${billingErrorHtml(u)}
             \${quotaLineHtml(u)}
           </div>
-          <div class="workbench-actions">
-            <button class="ghost toggle-site \${u.enabled ? 'is-on' : 'is-off'}" type="button" data-toggle="\${esc(u.name)}" data-enabled="\${u.enabled ? 'true' : 'false'}" aria-pressed="\${u.enabled ? 'true' : 'false'}">\${icon(u.enabled ? 'pause' : 'play')}\${u.enabled ? '停用' : '启用'}</button>
-            <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
-            <button class="ghost claude-site" type="button" data-claude-check="\${esc(u.name)}" \${claudeCheckingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : claudeCheckingUpstreams.has(u.name) ? '检测中' : 'Claude'}</button>
-            <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('wallet')}\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
-            \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">\${icon('external')}签到</a>\` : ''}
-            <button class="ghost signin-action \${canSignin(u) ? '' : 'is-off'}" type="button" data-signin-available="\${esc(u.name)}" data-available="\${canSignin(u) ? 'true' : 'false'}" aria-pressed="\${canSignin(u) ? 'true' : 'false'}">\${icon(canSignin(u) ? 'x' : 'check')}\${canSignin(u) ? '设不可签' : '设可签'}</button>
-            <button class="ghost signin-action \${!canSignin(u) ? 'is-off' : signinCompleted(u) ? 'is-complete' : ''}" type="button" data-signin-complete="\${esc(u.name)}" \${!canSignin(u) ? 'disabled' : ''}>\${icon(!canSignin(u) || signinCompleted(u) ? 'x' : 'signin')}\${!canSignin(u) ? '不可签' : signinCompleted(u) ? '撤销' : '完成'}</button>
-            <button class="ghost delete-site" type="button" data-delete="\${esc(u.name)}" \${deletingUpstreams.has(u.name) ? 'disabled' : ''} aria-label="删除站点 \${esc(u.name)}">\${icon('trash')}\${deletingUpstreams.has(u.name) ? '删除中' : '删除'}</button>
+          <div class="workbench-action-stack">
+            <div class="workbench-confirmed-actions" data-action-group="confirmed">
+              <button class="ghost toggle-site \${u.enabled ? 'is-on' : 'is-off'}" type="button" data-toggle="\${esc(u.name)}" data-enabled="\${u.enabled ? 'true' : 'false'}" aria-pressed="\${u.enabled ? 'true' : 'false'}">\${icon(u.enabled ? 'pause' : 'play')}\${u.enabled ? '停用' : '启用'}</button>
+              <button class="ghost quarantine-site \${u.quarantined ? 'is-restore' : ''}" type="button" data-quarantine="\${esc(u.name)}" data-quarantined="\${u.quarantined ? 'true' : 'false'}" aria-pressed="\${u.quarantined ? 'true' : 'false'}">\${icon(u.quarantined ? 'play' : 'shield')}\${u.quarantined ? '恢复' : '隔离'}</button>
+              <button class="ghost delete-site" type="button" data-delete="\${esc(u.name)}" \${deletingUpstreams.has(u.name) ? 'disabled' : ''} aria-label="删除站点 \${esc(u.name)}">\${icon('trash')}\${deletingUpstreams.has(u.name) ? '删除中' : '删除'}</button>
+            </div>
+            <div class="workbench-actions" data-action-group="safe">
+              <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
+              <button class="ghost claude-site" type="button" data-claude-check="\${esc(u.name)}" \${claudeCheckingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : claudeCheckingUpstreams.has(u.name) ? '检测中' : 'Claude'}</button>
+              <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('wallet')}\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
+              \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">\${icon('external')}签到</a>\` : ''}
+              <button class="ghost signin-action \${canSignin(u) ? '' : 'is-off'}" type="button" data-signin-available="\${esc(u.name)}" data-available="\${canSignin(u) ? 'true' : 'false'}" aria-pressed="\${canSignin(u) ? 'true' : 'false'}">\${icon(canSignin(u) ? 'x' : 'check')}\${canSignin(u) ? '设不可签' : '设可签'}</button>
+              <button class="ghost signin-action \${!canSignin(u) ? 'is-off' : signinCompleted(u) ? 'is-complete' : ''}" type="button" data-signin-complete="\${esc(u.name)}" \${!canSignin(u) ? 'disabled' : ''}>\${icon(!canSignin(u) || signinCompleted(u) ? 'x' : 'signin')}\${!canSignin(u) ? '不可签' : signinCompleted(u) ? '撤销' : '完成'}</button>
+            </div>
             \${claudeCardResultHtml(u.name)}
           </div>
           <div class="workbench-models-row">
@@ -9963,6 +10152,30 @@ function dashboardHtml() {
         : \`兼容模式更新失败：\${result.error || response.status}\`);
       await load();
     }
+    function updateQuarantineDrawerButton(count = 0) {
+      quarantineCards.hidden = !quarantineDrawerOpen;
+      quarantineToggle.setAttribute('aria-expanded', String(quarantineDrawerOpen));
+      quarantineToggle.title = quarantineDrawerOpen
+        ? '收起隔离区'
+        : \`打开隔离区，查看 \${count} 个 Quarantined Upstream\`;
+      setButtonLabel(quarantineToggle, quarantineDrawerOpen ? 'x' : 'shield', quarantineDrawerOpen ? '收起隔离区' : '打开隔离区');
+    }
+    function renderQuarantineDrawer(quarantinedUps, activeModel, data) {
+      updateQuarantineDrawerButton(quarantinedUps.length);
+      if (!quarantineDrawerOpen) {
+        if (quarantineCards.innerHTML) quarantineCards.innerHTML = '';
+        quarantineCardsSignature = null;
+        return;
+      }
+      const nextQuarantineCardsSignature = cardSignature(quarantinedUps, activeModel);
+      if (nextQuarantineCardsSignature !== quarantineCardsSignature) {
+        quarantineCards.classList.toggle('stable', Boolean(quarantineCardsSignature));
+        quarantineCards.innerHTML = quarantinedUps.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + workbenchRowsHtml(quarantinedUps, activeModel, data) : '<div class="empty panel">暂无 Quarantined Upstream。</div>';
+        quarantineCardsSignature = nextQuarantineCardsSignature;
+      } else {
+        quarantinedUps.forEach((upstream) => updateCard(upstream, activeModel));
+      }
+    }
     async function load() {
       const response = await fetch('/pool/status', { headers: authHeaders() });
       if (response.status === 401) {
@@ -9976,18 +10189,21 @@ function dashboardHtml() {
       const knownModels = data.model?.known || [];
       const activeModel = data.model?.override || '';
       const allUps = sortedUpstreams(data.upstreams || [], activeModel);
-      const ups = allUps.filter((upstream) => verificationFilterMatches(upstream) && signinFilterMatches(upstream));
+      const activeUps = allUps.filter((upstream) => !upstream.quarantined);
+      const quarantinedUps = allUps.filter((upstream) => upstream.quarantined);
+      const ups = activeUps.filter((upstream) => verificationFilterMatches(upstream) && signinFilterMatches(upstream));
       upstreamCache = new Map(allUps.map((upstream) => [upstream.name, upstream]));
       if (editingName && !upstreamCache.has(editingName)) resetEdit(false);
       const selectModels = activeModel && !knownModels.includes(activeModel) ? [activeModel, ...knownModels] : knownModels;
       updateTopDiagnostic(data, allUps, activeModel);
-      document.querySelector('#total').textContent = allUps.length;
-      document.querySelector('#available').textContent = allUps.filter(u => u.available).length;
-      document.querySelector('#healthy').textContent = allUps.filter(u => u.health?.state === 'ok').length;
-      document.querySelector('#cooling').textContent = allUps.filter(u => u.cooldown_ms > 0).length;
+      document.querySelector('#total').textContent = activeUps.length;
+      document.querySelector('#available').textContent = activeUps.filter(u => u.available).length;
+      document.querySelector('#healthy').textContent = activeUps.filter(u => u.health?.state === 'ok').length;
+      document.querySelector('#cooling').textContent = activeUps.filter(u => u.cooldown_ms > 0).length;
+      quarantineCount.textContent = quarantinedUps.length;
       updateTokenBreakdown(data.usage || {});
       renderDailyUsage(data, allUps);
-      updateWorkbenchFilterControls(allUps, ups);
+      updateWorkbenchFilterControls(activeUps, ups);
       const nextModelOptionsSignature = selectModels.join('|');
       if (nextModelOptionsSignature !== modelOptionsSignature) {
         modelSelect.innerHTML = '<option value="">跟随 Codex 请求</option>' + selectModels.map((model) => \`<option value="\${esc(model)}">\${esc(model)}</option>\`).join('');
@@ -10011,17 +10227,18 @@ function dashboardHtml() {
       const nextCardsSignature = cardSignature(ups, activeModel);
       if (nextCardsSignature !== cardsSignature) {
         cards.classList.toggle('stable', Boolean(cardsSignature));
-        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + workbenchRowsHtml(ups, activeModel, data) : \`<div class="empty panel">\${allUps.length ? '暂无符合筛选的 Upstream。' : '暂无 Upstream。'}</div>\`;
+        cards.innerHTML = ups.length ? '<div class="workbench-head" aria-hidden="true"><span>Upstream</span><span>Health</span><span>Selection</span><span>Usage</span><span>Billing / Quota</span><span>Actions</span></div>' + workbenchRowsHtml(ups, activeModel, data) : \`<div class="empty panel">\${activeUps.length ? '暂无符合筛选的 Upstream。' : '暂无 Active Upstream。'}</div>\`;
         cardsSignature = nextCardsSignature;
       } else {
         ups.forEach((upstream) => updateCard(upstream, activeModel));
       }
+      renderQuarantineDrawer(quarantinedUps, activeModel, data);
       lastRefresh.textContent = \`最后刷新：\${new Date().toLocaleTimeString()}\`;
       markEditingCard();
     }
     async function probeAll() {
       rememberAllInlineProbeRunning();
-      renderProbeResult({ probe_status: 'running', summary: { total_count: upstreamCache.size, enabled_count: [...upstreamCache.values()].filter((upstream) => upstream.enabled).length } }, { mode: 'all', title: '全部测试结果', responseOk: true, error: '测试中' });
+      renderProbeResult({ probe_status: 'running', summary: { total_count: upstreamCache.size, enabled_count: [...upstreamCache.values()].filter((upstream) => upstream.enabled && !upstream.quarantined).length, quarantined_count: [...upstreamCache.values()].filter((upstream) => upstream.enabled && upstream.quarantined).length } }, { mode: 'all', title: '全部测试结果', responseOk: true, error: '测试中' });
       try {
         const response = await fetch('/pool/probe', { method: 'POST', headers: authHeaders() });
         const result = await response.json();
@@ -10050,7 +10267,7 @@ function dashboardHtml() {
     async function probeOne(name) {
       probingUpstreams.add(name);
       rememberInlineProbeRunning(name);
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-probe]');
       if (button) {
         button.disabled = true;
@@ -10103,7 +10320,7 @@ function dashboardHtml() {
     }
     async function checkClaudeOne(name) {
       claudeCheckingUpstreams.add(name);
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-claude-check]');
       if (button) {
         button.disabled = true;
@@ -10131,7 +10348,7 @@ function dashboardHtml() {
     }
     async function probeBillingOne(name) {
       billingUpstreams.add(name);
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-billing]');
       if (button) {
         button.disabled = true;
@@ -10153,7 +10370,7 @@ function dashboardHtml() {
       }
     }
     async function setUpstreamEnabled(name, enabled) {
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-toggle]');
       if (button) {
         button.disabled = true;
@@ -10176,6 +10393,35 @@ function dashboardHtml() {
         await load();
       }
     }
+    async function setUpstreamQuarantine(name, quarantined) {
+      if (!name) return;
+      const confirmed = window.confirm(quarantined
+        ? \`确认隔离 "\${name}"？它将停止参与 Selection，但仍可在隔离区测试。\`
+        : \`确认恢复 "\${name}"？它将回到 Active Upstreams，并可再次参与 Selection。\`);
+      if (!confirmed) return;
+      const card = workbenchCard(name);
+      const button = card?.querySelector('[data-quarantine]');
+      if (button) {
+        button.disabled = true;
+        setButtonLabel(button, quarantined ? 'shield' : 'play', quarantined ? '隔离中' : '恢复中');
+      }
+      try {
+        const response = await fetch(\`/pool/upstreams/\${encodeURIComponent(name)}/quarantine\`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...authHeaders() },
+          body: JSON.stringify({ quarantined })
+        });
+        const result = await response.json();
+        const probeNote = quarantined ? '' : probeStatusNote(result);
+        setToast(response.ok
+          ? \`\${name} 已\${quarantined ? '隔离' : '恢复'}，状态：\${result.health?.state || 'unknown'}\${probeNote}\`
+          : \`\${name} 隔离状态切换失败：\${result.error || response.status}\`);
+      } catch (error) {
+        setToast(\`\${name} 隔离状态切换失败：\${error.message}\`);
+      } finally {
+        await load();
+      }
+    }
     async function setSigninState(name, payload) {
       const response = await fetch(\`/pool/upstreams/\${encodeURIComponent(name)}/signin\`, {
         method: 'POST',
@@ -10189,7 +10435,7 @@ function dashboardHtml() {
     async function setSigninCompleted(name) {
       const upstream = upstreamCache.get(name);
       const completed = signinCompleted(upstream);
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-signin-complete]');
       if (button) {
         button.disabled = true;
@@ -10207,7 +10453,7 @@ function dashboardHtml() {
       }
     }
     async function setSigninAvailable(name, available) {
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-signin-available]');
       if (button) {
         button.disabled = true;
@@ -10227,7 +10473,7 @@ function dashboardHtml() {
       const confirmed = window.confirm(\`确认删除站点 "\${name}"？此操作会从配置中移除它。\`);
       if (!confirmed) return;
       deletingUpstreams.add(name);
-      const card = cards.querySelector(\`[data-upstream="\${CSS.escape(name)}"]\`);
+      const card = workbenchCard(name);
       const button = card?.querySelector('[data-delete]');
       if (button) {
         button.disabled = true;
@@ -10358,11 +10604,26 @@ function dashboardHtml() {
     compatAnthropic.addEventListener('change', setCompatibilityFromControls);
     compatChat.addEventListener('change', setCompatibilityFromControls);
     document.querySelector('#clearModel').addEventListener('click', () => setModel(''));
-    cards.addEventListener('click', (event) => {
+    quarantineToggle.addEventListener('click', () => {
+      quarantineDrawerOpen = !quarantineDrawerOpen;
+      localStorage.setItem('codexPoolQuarantineOpen', quarantineDrawerOpen ? 'true' : 'false');
+      const data = latestStatus || { upstreams: [], model: {} };
+      const activeModel = data.model?.override || '';
+      const allUps = sortedUpstreams(data.upstreams || [], activeModel);
+      renderQuarantineDrawer(allUps.filter((upstream) => upstream.quarantined), activeModel, data);
+      markEditingCard();
+    });
+    function handleWorkbenchClick(event) {
       const toggleButton = event.target.closest('[data-toggle]');
       if (toggleButton) {
         const currentlyEnabled = toggleButton.dataset.enabled === 'true';
         setUpstreamEnabled(toggleButton.dataset.toggle || '', !currentlyEnabled);
+        return;
+      }
+      const quarantineButton = event.target.closest('[data-quarantine]');
+      if (quarantineButton) {
+        const currentlyQuarantined = quarantineButton.dataset.quarantined === 'true';
+        setUpstreamQuarantine(quarantineButton.dataset.quarantine || '', !currentlyQuarantined);
         return;
       }
       const probeButton = event.target.closest('[data-probe]');
@@ -10406,8 +10667,10 @@ function dashboardHtml() {
       if (!card) return;
       const upstream = upstreamCache.get(card.dataset.upstream);
       if (upstream) startEdit(upstream);
-    });
-    cards.addEventListener('keydown', (event) => {
+    }
+    cards.addEventListener('click', handleWorkbenchClick);
+    quarantineCards.addEventListener('click', handleWorkbenchClick);
+    function handleWorkbenchKeydown(event) {
       if (event.key !== 'Enter' && event.key !== ' ') return;
       if (event.target.closest('button, a, input, select, label, .probe-inline')) return;
       const card = event.target.closest('[data-upstream]');
@@ -10416,8 +10679,10 @@ function dashboardHtml() {
       if (!upstream) return;
       event.preventDefault();
       startEdit(upstream);
-    });
-      cancelEdit.addEventListener('click', () => resetEdit());
+    }
+    cards.addEventListener('keydown', handleWorkbenchKeydown);
+    quarantineCards.addEventListener('keydown', handleWorkbenchKeydown);
+    cancelEdit.addEventListener('click', () => resetEdit());
     upstreamForm.elements.key_mode.addEventListener('change', updateKeyModeFormState);
     upstreamForm.elements.signin_available.addEventListener('change', updateSigninFormState);
     upstreamForm.addEventListener('input', (event) => {
@@ -10454,7 +10719,7 @@ function dashboardHtml() {
 }
 
 function knownModels(state) {
-  return [...new Set(state.upstreams.filter((upstream) => upstream.enabled).flatMap((upstream) => upstream.health?.models || []))]
+  return [...new Set(state.upstreams.filter((upstream) => upstream.enabled && !upstream.quarantined).flatMap((upstream) => upstream.health?.models || []))]
     .sort((a, b) => a.localeCompare(b));
 }
 
@@ -10499,7 +10764,7 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     codex_oauth: upstream.codexOAuth,
     request_mode: upstream.requestMode,
     resolved_request_mode: upstream.resolvedRequestMode || undefined,
-    request_interface: requestInterfaceForUpstream(upstream),
+    request_interface: requestInterfaceForUpstream(upstream, state.modelOverride),
     route_strategies: normalizeRouteStrategies(upstream.routeStrategies),
     oauth_expires_at: upstream.oauthExpiresAt || undefined,
     oauth_client_id: upstream.oauthClientId || undefined,
@@ -10513,6 +10778,7 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     api: upstream.api,
     capabilities: normalizeProtocolCapabilities(upstream.capabilities),
     enabled: upstream.enabled,
+    quarantined: upstream.quarantined === true,
     weight: upstream.weight,
     selection_weight: roundedSelectionValue(selectionWeight),
     selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, at)) : 0,
@@ -10609,6 +10875,7 @@ function createCodexOAuthAccountsPayload(config, state, secrets = {}) {
       return {
         name: account.name,
         enabled: account.enabled !== false,
+        quarantined: account.enabled !== false && account.quarantined === true,
         weight: Number(account.weight || 1),
         proxy_url: account.proxy_url || undefined,
         credential_ref: credentialRef,
@@ -10828,6 +11095,7 @@ function normalizeImportItem(item, index, options = {}) {
   const signinAvailable = signinAvailableValue(item);
   const signinCompleted = signinCompletedValue(item);
   const signinCompletedDate = signinCompletedDateValue(item);
+  const hasQuarantined = Object.prototype.hasOwnProperty.call(item, 'quarantined');
   return {
     name,
     base_url: baseUrl,
@@ -10846,6 +11114,7 @@ function normalizeImportItem(item, index, options = {}) {
     weight: Number(firstString(item.weight, item.priority) || 1),
     keys: keyEntriesFromImportItem(item, name, options.secretMode),
     enabled: item.enabled === undefined ? true : item.enabled !== false,
+    ...(hasQuarantined ? { quarantined: item.quarantined === true } : {}),
     replace: options.replace,
     ...Object.fromEntries(Object.entries(oauthExtra).filter(([, value]) => value !== ''))
   };
@@ -11073,6 +11342,8 @@ function validateUpstreamPayload(payload, config) {
       : existing?.protocol_capabilities;
   const billingInput = hasOwn('billing') ? payload.billing : existing?.billing;
   const declaredProtocolCapabilities = normalizeDeclaredProtocolCapabilities(protocolCapabilitiesInput);
+  const enabled = hasOwn('enabled') ? payload.enabled !== false : existing?.enabled !== false;
+  const quarantined = enabled && (hasOwn('quarantined') ? payload.quarantined === true : existing?.quarantined === true);
 
   return {
     name,
@@ -11110,7 +11381,8 @@ function validateUpstreamPayload(payload, config) {
       : undefined,
     weight: Number(hasOwn('weight') ? payload.weight || 1 : existing?.weight || 1),
     keys,
-    enabled: hasOwn('enabled') ? payload.enabled !== false : existing?.enabled !== false
+    enabled,
+    quarantined: quarantined || undefined
   };
 }
 
@@ -11383,7 +11655,8 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (accountIndex < 0) return jsonResponse(res, 404, { error: `codex oauth account not found: ${name}` });
     oauthConfig.accounts[accountIndex] = {
       ...oauthConfig.accounts[accountIndex],
-      enabled: payload.enabled
+      enabled: payload.enabled,
+      quarantined: undefined
     };
     runtime.rebuildRuntimeUpstreams ? runtime.rebuildRuntimeUpstreams() : rebuildUpstreams(state, config);
     await saveConfig(config, options.configPath);
@@ -11403,6 +11676,38 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, state.modelOverride), account: name, health });
   }
 
+  const quarantineMatch = pathname.match(/^\/pool\/upstreams\/([^/]+)\/quarantine$/);
+  if (req.method === 'POST' && quarantineMatch) {
+    const name = decodeURIComponent(quarantineMatch[1]);
+    const payload = await readJsonBody(req, maxBodyBytes);
+    if (typeof payload.quarantined !== 'boolean') {
+      return jsonResponse(res, 400, { error: 'quarantined must be a boolean' });
+    }
+    const existingIndex = (config.upstreams || []).findIndex((item) => item.name === name);
+    if (existingIndex >= 0) {
+      config.upstreams[existingIndex] = {
+        ...config.upstreams[existingIndex],
+        enabled: true,
+        quarantined: payload.quarantined || undefined
+      };
+    } else {
+      const oauthConfig = ensureCodexOAuthConfig(config);
+      const accountIndex = oauthConfig.accounts.findIndex((item) => item.name === name);
+      if (accountIndex < 0) return jsonResponse(res, 404, { error: `upstream not found: ${name}` });
+      oauthConfig.accounts[accountIndex] = {
+        ...oauthConfig.accounts[accountIndex],
+        enabled: true,
+        quarantined: payload.quarantined || undefined
+      };
+    }
+    runtime.rebuildRuntimeUpstreams ? runtime.rebuildRuntimeUpstreams() : rebuildUpstreams(state, config);
+    await saveConfig(config, options.configPath);
+    const upstream = state.upstreams.find((item) => item.name === name);
+    const health = upstream && !payload.quarantined ? await probeOneUpstream(state, upstream, config, { live: true }) : upstream?.health || null;
+    persistStats(state, statsPath);
+    return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, state.modelOverride), upstream: name, quarantined: payload.quarantined, enabled: upstream?.enabled !== false, health });
+  }
+
   const enabledMatch = pathname.match(/^\/pool\/upstreams\/([^/]+)\/enabled$/);
   if (req.method === 'POST' && enabledMatch) {
     const name = decodeURIComponent(enabledMatch[1]);
@@ -11414,7 +11719,8 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (existingIndex >= 0) {
       config.upstreams[existingIndex] = {
         ...config.upstreams[existingIndex],
-        enabled: payload.enabled
+        enabled: payload.enabled,
+        quarantined: undefined
       };
     } else {
       const oauthConfig = ensureCodexOAuthConfig(config);
@@ -11422,7 +11728,8 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
       if (accountIndex < 0) return jsonResponse(res, 404, { error: `upstream not found: ${name}` });
       oauthConfig.accounts[accountIndex] = {
         ...oauthConfig.accounts[accountIndex],
-        enabled: payload.enabled
+        enabled: payload.enabled,
+        quarantined: undefined
       };
     }
     runtime.rebuildRuntimeUpstreams ? runtime.rebuildRuntimeUpstreams() : rebuildUpstreams(state, config);

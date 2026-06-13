@@ -100,11 +100,19 @@ export function normalizeCodexOAuthAccount(item, index, options = {}) {
   const name = cleanName(firstString(item.name, item.id, item.title, item.label, email), fallbackName);
   const credentialRef = firstString(item.credential_ref, item.credentialRef, credentials.credential_ref, credentials.credentialRef, `codex_oauth.${name}`);
   const proxyUrl = firstString(item.proxy_url, item.proxyUrl, credentials.proxy_url, credentials.proxyUrl, options.existingAccount?.proxy_url, options.existingLegacyUpstream?.proxy_url);
+  const enabled = item.enabled === undefined ? options.existingAccount?.enabled !== false : item.enabled !== false;
+  const hasQuarantined = Object.prototype.hasOwnProperty.call(item, 'quarantined');
+  const quarantined = enabled && (
+    hasQuarantined
+      ? item.quarantined === true
+      : options.existingAccount?.quarantined === true || options.existingLegacyUpstream?.quarantined === true
+  );
 
   return {
     account: {
       name,
-      enabled: item.enabled === undefined ? options.existingAccount?.enabled !== false : item.enabled !== false,
+      enabled,
+      quarantined: quarantined || undefined,
       weight: Number(firstString(item.weight, item.priority, options.existingAccount?.weight) || 1),
       proxy_url: proxyUrl || undefined,
       credential_ref: credentialRef,

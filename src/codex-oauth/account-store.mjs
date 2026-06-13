@@ -64,6 +64,7 @@ export function projectCodexOAuthAccount(account, secrets = {}) {
     weight: Number(account.weight || 1),
     keys: [{ label: credentialRef, value: secret.access_token || '' }],
     enabled: account.enabled !== false,
+    quarantined: account.enabled !== false && account.quarantined === true,
     _codex_oauth_account: true
   };
 }

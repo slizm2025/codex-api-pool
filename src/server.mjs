@@ -7239,12 +7239,21 @@ function codexForwardOnlyProbeError(responsesClassification, chatClassification)
   return `native Responses capability is user-declared or configured, but the standard Health Probe is not representative of real Codex traffic: ${responsesError}; ${chatError}`;
 }
 
-function protocolCapabilityStatusFromProbeState(state) {
+function protocolCapabilityStatusFromProbeState(state, statusCode = 0) {
   if (state === 'ok') return 'verified';
   if (state === 'advanced_curl_required' || state === 'codex_forward_only') return 'unknown';
+
+  // Transient failures → unknown (short recheck interval)
   if (state === 'network_error' || state === 'timeout') return 'unknown';
+  if (state === 'rate_limited') return 'unknown';
+  if (state === 'server_error') return 'unknown';
   if (state === 'inconclusive') return 'unknown';
-  return 'failed';
+
+  // Hard endpoint-unsupported (404/405/501) → unsupported (long recheck interval)
+  if (NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode)) return 'unsupported';
+
+  // Other failures (auth_error, etc.) → unknown
+  return 'unknown';
 }
 
 function protocolCapabilityReason(classified, result, protocol) {
@@ -7308,7 +7317,7 @@ function recordProtocolCapabilityProbe(upstream, protocol, result, classified, {
 
   // ── 记录新的协议能力状态 ──
   upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
-  const newStatus = protocolCapabilityStatusFromProbeState(state);
+  const newStatus = protocolCapabilityStatusFromProbeState(state, statusCode);
 
   upstream.capabilities[protocol] = {
     status: newStatus,
@@ -13293,27 +13302,8 @@ export function createPoolServer(config, options = {}) {
                 streamingBoundaryReached = true;
                 recordSuccess(upstream, attemptStart, statusCode);
 
-                // Record request for Dashboard
-                const routingStrategy = useAdapter
-                  ? 'messages_to_chat_completions'
-                  : 'native_messages';
-
-                rememberRequest(state, {
-                  method: 'POST',
-                  path: '/v1/messages',
-                  entry_protocol: 'messages',
-                  ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                  routing_strategy: routingStrategy,
-                  upstream: upstream.name,
-                  key: key.label,
-                  model: requestedModel,
-                  actualModel: requestedModel,
-                  status: statusCode,
-                  streaming: isStreaming,
-                  retried: attempt > 1,
-                  succeeded: true,
-                  route: routeTrace
-                });
+                // Create usage capture for native forwarding
+                const usageCapture = createUsageCapture(response.headers);
 
                 // Handle response conversion if using adapter
                 if (useAdapter) {
@@ -13328,8 +13318,39 @@ export function createPoolServer(config, options = {}) {
                     });
 
                     const adapter = createChatToMessagesStreamAdapter(res, requestedModel);
-                    response.on('data', (chunk) => adapter.write(chunk));
-                    response.on('end', () => adapter.end());
+                    response.on('data', (chunk) => {
+                      usageCapture.push(chunk);
+                      adapter.write(chunk);
+                    });
+                    response.on('end', () => {
+                      adapter.end();
+                      const capturedUsage = usageCapture.result();
+                      const recordedTokens = recordTokenUsage(upstream, capturedUsage.tokens, attemptStart);
+
+                      const routingStrategy = 'messages_to_chat_completions';
+                      rememberRequest(state, {
+                        method: 'POST',
+                        path: '/v1/messages',
+                        entry_protocol: 'messages',
+                        ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+                        routing_strategy: routingStrategy,
+                        upstream: upstream.name,
+                        key: key.label,
+                        model: requestedModel,
+                        actualModel: requestedModel,
+                        status: statusCode,
+                        streaming: isStreaming,
+                        retried: attempt > 1,
+                        succeeded: true,
+                        route: routeTrace,
+                        tokens: recordedTokens.totalTokens,
+                        inputTokens: recordedTokens.inputTokens,
+                        outputTokens: recordedTokens.outputTokens,
+                        durationMs: now() - attemptStart,
+                        outcome: 'ok'
+                      });
+                      persistStats(state, statsPath);
+                    });
                     response.on('error', (err) => {
                       console.error('Streaming adapter error:', err);
                       if (!res.writableEnded) res.end();
@@ -13338,6 +13359,7 @@ export function createPoolServer(config, options = {}) {
                     // JSON adapter: Chat JSON → Messages JSON
                     let responseBody = Buffer.alloc(0);
                     response.on('data', (chunk) => {
+                      usageCapture.push(chunk);
                       responseBody = Buffer.concat([responseBody, chunk]);
                     });
                     response.on('end', () => {
@@ -13348,6 +13370,33 @@ export function createPoolServer(config, options = {}) {
                           'content-length': convertedBody.length
                         });
                         res.end(convertedBody);
+
+                        const capturedUsage = usageCapture.result();
+                        const recordedTokens = recordTokenUsage(upstream, capturedUsage.tokens, attemptStart);
+
+                        const routingStrategy = 'messages_to_chat_completions';
+                        rememberRequest(state, {
+                          method: 'POST',
+                          path: '/v1/messages',
+                          entry_protocol: 'messages',
+                          ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+                          routing_strategy: routingStrategy,
+                          upstream: upstream.name,
+                          key: key.label,
+                          model: requestedModel,
+                          actualModel: requestedModel,
+                          status: statusCode,
+                          streaming: isStreaming,
+                          retried: attempt > 1,
+                          succeeded: true,
+                          route: routeTrace,
+                          tokens: recordedTokens.totalTokens,
+                          inputTokens: recordedTokens.inputTokens,
+                          outputTokens: recordedTokens.outputTokens,
+                          durationMs: now() - attemptStart,
+                          outcome: 'ok'
+                        });
+                        persistStats(state, statsPath);
                       } catch (error) {
                         console.error('Response conversion error:', error);
                         anthropicErrorResponse(res, 500, 'api_error', 'Response conversion failed');
@@ -13355,9 +13404,44 @@ export function createPoolServer(config, options = {}) {
                     });
                   }
                 } else {
-                  // Native forwarding: pass through as-is
+                  // Native forwarding: capture usage while forwarding
                   res.writeHead(statusCode, response.headers);
-                  response.pipe(res);
+
+                  response.on('data', (chunk) => {
+                    usageCapture.push(chunk);
+                    res.write(chunk);
+                  });
+
+                  response.on('end', () => {
+                    res.end();
+
+                    const capturedUsage = usageCapture.result();
+                    const recordedTokens = recordTokenUsage(upstream, capturedUsage.tokens, attemptStart);
+
+                    const routingStrategy = 'native_messages';
+                    rememberRequest(state, {
+                      method: 'POST',
+                      path: '/v1/messages',
+                      entry_protocol: 'messages',
+                      ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+                      routing_strategy: routingStrategy,
+                      upstream: upstream.name,
+                      key: key.label,
+                      model: requestedModel,
+                      actualModel: requestedModel,
+                      status: statusCode,
+                      streaming: isStreaming,
+                      retried: attempt > 1,
+                      succeeded: true,
+                      route: routeTrace,
+                      tokens: recordedTokens.totalTokens,
+                      inputTokens: recordedTokens.inputTokens,
+                      outputTokens: recordedTokens.outputTokens,
+                      durationMs: now() - attemptStart,
+                      outcome: 'ok'
+                    });
+                    persistStats(state, statsPath);
+                  });
                 }
               } else {
                 // Error response

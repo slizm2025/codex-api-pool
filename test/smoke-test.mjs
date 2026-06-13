@@ -3607,7 +3607,7 @@ try {
       postProbeChatOnly?.capabilities?.chat_completions?.status !== 'verified' ||
       postProbeChatOnly?.capabilities?.chat_completions?.source !== 'probe' ||
       postProbeChatOnly?.capabilities?.chat_completions?.representative !== true ||
-      postProbeChatOnly?.capabilities?.responses?.status !== 'failed' ||
+      postProbeChatOnly?.capabilities?.responses?.status !== 'unsupported' ||
       postProbeChatOnly?.capabilities?.responses?.http_status !== 404
     ) {
       throw new Error(`expected /pool/status to expose protocol capability evidence after chat fallback probe: ${JSON.stringify(postProbeChatOnly?.capabilities)}`);
@@ -3624,7 +3624,7 @@ try {
     if (
       restoredChatOnly?.capabilities?.chat_completions?.status !== 'verified' ||
       restoredChatOnly?.capabilities?.chat_completions?.source !== 'probe' ||
-      restoredChatOnly?.capabilities?.responses?.status !== 'failed' ||
+      restoredChatOnly?.capabilities?.responses?.status !== 'unsupported' ||
       restoredChatOnly?.capabilities?.responses?.http_status !== 404
     ) {
       throw new Error(`expected protocol capability evidence to persist across restart: ${JSON.stringify(restoredChatOnly?.capabilities)}`);
@@ -6904,7 +6904,155 @@ try {
     await close(openaiOnlyUpstream);
   }
 
-  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, automatic probe recovery, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, immediate health probe, per-protocol representative model selection, graceful skip when no representative model, and single-family backward compatibility all passed');
+  // ── Issue #23: Protocol capability status vocabulary unification ──
+  // Test 1: Hard endpoint-unsupported (404) throttles recheck
+  let endpointUnsupportedProbeCount = 0;
+  const endpointUnsupportedUpstream = createFakeUpstream('endpoint-unsupported', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      endpointUnsupportedProbeCount += 1;
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'endpoint not found' }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'chat_ok', object: 'chat.completion', choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  const endpointUnsupportedInfo = await listen(endpointUnsupportedUpstream);
+
+  try {
+    const endpointUnsupportedPool = createTestPool({
+      server: { auth_token_env: 'TEST_POOL_TOKEN', admin_auth_token_env: 'TEST_POOL_TOKEN', port: 0 },
+      model_override: 'test-model',
+      health: { enabled: false, path: '/models', timeout_ms: 1000 },
+      upstreams: [
+        { name: 'endpoint-unsupported-site', api: 'openai', base_url: `${endpointUnsupportedInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+      ]
+    });
+    const endpointUnsupportedPoolInfo = await listen(endpointUnsupportedPool);
+
+    // First probe: /responses returns 404, should mark as unsupported and fall back to chat
+    const firstProbe = await postJson(`${endpointUnsupportedPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      firstProbe.response.status !== 200 ||
+      firstProbe.json.probe_ok !== true ||
+      endpointUnsupportedProbeCount !== 1
+    ) {
+      throw new Error(`expected first probe to hit responses endpoint: ${firstProbe.text} count=${endpointUnsupportedProbeCount}`);
+    }
+
+    const statusAfterFirst = (await getJson(`${endpointUnsupportedPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const siteAfterFirst = statusAfterFirst.upstreams.find((u) => u.name === 'endpoint-unsupported-site');
+    if (
+      siteAfterFirst?.capabilities?.responses?.status !== 'unsupported' ||
+      siteAfterFirst?.capabilities?.chat_completions?.status !== 'verified'
+    ) {
+      throw new Error(`expected responses unsupported and chat verified after 404: ${JSON.stringify(siteAfterFirst?.capabilities)}`);
+    }
+
+    // Second probe immediately after: should NOT re-probe responses (throttled), count stays at 1
+    const secondProbe = await postJson(`${endpointUnsupportedPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      secondProbe.response.status !== 200 ||
+      secondProbe.json.probe_ok !== true ||
+      endpointUnsupportedProbeCount !== 1
+    ) {
+      throw new Error(`expected second probe to skip throttled responses endpoint: ${secondProbe.text} count=${endpointUnsupportedProbeCount}`);
+    }
+
+    await close(endpointUnsupportedPool);
+  } finally {
+    await close(endpointUnsupportedUpstream);
+  }
+
+  // ── Issue #23 Test 2: Transient failure maps to unknown ──
+  let transientFailureProbeCount = 0;
+  const transientFailureUpstream = createFakeUpstream('transient-failure', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'test-model' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      transientFailureProbeCount += 1;
+      // First probe: 500 error (transient), second probe: success
+      if (transientFailureProbeCount === 1) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'internal server error' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'resp_ok', object: 'response', output_text: 'ok' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  const transientFailureInfo = await listen(transientFailureUpstream);
+
+  try {
+    const transientFailurePool = createTestPool({
+      server: { auth_token_env: 'TEST_POOL_TOKEN', admin_auth_token_env: 'TEST_POOL_TOKEN', port: 0 },
+      model_override: 'test-model',
+      health: { enabled: false, path: '/models', timeout_ms: 1000 },
+      upstreams: [
+        { name: 'transient-failure-site', api: 'openai', base_url: `${transientFailureInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+      ]
+    });
+    const transientFailurePoolInfo = await listen(transientFailurePool);
+
+    // First probe: /responses returns 500, should mark as unknown (not unsupported)
+    const firstProbe = await postJson(`${transientFailurePoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      firstProbe.response.status !== 200 ||
+      transientFailureProbeCount !== 1
+    ) {
+      throw new Error(`expected first probe to hit responses: ${firstProbe.text} count=${transientFailureProbeCount}`);
+    }
+
+    const statusAfterFirst = (await getJson(`${transientFailurePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const siteAfterFirst = statusAfterFirst.upstreams.find((u) => u.name === 'transient-failure-site');
+    if (
+      siteAfterFirst?.capabilities?.responses?.status !== 'unknown'
+    ) {
+      throw new Error(`expected transient 500 failure to map to unknown: ${JSON.stringify(siteAfterFirst?.capabilities)}`);
+    }
+
+    // Second probe immediately after: should retry unknown protocol and succeed
+    const secondProbe = await postJson(`${transientFailurePoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      secondProbe.response.status !== 200 ||
+      secondProbe.json.probe_ok !== true ||
+      transientFailureProbeCount !== 2
+    ) {
+      throw new Error(`expected second probe to retry unknown protocol: ${secondProbe.text} count=${transientFailureProbeCount}`);
+    }
+
+    const statusAfterSecond = (await getJson(`${transientFailurePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const siteAfterSecond = statusAfterSecond.upstreams.find((u) => u.name === 'transient-failure-site');
+    if (
+      siteAfterSecond?.capabilities?.responses?.status !== 'verified'
+    ) {
+      throw new Error(`expected second probe to verify after transient failure: ${JSON.stringify(siteAfterSecond?.capabilities)}`);
+    }
+
+    await close(transientFailurePool);
+  } finally {
+    await close(transientFailureUpstream);
+  }
+
+  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, automatic probe recovery, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, immediate health probe, per-protocol representative model selection, graceful skip when no representative model, single-family backward compatibility, hard-unsupported recheck throttling, and transient failure retry all passed');
 } finally {
   await close(codexOauthProxy);
   await close(codexOauthCompactOnlyBackend);

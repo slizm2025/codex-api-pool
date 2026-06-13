@@ -13,6 +13,7 @@
 - Representative Request Template 现在只保留红acted 元数据和 replay-risk header 名称，例如 `headers.x-oai-attestation`；手动 Health Probe 不再重放内存模板，避免一次性字段导致无意义测试。
 - Management API probe 失败时会在本次响应中返回 `health.upstream_result`，包含上游状态码、响应头、响应体、错误和 retry-after，便于后续判断。
 - 基于真实 rawchat 上游复测修正 auto request-mode 学习条件：只有解析到具体模型输出的真实请求才会写入 `resolvedRequestMode` 和 `real_traffic` 证据，避免 `HTTP 200 + code/msg/data:null` 这类商家业务错误把上游误学习为 chat-only 并短路后续真实请求验证；同时 success accounting 现在会解析 gzip/br/deflate JSON/SSE 响应体。
+- 新增 Native Responses Recheck：自动模式下如果某个 `Upstream + Requested Model` 暂时学到 Chat Completions Forwarding Strategy，API Pool 会在 `retry.native_responses_recheck_ms` 窗口后或更新的 Responses probe 成功后重新优先尝试 `/v1/responses`，避免临时不支持变成永久 Chat 兼容转发。
 
 ### Dashboard 稳定排序
 

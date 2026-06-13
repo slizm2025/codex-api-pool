@@ -25,6 +25,7 @@
     "base_cooldown_ms": 30000,
     "key_cooldown_ms": 60000,
     "chat_fallback_probe_timeout_ms": 15000,
+    "native_responses_recheck_ms": 1800000,
     "retryable_statuses": [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524]
   },
   "availability": {

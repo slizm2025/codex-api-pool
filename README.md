@@ -218,7 +218,8 @@ env_key = "CODEX_POOL_API_KEY"
     "failure_threshold": 2,
     "base_cooldown_ms": 30000,
     "key_cooldown_ms": 60000,
-    "chat_fallback_probe_timeout_ms": 15000
+    "chat_fallback_probe_timeout_ms": 15000,
+    "native_responses_recheck_ms": 1800000
   },
   "availability": {
     "window_size": 50,
@@ -241,6 +242,8 @@ env_key = "CODEX_POOL_API_KEY"
   "upstreams": []
 }
 ```
+
+`retry.native_responses_recheck_ms` controls the Native Responses Recheck window. When an automatic Upstream falls back to Chat Completions, the API Pool can reuse that learned Forwarding Strategy briefly, then try `/v1/responses` first again after the window expires or after newer Responses probe evidence appears.
 
 ### Token 分层
 
@@ -497,7 +500,18 @@ curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
   -H "Authorization: Bearer $CODEX_POOL_API_KEY"
 ```
 
+指定模型临时探测单个 Upstream：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/pool/upstreams/rawchat/probe \
+  -H "Authorization: Bearer $CODEX_POOL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"probe_model":"gpt-5.5"}'
+```
+
 Health Probe 使用当前 `model_override` 发送小型真实模型请求。OpenAI-compatible Upstream 会探测 Responses，必要时尝试 Chat Completions；Anthropic Upstream 会探测 Messages；Codex OAuth account 会做 Codex OAuth 路线诊断。
+
+单个 Upstream 的手动 Health Probe 可以用 `probe_model` 临时指定本次 Probe Model。临时 Probe Model 不会修改全局 `model_override`；只有当它等于当前 `model_override` 时，探测结果才会写回 Upstream 的主 Health State 并影响 Selection。Dashboard 的 Upstream 行内 Probe Model 输入框也是这个语义，Discovered Models chips 只会填充该行输入框，不会切换全局 Model Override。
 
 如果没有 `model_override`，Probe 会显示 `missing_model_override`，避免用随机默认模型误判 Upstream。切换 `model_override` 后，旧模型的探测结果会变成 `stale_model_override`，直到重新探测。
 

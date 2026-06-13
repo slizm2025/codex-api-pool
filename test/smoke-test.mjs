@@ -683,6 +683,34 @@ const responsesDataOnly = createFakeUpstream('responses-data-only', ({ req, res 
   res.end(JSON.stringify({ error: 'not found' }));
 });
 
+let probeModelRequestModels = [];
+const probeModelOverride = createFakeUpstream('probe-model-override', ({ req, res, body }) => {
+  if (req.url.endsWith('/models')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'stable-model' }, { id: 'probe-only-model' }] }));
+    return;
+  }
+  if (req.url.endsWith('/responses') || req.url.endsWith('/chat/completions')) {
+    const payload = JSON.parse(body || '{}');
+    probeModelRequestModels.push(payload.model);
+    if (payload.model === 'probe-bad-model') {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'model_not_found', message: 'model not found' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'resp_probe_model_override',
+      object: 'response',
+      output_text: 'ok',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }]
+    }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ error: 'not found' }));
+});
+
 const responsesObjectOnly = createFakeUpstream('responses-object-only', ({ req, res }) => {
   if (req.url.endsWith('/models')) {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -961,6 +989,7 @@ const cachedChatThenNative = createFakeUpstream('cached-chat-then-native', ({ re
 
 let nativeFeatureBlockedResponsesHits = 0;
 let nativeFeatureBlockedChatHits = 0;
+let nativeFeatureBlockedAllowsImageGeneration = false;
 const nativeFeatureBlocked = createFakeUpstream('native-feature-blocked', ({ req, res, body }) => {
   if (req.url.endsWith('/models')) {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -970,7 +999,7 @@ const nativeFeatureBlocked = createFakeUpstream('native-feature-blocked', ({ req
   if (req.url.endsWith('/responses')) {
     nativeFeatureBlockedResponsesHits += 1;
     const payload = JSON.parse(body || '{}');
-    if (Array.isArray(payload.tools) && payload.tools.some((tool) => tool?.type === 'image_generation')) {
+    if (!nativeFeatureBlockedAllowsImageGeneration && Array.isArray(payload.tools) && payload.tools.some((tool) => tool?.type === 'image_generation')) {
       res.writeHead(403, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'Image generation is not enabled for this group', type: 'permission_error' } }));
       return;
@@ -1487,6 +1516,7 @@ const usageInfo = await listen(usageUpstream);
 const zeroOutputUsageInfo = await listen(zeroOutputUsage);
 const responsesMissingCompletedInfo = await listen(responsesMissingCompleted);
 const responsesDataOnlyInfo = await listen(responsesDataOnly);
+const probeModelOverrideInfo = await listen(probeModelOverride);
 const responsesObjectOnlyInfo = await listen(responsesObjectOnly);
 const chatChoicesEmptyInfo = await listen(chatChoicesEmpty);
 const anthropicContentEmptyInfo = await listen(anthropicContentEmpty);
@@ -2334,6 +2364,88 @@ try {
     await close(responsesDataOnlyPool);
   }
 
+  probeModelRequestModels = [];
+  const probeModelOverridePool = createTestPool({
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      public_prefix: '/v1',
+      auth_token_env: 'TEST_POOL_TOKEN',
+      max_body_bytes: 1024 * 1024,
+      request_timeout_ms: 5000
+    },
+    model_override: 'stable-model',
+    retry: {
+      max_attempts: 1,
+      failure_threshold: 1,
+      base_cooldown_ms: 1000,
+      key_cooldown_ms: 1000
+    },
+    health: { enabled: false, path: '/models', timeout_ms: 1000 },
+    upstreams: [
+      { name: 'probe-model-override', base_url: `${probeModelOverrideInfo.url}/v1`, weight: 1, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+    ]
+  });
+  const probeModelOverridePoolInfo = await listen(probeModelOverridePool);
+  try {
+    const stableProbe = await postJson(`${probeModelOverridePoolInfo.url}/pool/upstreams/probe-model-override/probe`, 'pool-secret', {});
+    if (
+      stableProbe.response.status !== 200 ||
+      stableProbe.json.probe_ok !== true ||
+      stableProbe.json.probe_model !== 'stable-model' ||
+      stableProbe.json.diagnostic_only !== false ||
+      stableProbe.json.health?.probeModel !== 'stable-model' ||
+      probeModelRequestModels.at(-1) !== 'stable-model'
+    ) {
+      throw new Error(`expected default single-upstream probe to use and persist model_override: ${stableProbe.text} models=${probeModelRequestModels.join(',')}`);
+    }
+
+    const temporaryProbe = await postJson(`${probeModelOverridePoolInfo.url}/pool/upstreams/probe-model-override/probe`, 'pool-secret', { probe_model: 'probe-only-model' });
+    if (
+      temporaryProbe.response.status !== 200 ||
+      temporaryProbe.json.probe_ok !== true ||
+      temporaryProbe.json.probe_model !== 'probe-only-model' ||
+      temporaryProbe.json.diagnostic_only !== true ||
+      temporaryProbe.json.health?.probeModel !== 'probe-only-model' ||
+      probeModelRequestModels.at(-1) !== 'probe-only-model'
+    ) {
+      throw new Error(`expected explicit probe_model to run as diagnostic-only single-upstream probe: ${temporaryProbe.text} models=${probeModelRequestModels.join(',')}`);
+    }
+
+    const afterTemporaryProbeStatus = (await getJson(`${probeModelOverridePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const afterTemporaryProbeSite = afterTemporaryProbeStatus.upstreams.find((upstream) => upstream.name === 'probe-model-override');
+    if (
+      afterTemporaryProbeSite?.health?.state !== 'ok' ||
+      afterTemporaryProbeSite?.health?.probe_model !== 'stable-model' ||
+      afterTemporaryProbeSite?.capabilities?.responses?.model !== 'stable-model'
+    ) {
+      throw new Error(`expected diagnostic-only probe_model success not to replace persisted health/capability state: ${JSON.stringify(afterTemporaryProbeSite)}`);
+    }
+
+    const badTemporaryProbe = await postJson(`${probeModelOverridePoolInfo.url}/pool/upstreams/probe-model-override/probe`, 'pool-secret', { probe_model: 'probe-bad-model' });
+    if (
+      badTemporaryProbe.response.status !== 200 ||
+      badTemporaryProbe.json.probe_ok !== false ||
+      badTemporaryProbe.json.diagnostic_only !== true ||
+      badTemporaryProbe.json.health?.probeModel !== 'probe-bad-model' ||
+      !probeModelRequestModels.includes('probe-bad-model')
+    ) {
+      throw new Error(`expected failing explicit probe_model to return failure without failing the route: ${badTemporaryProbe.text} models=${probeModelRequestModels.join(',')}`);
+    }
+
+    const afterBadTemporaryProbeStatus = (await getJson(`${probeModelOverridePoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const afterBadTemporaryProbeSite = afterBadTemporaryProbeStatus.upstreams.find((upstream) => upstream.name === 'probe-model-override');
+    if (
+      afterBadTemporaryProbeSite?.health?.state !== 'ok' ||
+      afterBadTemporaryProbeSite?.health?.probe_model !== 'stable-model' ||
+      afterBadTemporaryProbeSite?.available !== true
+    ) {
+      throw new Error(`expected failing diagnostic-only probe_model not to affect Selection state: ${JSON.stringify(afterBadTemporaryProbeSite)}`);
+    }
+  } finally {
+    await close(probeModelOverridePool);
+  }
+
   const responsesObjectOnlyPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -3026,7 +3138,7 @@ try {
       !nativeToolsJson.unsupported_tool_types?.includes('image_generation') ||
       !nativeToolsJson.unsupported_output_format_types?.includes('grammar') ||
       nativeToolsJson.attempts?.length !== 0 ||
-      !String(nativeToolsJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      !String(nativeToolsJson.incompatible_upstreams?.[0]?.reason || '').includes('Native Responses Recheck window') ||
       cachedChatThenNativeResponsesHits !== 1 ||
       cachedChatThenNativeChatHits !== 1
     ) {
@@ -3082,6 +3194,7 @@ try {
 
   nativeFeatureBlockedResponsesHits = 0;
   nativeFeatureBlockedChatHits = 0;
+  nativeFeatureBlockedAllowsImageGeneration = false;
   const nativeFeatureBlockedPool = createTestPool({
     server: {
       host: '127.0.0.1',
@@ -3103,7 +3216,8 @@ try {
       failure_threshold: 4,
       base_cooldown_ms: 1000,
       key_cooldown_ms: 1000,
-      chat_fallback_probe_timeout_ms: 50
+      chat_fallback_probe_timeout_ms: 50,
+      native_responses_recheck_ms: 60 * 60 * 1000
     },
     health: { enabled: false, path: '/models', timeout_ms: 50 },
     upstreams: [
@@ -3175,6 +3289,35 @@ try {
       nativeFeatureBlockedChatHits !== 2
     ) {
       throw new Error(`expected learned lossy Chat strategy to skip native Responses on subsequent same-model request: ${secondBlockedFeatureResponse.status} ${secondBlockedFeatureText} responses=${nativeFeatureBlockedResponsesHits} chat=${nativeFeatureBlockedChatHits}`);
+    }
+
+    const runtimeNativeFeatureBlocked = nativeFeatureBlockedPool.state.upstreams.find((upstream) => upstream.name === 'native-feature-blocked');
+    runtimeNativeFeatureBlocked.routeStrategies['test-model'].checked_at = new Date(Date.now() - (2 * 60 * 60 * 1000)).toISOString();
+    nativeFeatureBlockedAllowsImageGeneration = true;
+    const recoveredNativeResponse = await fetch(`${nativeFeatureBlockedPoolInfo.url}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer pool-secret',
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(blockedFeatureBody))
+      },
+      body: blockedFeatureBody
+    });
+    const recoveredNativeText = await recoveredNativeResponse.text();
+    const recoveredNativeJson = JSON.parse(recoveredNativeText);
+    const recoveredNativeStatus = (await getJson(`${nativeFeatureBlockedPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const recoveredNativeSite = recoveredNativeStatus.upstreams.find((upstream) => upstream.name === 'native-feature-blocked');
+    if (
+      recoveredNativeResponse.status !== 200 ||
+      recoveredNativeJson.output_text !== 'native-ok' ||
+      recoveredNativeResponse.headers.get('x-codex-api-pool-route') !== 'responses->responses' ||
+      recoveredNativeResponse.headers.get('x-codex-api-pool-compatibility') ||
+      nativeFeatureBlockedResponsesHits !== 2 ||
+      nativeFeatureBlockedChatHits !== 2 ||
+      recoveredNativeSite?.route_strategies?.['test-model']?.strategy !== 'responses' ||
+      recoveredNativeSite?.request_interface?.using?.type !== 'responses'
+    ) {
+      throw new Error(`expected stale learned Chat strategy to recheck and recover native Responses: ${recoveredNativeResponse.status} ${recoveredNativeText} responses=${nativeFeatureBlockedResponsesHits} chat=${nativeFeatureBlockedChatHits} site=${JSON.stringify(recoveredNativeSite)}`);
     }
   } finally {
     await close(nativeFeatureBlockedPool);
@@ -3317,7 +3460,7 @@ try {
       expectedStrictFieldTypes.some((field) => !scrubChatJson.unsupported_field_types?.includes(field)) ||
       !String(scrubChatJson.error || '').includes('fields') ||
       scrubChatJson.attempts?.length !== 0 ||
-      !String(scrubChatJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      !String(scrubChatJson.incompatible_upstreams?.[0]?.reason || '').includes('Native Responses Recheck window') ||
       chatOnlyResponsesHits !== 1 ||
       chatOnlyChatHits !== 3
     ) {
@@ -3374,7 +3517,7 @@ try {
       unsupportedChatToolJson.unsupported_tool_types?.[0] !== 'web_search_preview' ||
       !String(unsupportedChatToolJson.error || '').includes('no compatible upstream candidate') ||
       unsupportedChatToolJson.attempts?.length !== 0 ||
-      !String(unsupportedChatToolJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      !String(unsupportedChatToolJson.incompatible_upstreams?.[0]?.reason || '').includes('Native Responses Recheck window') ||
       chatOnlyResponsesHits !== 1 ||
       chatOnlyChatHits !== 4
     ) {
@@ -3409,7 +3552,7 @@ try {
       unsupportedChatInputJson.unsupported_input_types?.includes('content:input_image') ||
       !String(unsupportedChatInputJson.error || '').includes('no compatible upstream candidate') ||
       unsupportedChatInputJson.attempts?.length !== 0 ||
-      !String(unsupportedChatInputJson.incompatible_upstreams?.[0]?.reason || '').includes('resolved request interface chat_completions') ||
+      !String(unsupportedChatInputJson.incompatible_upstreams?.[0]?.reason || '').includes('Native Responses Recheck window') ||
       chatOnlyResponsesHits !== 1 ||
       chatOnlyChatHits !== 4
     ) {
@@ -6563,6 +6706,7 @@ try {
   await close(anthropicContentEmpty);
   await close(chatChoicesEmpty);
   await close(responsesObjectOnly);
+  await close(probeModelOverride);
   await close(responsesDataOnly);
   await close(responsesMissingCompleted);
   await close(zeroOutputUsage);

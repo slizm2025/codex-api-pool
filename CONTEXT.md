@@ -68,6 +68,10 @@ _Avoid_: stream retry, resume, continuation
 A Model Interaction Request path where the API Pool can forward a Responses request to an Upstream without translating it to another model API family. A Native Responses Route preserves Responses-only Features.
 _Avoid_: native model, original model, full model
 
+**Native Responses Recheck**:
+A time-bounded recovery attempt that lets an Upstream with a learned non-native Forwarding Strategy try a Native Responses Route again for the same Requested Model, so temporary lack of native support does not become permanent.
+_Avoid_: permanent retry, manual reset, endpoint polling
+
 **Request Interface**:
 The model API family that current evidence says an Upstream can successfully serve for a Requested Model, such as Responses, Chat Completions, Anthropic Messages, or Codex OAuth Responses. Once learned, it guides later Model Interaction Requests so the API Pool keeps using the interface that has been proven for that Upstream until stronger evidence changes it.
 _Avoid_: endpoint guess, route preference, protocol hint
@@ -77,7 +81,7 @@ Evidence that an Upstream can or cannot serve a model API family, gathered from 
 _Avoid_: request interface, forwarding strategy, current route
 
 **Forwarding Strategy**:
-The learned way the API Pool sends future Model Interaction Requests for the same Upstream and Requested Model after real traffic succeeds, such as Native Responses, Chat Completions, or Chat Completions with Adapter Compatibility Mode.
+The learned way the API Pool sends future Model Interaction Requests for the same Upstream and Requested Model after real traffic succeeds, such as Native Responses, Chat Completions, or Chat Completions with Adapter Compatibility Mode. A non-native Forwarding Strategy can be superseded by stronger native evidence or a Native Responses Recheck.
 _Avoid_: permanent model setting, global routing mode, provider type
 
 **Responses-only Feature**:

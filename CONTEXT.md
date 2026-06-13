@@ -9,8 +9,12 @@ A local multi-protocol proxy that selects among multiple upstream services, retr
 _Avoid_: proxy, router, gateway, key pool, site pool
 
 **Upstream**:
-An external API service that the API Pool can send model requests to. An Upstream has a base URL, weight, keys, health state, cooldown state, protocol capability (OpenAI-compatible, Anthropic Messages, or both), and optional billing or quota information.
+An external API service that the API Pool can send model requests to. An Upstream has a base URL, weight, keys, health state, cooldown state, Protocol Capability evidence, and optional billing or quota information.
 _Avoid_: provider, site, API site, station, vendor
+
+**API Type Declaration**:
+The user-configured `api` field in Pool Configuration that declares the expected protocol family for an Upstream (`openai`, `anthropic`, or `both`). It serves as the initial assumption for Health Probes but does not restrict runtime protocol selection—Protocol Capability evidence from probes takes precedence.
+_Avoid_: protocol type, upstream type, API family, provider type
 
 **Pool Token**:
 The local Bearer token that Codex uses to access the API Pool. It authorizes entry to the local pool and is not forwarded to any Upstream.
@@ -49,8 +53,12 @@ A client request that is expected to produce model output, such as a Responses, 
 _Avoid_: request, API call, probe, model list
 
 **Selection**:
-The process of choosing an available Upstream and Upstream Key for a request. Selection considers weight, Availability, cooldown, health, in-flight requests, failure history, and model support.
+The process of choosing an available Upstream and Upstream Key for a request. Selection prioritizes Protocol Matching over weight to enable lossless forwarding, then considers Availability, cooldown, health, in-flight requests, failure history, and model support.
 _Avoid_: routing, dispatch, load balancing
+
+**Protocol Matching**:
+The Selection behavior that prioritizes Upstreams with verified Protocol Capability matching the client's request entry point. A Responses request prefers Upstreams with verified `responses` capability; a Messages request prefers Upstreams with verified `anthropic_messages` capability. Protocol Matching takes precedence over weight to avoid lossy protocol conversion when native routes exist.
+_Avoid_: protocol preference, endpoint matching, native priority
 
 **Retry**:
 A subsequent attempt for the same client request after an eligible failure, retryable HTTP status, network error, or timeout.
@@ -81,8 +89,8 @@ The model API family that current evidence says an Upstream can successfully ser
 _Avoid_: endpoint guess, route preference, protocol hint
 
 **Protocol Capability**:
-Evidence that an Upstream can or cannot serve a model API family, gathered from Pool Configuration, Health Probes, user declarations, or real model traffic. Protocol Capability describes what an Upstream supports; it does not by itself say which interface the next Model Interaction Request will use.
-_Avoid_: request interface, forwarding strategy, current route
+Runtime evidence that an Upstream can or cannot serve a model API family (Responses, Chat Completions, or Anthropic Messages), gathered from Health Probes or real model traffic. Each capability has a status (`verified` from successful probes, `assumed` from API Type Declaration, `unsupported` from authoritative failures, or `unknown` before evidence). Protocol Capability takes precedence over API Type Declaration when selecting upstreams—a configured `api: "openai"` upstream that successfully probes `/v1/messages` will gain `anthropic_messages: verified` capability and become eligible for Claude model requests.
+_Avoid_: request interface, forwarding strategy, current route, API type
 
 **Forwarding Strategy**:
 The learned way the API Pool sends future Model Interaction Requests for the same Upstream and Requested Model after real traffic succeeds, such as Native Responses, Chat Completions, or Chat Completions with Adapter Compatibility Mode. A non-native Forwarding Strategy can be superseded by stronger native evidence or a Native Responses Recheck.
@@ -121,7 +129,7 @@ The Bearer token used to authorize access to the Management API. It may be confi
 _Avoid_: pool token, upstream key, API key
 
 **Health Probe**:
-An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but synthetic probe failures are authoritative only when they contain deterministic failure evidence.
+An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but synthetic probe failures are authoritative only when they contain deterministic failure evidence. Health Probes use a browser-like User-Agent to avoid client restrictions imposed by some Upstreams.
 _Avoid_: test, check, ping, health check, real Codex check
 
 **Representative Model Probe**:
@@ -183,6 +191,10 @@ _Avoid_: requested model, target model, override model
 **Discovered Model**:
 A model name learned from an Upstream's model listing during a Health Probe. Discovered Models can be used to decide whether an Upstream supports the Requested Model.
 _Avoid_: model, active model, target model
+
+**Upstream Model Suffix**:
+A per-Upstream suffix that a non-standard Upstream appends to otherwise standard model names, such as `-cc` turning `claude-opus-4-8` into `claude-opus-4-8-cc`. The API Pool strips the Upstream Model Suffix from Discovered Models so Selection and diagnostics use the standard name, and reattaches it only to the model field of the request body sent to that Upstream. It does not change the Requested Model seen by clients, Recent Request Timeline, or availability statistics.
+_Avoid_: model alias, model rename, model override, custom model name
 
 **Management Dashboard**:
 The local operations interface for the API Pool, used to understand Upstream availability, explain why Codex requests may fail, and perform safe Management API actions such as Health Probes, Billing refreshes, Upstream enable toggles, Model Override changes, and Upstream creation.

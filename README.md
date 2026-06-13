@@ -671,6 +671,113 @@ Billing 默认尝试常见 OpenAI-compatible 账单接口：
 
 只有 HTTP 2xx/3xx 且响应里有具体模型输出才算成功。HTTP 错误、网络错误、超时、上游流式中断、空输出、显式 `output_tokens = 0` 都算失败。
 
+## 调试与请求日志
+
+### 启用请求捕获
+
+在 `config.local.json` 中启用调试模式以捕获完整的客户端原始请求信息：
+
+```json
+{
+  "debug": {
+    "capture_request_headers": true,
+    "request_log_path": "requests.debug.log"
+  }
+}
+```
+
+启用后，每个请求的完整信息会被记录：
+
+- **客户端原始请求头** (`incomingHeaders`)：包括 Authorization、Content-Type、User-Agent 等所有头部（包括敏感信息）
+- **客户端原始请求体** (`incomingBody`)：完整的 JSON payload，在任何协议转换之前
+- **路由信息**：选择的上游、使用的密钥、协议路线、兼容性转换详情
+- **响应信息**：状态码、耗时、Token 消耗、成功/失败原因
+
+### 存储位置
+
+请求信息会保存在三个地方：
+
+1. **内存** (`state.recentRequests`)：最近 30 条请求，用于实时查询
+2. **stats.local.json**：持久化存储，重启后恢复
+3. **requests.debug.log**（可选）：每行一条 JSON 记录，方便用 `jq`/`grep` 分析
+
+**重要**：这三个位置保存的都是**客户端发来的原始请求**，不是转发给上游后的请求。
+
+### 查看请求日志
+
+**方法 1：Dashboard 可视化**
+
+```bash
+open http://127.0.0.1:8787/pool/dashboard
+```
+
+**方法 2：API 查询**
+
+```bash
+# 查看最近请求
+curl -s http://127.0.0.1:8787/pool/status | jq '.recent_requests[0]'
+
+# 查看最后一个请求的完整信息
+curl -s http://127.0.0.1:8787/pool/status | jq '.recent_requests[0] | {
+  at,
+  method,
+  path,
+  upstream,
+  status,
+  incomingHeaders,
+  incomingBody
+}'
+```
+
+**方法 3：日志文件脚本**
+
+```bash
+# 查看最近 10 条请求
+./scripts/view-request-log.sh
+
+# 查看最近 20 条
+./scripts/view-request-log.sh 20
+
+# 实时跟踪
+./scripts/view-request-log.sh follow
+
+# 统计分析
+./scripts/analyze-request-log.sh
+
+# 提取特定请求
+./scripts/extract-request.sh --last              # 最后一个
+./scripts/extract-request.sh --last-error        # 最后一个失败
+./scripts/extract-request.sh --upstream rawchat  # 特定上游
+./scripts/extract-request.sh <request_id>        # 通过 ID
+```
+
+### 日志分析示例
+
+**按上游分组统计：**
+
+```bash
+jq -r '.upstream // "null"' requests.debug.log | sort | uniq -c | sort -rn
+```
+
+**查找失败请求：**
+
+```bash
+jq 'select(.outcome == "error" or .succeeded == false)' requests.debug.log | jq -C '.'
+```
+
+**提取特定模型的请求体：**
+
+```bash
+jq 'select(.originalModel == "claude-opus-4-8") | .incomingBody' requests.debug.log
+```
+
+### 安全提示
+
+- `requests.debug.log` 包含**完整的敏感信息**（API Key、请求内容等）
+- 已添加到 `.gitignore`，不会被 Git 跟踪
+- 定期清理旧日志：`rm requests.debug.log`
+- 分享日志前务必脱敏：`jq 'del(.incomingHeaders.authorization, .incomingHeaders.cookie)' requests.debug.log`
+
 ## 常见排障
 
 | 现象 | 优先检查 |

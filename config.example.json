@@ -85,6 +85,7 @@
       "base_url": "https://runanytime.example",
       "health_path": "/v1/models",
       "probe_auth": "anthropic",
+      "model_suffix_strip": "-cc",
       "weight": 1,
       "keys": [
         {

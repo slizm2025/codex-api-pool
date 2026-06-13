@@ -61,6 +61,7 @@ const DEFAULT_BILLING_LARGE_LIMIT_THRESHOLD = 10_000_000;
 const DEFAULT_AVAILABILITY_WINDOW_SIZE = 50;
 const DEFAULT_AVAILABILITY_MIN_SAMPLES = 10;
 const DEFAULT_GRACEFUL_SHUTDOWN_MS = 15000;
+const BROWSER_LIKE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const STRIPPABLE_RESPONSES_INPUT_ITEM_TYPES = new Set(['reasoning']);
 const RESPONSE_COMPATIBILITY_SCRUB_FIELDS = [
   'previous_response_id',
@@ -76,6 +77,22 @@ const RESPONSE_COMPATIBILITY_SCRUB_FIELDS = [
 const RESPONSE_COMPATIBILITY_CHAT_TEXT_VERBOSITY_FIELD = 'text.verbosity';
 function now() {
   return Date.now();
+}
+
+function localDateTimeString(timestamp = now()) {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hour = String(date.getHours()).padStart(2, '0');
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  const second = String(date.getSeconds()).padStart(2, '0');
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  const tzOffset = -date.getTimezoneOffset();
+  const tzHours = String(Math.floor(Math.abs(tzOffset) / 60)).padStart(2, '0');
+  const tzMinutes = String(Math.abs(tzOffset) % 60).padStart(2, '0');
+  const tzSign = tzOffset >= 0 ? '+' : '-';
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}.${ms}${tzSign}${tzHours}:${tzMinutes}`;
 }
 
 function sleep(ms) {
@@ -183,27 +200,60 @@ function sanitizeRequestHeaders(headers, upstreamKey, targetUrl) {
 
 function captureIncomingRequestHeaders(config, headers = {}) {
   if (config.debug?.capture_request_headers !== true) return undefined;
-  const sensitive = /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key|api-key)$/i;
-  const sensitiveFragment = /(token|secret|password|credential|api[-_]?key)/i;
+  // Capture ALL headers without filtering when debug mode is enabled
   const captured = {};
   for (const [name, value] of Object.entries(headers || {})) {
     const lower = name.toLowerCase();
-    if (sensitive.test(lower) || sensitiveFragment.test(lower)) continue;
     captured[lower] = Array.isArray(value) ? value.join(', ') : String(value);
   }
   return captured;
 }
 
-function requestDebugFields(incomingHeaders) {
-  return incomingHeaders ? { incomingHeaders } : {};
+function requestDebugFields(incomingHeaders, incomingBody) {
+  const fields = {};
+  if (incomingHeaders) fields.incomingHeaders = incomingHeaders;
+  if (incomingBody !== undefined) {
+    try {
+      // Convert Buffer to string first, then parse JSON
+      const bodyString = Buffer.isBuffer(incomingBody)
+        ? incomingBody.toString('utf8')
+        : String(incomingBody);
+      fields.incomingBody = JSON.parse(bodyString);
+    } catch {
+      // If not JSON or parsing fails, store as string
+      fields.incomingBody = Buffer.isBuffer(incomingBody)
+        ? incomingBody.toString('utf8')
+        : incomingBody;
+    }
+  }
+  return fields;
 }
 
 function stripRequestDebugFields(requests = []) {
-  return requests.map(({ incomingHeaders, ...request }) => request);
+  return requests.map(({ incomingHeaders, incomingBody, ...request }) => request);
 }
 
 function isCodexCliUserAgent(value) {
   return /\bcodex_cli(?:_rs)?\//i.test(String(value || ''));
+}
+
+function headerValueCaseInsensitive(headers = {}, names = []) {
+  const wanted = new Set(names.map((name) => String(name || '').toLowerCase()));
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (!wanted.has(String(name || '').toLowerCase())) continue;
+    if (Array.isArray(value)) return value[0];
+    return value;
+  }
+  return undefined;
+}
+
+function setHeaderCaseInsensitive(headers, name, value) {
+  if (value === undefined || value === null) return;
+  const normalized = String(name || '').toLowerCase();
+  for (const existing of Object.keys(headers)) {
+    if (existing.toLowerCase() === normalized) delete headers[existing];
+  }
+  headers[name] = String(value);
 }
 
 function isResponsesCompactUrl(targetUrl) {
@@ -601,31 +651,66 @@ function buildAnthropicRequestHeaders(targetUrl, keyValue, incomingHeaders = {},
     host: target.host
   };
   if (keyValue) headers['x-api-key'] = keyValue;
+
+  // Use Claude CLI compatible User-Agent
+  const incomingUserAgent = headerValueCaseInsensitive(extraHeaders, ['user-agent'])
+    || headerValueCaseInsensitive(incomingHeaders, ['user-agent']);
+
+  // If incoming request has a Claude CLI user-agent, preserve it; otherwise use it by default
+  if (incomingUserAgent && incomingUserAgent.includes('claude-cli')) {
+    headers['user-agent'] = incomingUserAgent;
+  } else {
+    headers['user-agent'] = 'claude-cli/2.1.177 (external, cli)';
+  }
+
   headers['anthropic-version'] = extraHeaders['anthropic-version']
     || extraHeaders['Anthropic-Version']
     || incomingHeaders['anthropic-version']
     || incomingHeaders['Anthropic-Version']
     || '2023-06-01';
+
   const beta = extraHeaders['anthropic-beta']
     || extraHeaders['Anthropic-Beta']
     || incomingHeaders['anthropic-beta']
-    || incomingHeaders['Anthropic-Beta'];
+    || incomingHeaders['Anthropic-Beta']
+    || 'claude-code-20250219';  // Default Claude CLI beta
   if (beta) headers['anthropic-beta'] = beta;
+
+  // Add Claude CLI specific headers
+  headers['anthropic-dangerous-direct-browser-access'] =
+    extraHeaders['anthropic-dangerous-direct-browser-access']
+    || incomingHeaders['anthropic-dangerous-direct-browser-access']
+    || 'true';
+
+  headers['x-app'] =
+    extraHeaders['x-app']
+    || incomingHeaders['x-app']
+    || 'cli';
+
   return headers;
 }
 
 function buildProbeHeaders(targetUrl, keyValue, authType = 'bearer', extraHeaders = {}) {
   const target = new URL(targetUrl);
-  const headers = { accept: 'application/json', host: target.host };
+  const headers = {
+    accept: 'application/json',
+    host: target.host,
+    'user-agent': BROWSER_LIKE_USER_AGENT
+  };
   const type = String(authType || 'bearer').toLowerCase();
   if (keyValue && type === 'anthropic') {
+    // Use Claude CLI compatible headers for Anthropic probes
     headers['x-api-key'] = keyValue;
+    headers['user-agent'] = 'claude-cli/2.1.177 (external, cli)';
     headers['anthropic-version'] = extraHeaders['anthropic-version'] || extraHeaders['Anthropic-Version'] || '2023-06-01';
+    headers['anthropic-beta'] = extraHeaders['anthropic-beta'] || 'claude-code-20250219';
+    headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    headers['x-app'] = 'cli';
   } else if (keyValue && type !== 'none') {
     headers.authorization = `Bearer ${keyValue}`;
   }
   for (const [name, value] of Object.entries(extraHeaders || {})) {
-    if (value !== undefined && value !== null) headers[name] = String(value);
+    setHeaderCaseInsensitive(headers, name, value);
   }
   return headers;
 }
@@ -1127,8 +1212,74 @@ function modelFromBody(req, body, options = {}) {
   return typeof payload?.model === 'string' ? payload.model : '';
 }
 
+function normalizeModelSuffix(value) {
+  return String(value || '').trim();
+}
+
+// Forward mapping: strip an Upstream Model Suffix from a Discovered Model so
+// Selection and diagnostics use the standard model name (e.g. claude-opus-4-8-cc -> claude-opus-4-8).
+function stripUpstreamModelSuffix(model, suffix) {
+  const name = String(model || '');
+  const tail = normalizeModelSuffix(suffix);
+  if (!tail || !name.endsWith(tail)) return name;
+  return name.slice(0, name.length - tail.length);
+}
+
+// Reverse mapping: reattach an Upstream Model Suffix to the model name sent in the
+// request body to a non-standard Upstream (e.g. claude-opus-4-8 -> claude-opus-4-8-cc).
+// Idempotent: never appends a suffix that is already present.
+function applyUpstreamModelSuffix(model, suffix) {
+  const name = String(model || '');
+  const tail = normalizeModelSuffix(suffix);
+  if (!tail || !name || name.endsWith(tail)) return name;
+  return `${name}${tail}`;
+}
+
+// Resolve the model name to send in the outgoing request body for the chosen Upstream.
+// Returns the standard name unchanged unless the Upstream declares a model_suffix_strip.
+function forwardModelForUpstream(upstream, model) {
+  const suffix = upstream?.modelSuffixStrip;
+  if (!normalizeModelSuffix(suffix)) return String(model || '');
+  const models = upstream?.health?.models || [];
+  // If health.models is populated, it already contains normalized (standard) names.
+  // Check if the requested model is in the normalized list.
+  if (models.length > 0 && models.includes(model)) {
+    // Model is in the normalized list → apply suffix for this upstream
+    return applyUpstreamModelSuffix(model, suffix);
+  }
+  // Fallback for empty models list (health probe not run yet):
+  // If suffix is configured, assume all models need it and apply with idempotency check
+  if (normalizeModelSuffix(suffix)) {
+    return applyUpstreamModelSuffix(model, suffix);
+  }
+  return String(model || '');
+}
+
+function normalizeDiscoveredModelsForUpstream(upstream, models) {
+  const suffix = upstream?.modelSuffixStrip;
+  return [...new Set((Array.isArray(models) ? models : [])
+    .map((model) => stripUpstreamModelSuffix(model, suffix))
+    .filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function attachForwardedModelTrace(routeTrace, attemptedModel, forwardedModel) {
+  if (!routeTrace || !forwardedModel || forwardedModel === attemptedModel) return routeTrace;
+  return { ...routeTrace, forwarded_model: forwardedModel };
+}
+
 function isClaudeModel(model) {
   return /^claude(?:-|$)/i.test(String(model || '').trim());
+}
+
+function modelRequiresProtocol(model) {
+  const normalized = String(model || '').trim();
+  if (!normalized) return null;
+  // Claude models require Anthropic Messages API
+  if (isClaudeModel(normalized)) return 'anthropic_messages';
+  // All other models (GPT, GLM, Qwen, DeepSeek, Yi, etc.) default to OpenAI protocol
+  // Most Chinese model providers offer OpenAI-compatible APIs
+  return 'openai';
 }
 
 function normalizeUpstreamApi(value, probeAuth = '') {
@@ -1138,18 +1289,24 @@ function normalizeUpstreamApi(value, probeAuth = '') {
 }
 
 function isAnthropicUpstream(upstream) {
+  // Priority: verified protocol capability > api configuration
+  if (upstreamHasVerifiedProtocolCapability(upstream, 'anthropic_messages')) return true;
+  // Fallback: check api configuration
   return upstream?.api === 'anthropic' ||
     upstream?.api === 'both' ||
-    String(upstream?.probeAuth || '').trim().toLowerCase() === 'anthropic' ||
-    upstreamHasVerifiedProtocolCapability(upstream, 'anthropic_messages');
+    String(upstream?.probeAuth || '').trim().toLowerCase() === 'anthropic';
 }
 
 function isOpenAiUpstream(upstream) {
+  // Priority: verified protocol capability > api configuration
+  if (upstreamHasVerifiedProtocolCapability(upstream, 'responses') ||
+      upstreamHasVerifiedProtocolCapability(upstream, 'chat_completions')) {
+    return true;
+  }
+  // Fallback: check api configuration (default to openai if not specified)
   return upstream?.api === 'openai' ||
     upstream?.api === 'both' ||
-    !upstream?.api ||
-    upstreamHasVerifiedProtocolCapability(upstream, 'responses') ||
-    upstreamHasVerifiedProtocolCapability(upstream, 'chat_completions');
+    !upstream?.api;
 }
 
 function isCodexOAuthModel(model) {
@@ -1297,9 +1454,18 @@ function requestProtocolView(protocol, capability = {}, upstream = {}, configure
 
 function supportedRequestProtocols(upstream = {}, configuredMode = '') {
   const capabilities = normalizeProtocolCapabilities(upstream.capabilities);
-  return PROTOCOL_CAPABILITY_NAMES
+  const protocols = PROTOCOL_CAPABILITY_NAMES
     .map((protocol) => requestProtocolView(protocol, capabilities[protocol] || {}, upstream, configuredMode))
     .filter((item) => ['verified', 'assumed'].includes(item.status));
+
+  // Sort by status priority: verified > assumed
+  protocols.sort((a, b) => {
+    if (a.status === 'verified' && b.status !== 'verified') return -1;
+    if (a.status !== 'verified' && b.status === 'verified') return 1;
+    return 0;
+  });
+
+  return protocols;
 }
 
 function currentRequestProtocolForUpstream(upstream = {}, activeModel = '') {
@@ -1549,21 +1715,32 @@ function initialProtocolCapabilities(upstream) {
   }
 
   if (api === 'anthropic') {
-    capabilities.responses = emptyProtocolCapability('disabled', 'configured api=anthropic');
-    capabilities.chat_completions = emptyProtocolCapability('disabled', 'configured api=anthropic');
     capabilities.anthropic_messages = {
       ...emptyProtocolCapability('assumed', 'configured api=anthropic'),
       source: 'config'
     };
   } else if (api === 'openai') {
-    capabilities.anthropic_messages = emptyProtocolCapability('disabled', 'configured api=openai');
+    capabilities.responses = {
+      ...emptyProtocolCapability('assumed', 'configured api=openai'),
+      source: 'config'
+    };
+    capabilities.chat_completions = {
+      ...emptyProtocolCapability('assumed', 'configured api=openai'),
+      source: 'config'
+    };
   } else if (api === 'both') {
-    if (capabilities.anthropic_messages.status === 'unknown') {
-      capabilities.anthropic_messages = {
-        ...emptyProtocolCapability('assumed', 'configured api=both'),
-        source: 'config'
-      };
-    }
+    capabilities.responses = {
+      ...emptyProtocolCapability('assumed', 'configured api=both'),
+      source: 'config'
+    };
+    capabilities.chat_completions = {
+      ...emptyProtocolCapability('assumed', 'configured api=both'),
+      source: 'config'
+    };
+    capabilities.anthropic_messages = {
+      ...emptyProtocolCapability('assumed', 'configured api=both'),
+      source: 'config'
+    };
   }
 
   return normalizeProtocolCapabilities({ ...capabilities, ...normalizeDeclaredProtocolCapabilities(upstream?.protocol_capabilities || upstream?.protocolCapabilities) });
@@ -1694,6 +1871,22 @@ function protocolCapabilityStatus(upstream, protocol) {
 
 function upstreamHasVerifiedProtocolCapability(upstream, protocol) {
   return protocolCapabilityStatus(upstream, protocol) === 'verified';
+}
+
+function shouldRecheckProtocolCapability(upstream, protocol) {
+  const capability = normalizeProtocolCapabilities(upstream?.capabilities)[protocol];
+  if (!capability) return false;
+
+  // 如果是明确的端点不支持（404/405/501）或探测失败，应该定期重检
+  if (capability.endpoint_unsupported === true || capability.status === 'unsupported' || capability.status === 'failed') {
+    const lastCheckedAt = timestampMs(capability.checked_at);
+    const at = now();
+    // 每 30 分钟重检一次端点是否恢复
+    const recheckIntervalMs = 30 * 60 * 1000;
+    return at - lastCheckedAt >= recheckIntervalMs;
+  }
+
+  return false;
 }
 
 function upstreamHasUserDeclaredProtocolCapability(upstream, protocol, status = 'assumed') {
@@ -4282,6 +4475,7 @@ function createUpstreamState(upstream, index) {
     chatGptUserId: typeof upstream.chatgpt_user_id === 'string' ? upstream.chatgpt_user_id : '',
     organizationId: typeof upstream.organization_id === 'string' ? upstream.organization_id : '',
     healthPath: typeof upstream.health_path === 'string' ? upstream.health_path : '',
+    modelSuffixStrip: normalizeModelSuffix(upstream.model_suffix_strip || upstream.modelSuffixStrip),
     probeAuth: typeof upstream.probe_auth === 'string' ? upstream.probe_auth : 'bearer',
     api: normalizeUpstreamApi(upstream.api, upstream.probe_auth),
     capabilities: initialProtocolCapabilities(upstream),
@@ -4352,6 +4546,7 @@ function buildState(config) {
     .map((upstream, index) => createUpstreamState(upstream, index));
 
   return {
+    config,
     retry,
     availability,
     compatibility,
@@ -4394,7 +4589,9 @@ function normalizeCompatibilityConfig(input = {}) {
 function statsSnapshot(state) {
   return {
     updatedAt: new Date().toISOString(),
-    recentRequests: stripRequestDebugFields(state.recentRequests),
+    recentRequests: state.config?.debug?.capture_request_headers === true
+      ? state.recentRequests
+      : stripRequestDebugFields(state.recentRequests),
     upstreams: Object.fromEntries(state.upstreams.map((upstream) => [upstream.name, {
       stats: upstream.stats,
       quota: upstream.quota,
@@ -4497,6 +4694,7 @@ function healthAllowsSelection(upstream, expectedModel = undefined) {
     || state === 'unknown'
     || state === 'oauth_ready'
     || state === 'stale_model_override'
+    || state === 'missing_model_override'
     || state === 'advanced_curl_required'
     || state === 'codex_forward_only'
     || state === 'inconclusive';
@@ -4706,10 +4904,28 @@ function restoreStats(state, statsPath) {
 function rememberRequest(state, event) {
   state.recentRequests.unshift({
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    at: new Date().toISOString(),
+    at: localDateTimeString(),
     ...event
   });
   state.recentRequests.splice(30);
+
+  // Write to debug log file if enabled
+  if (state.config?.debug?.capture_request_headers === true && state.config?.debug?.request_log_path) {
+    writeRequestDebugLog(state.config.debug.request_log_path, {
+      id: state.recentRequests[0].id,
+      at: state.recentRequests[0].at,
+      ...event
+    });
+  }
+}
+
+function writeRequestDebugLog(logPath, request) {
+  try {
+    const logEntry = JSON.stringify(request) + '\n';
+    writeFileSync(logPath, logEntry, { flag: 'a' });
+  } catch (error) {
+    console.warn?.(`[debug] failed to write request log to ${logPath}: ${error.message}`);
+  }
 }
 
 function writeStatsNow(state, statsPath) {
@@ -4814,9 +5030,19 @@ function upstreamAvailable(upstream, at, expectedModel = undefined) {
 
 function upstreamSupportsModel(upstream, model) {
   if (!model) return true;
-  if (isClaudeModel(model) && !isAnthropicUpstream(upstream)) return false;
-  if (!isClaudeModel(model) && !isOpenAiUpstream(upstream)) return false;
+
+  // Check protocol compatibility based on model requirements
+  const requiredProtocol = modelRequiresProtocol(model);
+  if (requiredProtocol === 'anthropic_messages') {
+    if (!isAnthropicUpstream(upstream)) return false;
+  } else if (requiredProtocol === 'openai') {
+    if (!isOpenAiUpstream(upstream)) return false;
+  }
+
+  // Check Codex OAuth model compatibility
   if (upstream.codexOAuth && !isCodexOAuthModel(model)) return false;
+
+  // Check if model is in discovered models list (if available)
   const models = upstream.health?.models || [];
   return models.length === 0 || models.includes(model);
 }
@@ -4832,6 +5058,7 @@ function chooseCandidate(state, tried, options = {}) {
   const preferredModel = options.preferredModel || state.modelOverride;
   const allowUnknownModelFallback = options.allowUnknownModelFallback === true;
   const candidateFilter = typeof options.candidateFilter === 'function' ? options.candidateFilter : null;
+  const preferredProtocol = options.preferredProtocol || '';
   let candidates = state.upstreams.filter((upstream) => {
     if (!upstreamAvailable(upstream, at)) return false;
     if (candidateFilter && !candidateFilter(upstream)) return false;
@@ -4846,6 +5073,17 @@ function chooseCandidate(state, tried, options = {}) {
         ? knownModelCandidates
         : modelCandidates;
     }
+  }
+
+  // Prioritize upstreams with verified protocol capability for lossless forwarding
+  if (preferredProtocol && candidates.length > 0) {
+    const protocolMatches = candidates.filter((upstream) =>
+      upstreamHasVerifiedProtocolCapability(upstream, preferredProtocol)
+    );
+    if (protocolMatches.length > 0) {
+      candidates = protocolMatches;
+    }
+    // If no protocol matches, fall back to all candidates (allow protocol conversion)
   }
 
   if (candidates.length === 0) return null;
@@ -6668,7 +6906,7 @@ function recordModelInteractionOutcome({
   return recordedTokens;
 }
 
-function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
+function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, incomingBody, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
   const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
   const recordedTokens = recordModelInteractionOutcome({
     state,
@@ -6686,7 +6924,7 @@ function finishResponseAttempt({ state, upstream, key, method, pathname, incomin
     method,
     path: pathname,
     entry_protocol: 'responses',
-    ...requestDebugFields(incomingHeaders),
+    ...requestDebugFields(incomingHeaders, incomingBody),
     upstream: upstream.name,
     key: key.label,
     originalModel: originalModel || null,
@@ -6753,6 +6991,9 @@ function advancedCurlRequiredProbeError(result) {
   }
   if (code === 'codex_access_restricted' || /codex_access_restricted|请使用最新版的codex客户端或codex cli调用|use latest codex client|please use .*codex.*(?:client|cli)/i.test(body)) {
     return '该上游要求比标准 Curl 更完整的请求形态（例如真实 Codex 客户端上下文、签名或额外头），当前测试请求无法单独验证；请使用匹配上游要求的高级 Curl profile 或真实 Codex 请求转发验证。';
+  }
+  if (/channel:client_restricted|client[_ -]?restricted|不允许当前客户端|current client .*not allowed|client .*restricted|go-http-client/i.test(body)) {
+    return '该上游限制了 Health Probe 的客户端形态，当前测试请求不能代表真实 Claude/Codex 转发；请使用真实客户端请求或匹配上游要求的高级测试配置验证可用性。';
   }
   if (/missing .*codex .*context|codex .*context .*required|requires .*codex .*context|真实 codex .*上下文|缺少.*codex.*上下文/i.test(body)) {
     return '该上游要求真实 Codex 请求上下文。标准 Health Probe 只能做合成验证，不能单独证明该上游不可用；请用真实 Codex 请求转发的响应结果验证可用性。';
@@ -7022,27 +7263,65 @@ function recordProtocolCapabilityProbe(upstream, protocol, result, classified, {
 } = {}) {
   if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
   const state = classified?.state || classifyModelProbe(result || {}, protocol).state;
-  if (state !== 'ok' && upstreamHasUserDeclaredProtocolCapability(upstream, protocol)) return;
+  const statusCode = Number(result?.statusCode || 0);
+
+  // ── 明确失败检测：404/405/501 表示端点明确不支持 ──
+  const isClearEndpointUnsupported = NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode);
+
+  // ── 保护机制 1: 用户声明优先 (除非明确失败) ──
+  if (state !== 'ok' && !isClearEndpointUnsupported && upstreamHasUserDeclaredProtocolCapability(upstream, protocol)) {
+    // 用户明确声明支持，但探测失败（非明确端点不存在）→ 保留用户声明，但记录探测失败时间
+    const existing = upstream.capabilities?.[protocol];
+    if (existing?.source === 'user_declared') {
+      // 更新 checked_at 和诊断信息，但保持 assumed 状态
+      upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+      upstream.capabilities[protocol] = {
+        ...existing,
+        checked_at: checkedAt,
+        http_status: statusCode,
+        probe_failure_reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
+        probe_failure_at: checkedAt
+      };
+    }
+    return;
+  }
+
+  // ── 保护机制 2: 真实流量验证优先 (除非明确失败) ──
   const existing = upstream.capabilities?.[protocol];
   if (
     state !== 'ok' &&
+    !isClearEndpointUnsupported &&
     existing?.status === 'verified' &&
     existing?.source === 'real_traffic' &&
     existing?.representative === true &&
     String(existing?.model || '').trim() === String(model || '').trim()
   ) {
+    // 真实流量已验证成功，探测失败（非明确端点不存在）→ 保留真实流量证据，但记录探测失败
+    upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+    upstream.capabilities[protocol] = {
+      ...existing,
+      probe_failure_reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
+      probe_failure_at: checkedAt
+    };
     return;
   }
+
+  // ── 记录新的协议能力状态 ──
   upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+  const newStatus = protocolCapabilityStatusFromProbeState(state);
+
   upstream.capabilities[protocol] = {
-    status: protocolCapabilityStatusFromProbeState(state),
+    status: newStatus,
     source: 'probe',
     probe_type: probeType,
     representative: state === 'advanced_curl_required' || state === 'codex_forward_only' ? false : representative,
     checked_at: checkedAt,
     model: String(model || ''),
-    http_status: Number(result?.statusCode || 0) || 0,
-    reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol)
+    http_status: statusCode,
+    reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
+    // 如果是明确失败，标记为可重检
+    endpoint_unsupported: isClearEndpointUnsupported,
+    last_probe_state: state
   };
 }
 
@@ -7702,12 +7981,13 @@ function probeChatCompletionsUpstream(upstream, key, config, model) {
   return new Promise((resolve) => {
     const timeoutMs = chatFallbackProbeTimeoutMs(config, Number(config.health?.timeout_ms || 10000));
     const targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
+    const forwardedModel = forwardModelForUpstream(upstream, model);
     const body = buildChatCompletionsPayload(Buffer.from(JSON.stringify({
-      model,
+      model: forwardedModel,
       input: 'ping',
       stream: false,
       max_output_tokens: 8
-    })), model);
+    })), forwardedModel);
     const headers = buildProbeHeaders(targetUrl, key.value, upstream.probeAuth, upstream.probeHeaders);
     headers['content-type'] = 'application/json';
     headers['content-length'] = body.length;
@@ -7760,7 +8040,8 @@ function probeResponsesUpstream(upstream, key, config, model) {
     const timeoutMs = Number(config.health?.timeout_ms || 10000);
     const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
     const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
-    const body = Buffer.from(JSON.stringify(codexResponsesProbePayload(model)));
+    const forwardedModel = forwardModelForUpstream(upstream, model);
+    const body = Buffer.from(JSON.stringify(codexResponsesProbePayload(forwardedModel)));
     const headers = buildJsonRequestHeaders(targetUrl, key.value, {
       ...codexResponsesProbeIncomingHeaders(),
       ...(upstream.probeHeaders || {})
@@ -7814,8 +8095,9 @@ function probeAnthropicUpstream(upstream, key, config, model) {
   return new Promise((resolve) => {
     const timeoutMs = Number(config.health?.timeout_ms || 10000);
     const targetUrl = joinUrlPath(upstream.baseUrl, anthropicMessagesPathForBaseUrl(upstream.baseUrl));
+    const forwardedModel = forwardModelForUpstream(upstream, model);
     const body = Buffer.from(JSON.stringify({
-      model,
+      model: forwardedModel,
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
       max_tokens: 1,
       stream: false
@@ -8209,7 +8491,7 @@ async function fetchSupplementalModels(upstream, config, key, timeoutMs, publicP
       headers: upstream.probeHeaders,
       proxyUrl: upstream.proxyUrl
     });
-    const extracted = extractModels(modelsResult.body);
+    const extracted = normalizeDiscoveredModelsForUpstream(upstream, extractModels(modelsResult.body));
     if (extracted.length > 0) models = extracted;
   } catch {
     // Model list is supplementary; ignore errors.
@@ -8270,8 +8552,30 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     return health;
   }
 
-  if (!probeModel) {
-    const models = await fetchSupplementalModels(upstream, config, key, timeoutMs, publicPrefix, pathSuffix);
+  // Fetch models list early for per-protocol model selection
+  const models = await fetchSupplementalModels(upstream, config, key, timeoutMs, publicPrefix, pathSuffix);
+
+  // Select representative model per protocol family
+  const claudeModelsList = claudeModels(models);
+  const nonClaudeModelsList = nonClaudeModels(models);
+  const hasDiscoveredModels = models.length > 0;
+
+  // For anthropic_messages: use probeModel if it's Claude; if models discovered and none are Claude, skip; else use first Claude from list
+  const anthropicProbeModel = (probeModel && isClaudeModel(probeModel))
+    ? probeModel
+    : hasDiscoveredModels
+      ? claudeModelsList[0] || ''
+      : '';
+
+  // For openai protocols: use probeModel if non-Claude; if models discovered and none are non-Claude, skip; else use first non-Claude from list
+  const openaiProbeModel = (probeModel && !isClaudeModel(probeModel))
+    ? probeModel
+    : hasDiscoveredModels
+      ? nonClaudeModelsList[0] || ''
+      : '';
+
+  // If no models available for any protocol, return missing_model_override
+  if (!anthropicProbeModel && !openaiProbeModel) {
     const health = {
       state: 'missing_model_override',
       checkedAt,
@@ -8353,8 +8657,8 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
   }
 
   // ── Real model request as primary health check ──
-  const isAnthropic = isAnthropicUpstream(upstream);
-  const isOpenAi = isOpenAiUpstream(upstream);
+  // Determine probe strategy based on api configuration and existing capabilities
+  const api = normalizeUpstreamApi(upstream?.api, upstream?.probe_auth);
   let healthResult = null;
   let stateName = '';
   let healthError = '';
@@ -8362,106 +8666,145 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
   let resolvedMode = '';
   let healthSource = 'probe';
 
-  // Step 1: Try real model request based on upstream type
-  if (isAnthropic && !isOpenAi) {
-    // Pure Anthropic upstream → probe /v1/messages first
-    const result = await probeAnthropicUpstream(upstream, key, config, probeModel);
-    if (persistHealth) applyQuota(upstream, key, result.headers || {});
-    const classified = classifyModelProbe(result, 'anthropic');
-    if (persistHealth) recordProtocolCapabilityProbe(upstream, 'anthropic_messages', result, classified, { checkedAt, model: probeModel });
-    stateName = classified.state;
-    healthResult = result;
-    healthError = classified.error || result.error;
-  } else if (isOpenAi) {
-    // OpenAI-compatible upstream → try /v1/responses first, then /v1/chat/completions
-    const shouldProbeChatOnly = upstream.requestMode === 'chat_completions' ||
-      (
-        upstream.resolvedRequestMode === 'chat_completions' &&
-        !canAttemptNativeResponses('/v1/responses', upstream, probeModel, {
-          nativeResponsesRecheckMs: state.retry.nativeResponsesRecheckMs
-        })
-      );
-    if (shouldProbeChatOnly) {
-      // Already known to be chat-only, skip responses probe
-      const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
-      if (persistHealth) applyQuota(upstream, key, chatResult.headers || {});
-      const classified = classifyModelProbe(chatResult, 'chat_completions');
-      if (persistHealth) recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, classified, { checkedAt, model: probeModel });
-      stateName = classified.state;
-      healthResult = chatResult;
-      healthError = classified.error || chatResult.error;
-      if (stateName === 'ok') resolvedMode = 'chat_completions';
-    } else {
-      // Try /v1/responses first
-      const responsesResult = await probeResponsesUpstream(upstream, key, config, probeModel);
-      if (persistHealth) applyQuota(upstream, key, responsesResult.headers || {});
-      const responsesClassification = classifyModelProbe(responsesResult, 'responses');
-      if (persistHealth) recordProtocolCapabilityProbe(upstream, 'responses', responsesResult, responsesClassification, { checkedAt, model: probeModel });
-      const responsesState = responsesClassification.state;
+  // Step 1: Progressive protocol discovery based on api configuration
+  const shouldRecheckResponses = shouldRecheckProtocolCapability(upstream, 'responses');
+  const shouldRecheckChat = shouldRecheckProtocolCapability(upstream, 'chat_completions');
+  const shouldRecheckAnthropicMessages = shouldRecheckProtocolCapability(upstream, 'anthropic_messages');
 
-      if (responsesState === 'ok') {
-        stateName = 'ok';
-        healthResult = responsesResult;
-        healthError = '';
-        resolvedMode = 'responses';
-      } else {
-        // /responses failed → try /v1/chat/completions as fallback
-        const chatResult = await probeChatCompletionsUpstream(upstream, key, config, probeModel);
-        if (persistHealth) applyQuota(upstream, key, chatResult.headers || {});
-        const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
-        if (persistHealth) recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: probeModel });
-        const chatState = chatClassification.state;
+  // Determine which protocols to probe based on configuration
+  const shouldProbeOpenAi = api === 'openai' || api === 'both' || !api;
+  const shouldProbeAnthropic = api === 'anthropic' || api === 'both';
 
-        if (chatState === 'ok') {
-          stateName = 'ok';
-          healthResult = chatResult;
-          healthError = '';
-          healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
-          resolvedMode = 'chat_completions';
-        } else {
-          const decision = openAiProbeDecision({
-            upstream,
-            probeModel,
-            responsesResult,
-            responsesClassification,
-            chatResult,
-            chatClassification
-          });
-          stateName = decision.stateName;
-          healthResult = decision.healthResult;
-          healthError = decision.healthError;
-          healthWarning = decision.healthWarning || healthWarning;
-          resolvedMode = decision.resolvedMode || resolvedMode;
-        }
-      }
-    }
-
-    // For "both" API upstreams, also try Anthropic
-    if (isAnthropic && stateName !== 'ok') {
-      const anthropicResult = await probeAnthropicUpstream(upstream, key, config, probeModel);
-      if (persistHealth) applyQuota(upstream, key, anthropicResult.headers || {});
-      const anthropicClassification = classifyModelProbe(anthropicResult, 'anthropic');
-      if (persistHealth) recordProtocolCapabilityProbe(upstream, 'anthropic_messages', anthropicResult, anthropicClassification, { checkedAt, model: probeModel });
-      const anthropicState = anthropicClassification.state;
-      if (anthropicState === 'ok') {
-        stateName = 'ok';
-        healthResult = anthropicResult;
-        healthError = '';
-      } else if (!healthError) {
-        healthError = anthropicClassification.error || anthropicResult.error;
+  // Probe Anthropic Messages if we have a Claude model
+  if (shouldProbeAnthropic && anthropicProbeModel) {
+    if (shouldRecheckAnthropicMessages || upstream.capabilities?.anthropic_messages?.status !== 'unsupported') {
+      const result = await probeAnthropicUpstream(upstream, key, config, anthropicProbeModel);
+      if (persistHealth) applyQuota(upstream, key, result.headers || {});
+      const classified = classifyModelProbe(result, 'anthropic');
+      if (persistHealth) recordProtocolCapabilityProbe(upstream, 'anthropic_messages', result, classified, { checkedAt, model: anthropicProbeModel });
+      // Use this for overall health if successful or if we don't have a result yet
+      if (classified.state === 'ok' || !healthResult) {
+        stateName = classified.state;
+        healthResult = result;
+        healthError = classified.error || result.error;
       }
     }
   }
 
-  // Fallback: if no real model probe function matched, do not use /models to claim availability.
+  // Probe OpenAI protocols if we have a non-Claude model
+  if (shouldProbeOpenAi && openaiProbeModel) {
+    const shouldProbeChatOnly = upstream.requestMode === 'chat_completions' ||
+      (
+        upstream.resolvedRequestMode === 'chat_completions' &&
+        !shouldRecheckResponses &&
+        !canAttemptNativeResponses('/v1/responses', upstream, openaiProbeModel, {
+          nativeResponsesRecheckMs: state.retry.nativeResponsesRecheckMs
+        })
+      );
+
+    if (shouldProbeChatOnly) {
+      if (shouldRecheckChat || upstream.capabilities?.chat_completions?.status !== 'unsupported') {
+        const chatResult = await probeChatCompletionsUpstream(upstream, key, config, openaiProbeModel);
+        if (persistHealth) applyQuota(upstream, key, chatResult.headers || {});
+        const classified = classifyModelProbe(chatResult, 'chat_completions');
+        if (persistHealth) recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, classified, { checkedAt, model: openaiProbeModel });
+        // Use this for overall health if successful or if we don't have a result yet
+        if (classified.state === 'ok' || !healthResult) {
+          if (classified.state === 'ok' && stateName !== 'ok') {
+            stateName = classified.state;
+            healthResult = chatResult;
+            healthError = '';
+            resolvedMode = 'chat_completions';
+          } else if (!healthResult) {
+            stateName = classified.state;
+            healthResult = chatResult;
+            healthError = classified.error || chatResult.error;
+            resolvedMode = 'chat_completions';
+          }
+        }
+      }
+    } else {
+      // Try /v1/responses first
+      if (shouldRecheckResponses || upstream.capabilities?.responses?.status !== 'unsupported') {
+        const responsesResult = await probeResponsesUpstream(upstream, key, config, openaiProbeModel);
+        if (persistHealth) applyQuota(upstream, key, responsesResult.headers || {});
+        const responsesClassification = classifyModelProbe(responsesResult, 'responses');
+        if (persistHealth) recordProtocolCapabilityProbe(upstream, 'responses', responsesResult, responsesClassification, { checkedAt, model: openaiProbeModel });
+        const responsesState = responsesClassification.state;
+
+        if (responsesState === 'ok') {
+          if (stateName !== 'ok') {
+            stateName = 'ok';
+            healthResult = responsesResult;
+            healthError = '';
+            resolvedMode = 'responses';
+          }
+        } else {
+          // /responses failed → try /v1/chat/completions as fallback
+          if (shouldRecheckChat || upstream.capabilities?.chat_completions?.status !== 'unsupported') {
+            const chatResult = await probeChatCompletionsUpstream(upstream, key, config, openaiProbeModel);
+            if (persistHealth) applyQuota(upstream, key, chatResult.headers || {});
+            const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
+            if (persistHealth) recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: openaiProbeModel });
+            const chatState = chatClassification.state;
+
+            if (chatState === 'ok' && stateName !== 'ok') {
+              stateName = 'ok';
+              healthResult = chatResult;
+              healthError = '';
+              healthWarning = `responses probe ${responsesState}; chat_completions probe ok`;
+              resolvedMode = 'chat_completions';
+            } else if (!healthResult) {
+              const decision = openAiProbeDecision({
+                upstream,
+                probeModel: openaiProbeModel,
+                responsesResult,
+                responsesClassification,
+                chatResult,
+                chatClassification
+              });
+              stateName = decision.stateName;
+              healthResult = decision.healthResult;
+              healthError = decision.healthError;
+              healthWarning = decision.healthWarning || healthWarning;
+              resolvedMode = decision.resolvedMode || resolvedMode;
+            }
+          } else if (!healthResult) {
+            // No chat probe available, use responses result
+            stateName = responsesState;
+            healthResult = responsesResult;
+            healthError = responsesClassification.error || responsesResult.error;
+          }
+        }
+      } else {
+        // Responses is unsupported and no recheck due, try chat directly
+        if (shouldRecheckChat || upstream.capabilities?.chat_completions?.status !== 'unsupported') {
+          const chatResult = await probeChatCompletionsUpstream(upstream, key, config, openaiProbeModel);
+          if (persistHealth) applyQuota(upstream, key, chatResult.headers || {});
+          const chatClassification = classifyModelProbe(chatResult, 'chat_completions');
+          if (persistHealth) recordProtocolCapabilityProbe(upstream, 'chat_completions', chatResult, chatClassification, { checkedAt, model: openaiProbeModel });
+          if (chatClassification.state === 'ok' && stateName !== 'ok') {
+            stateName = chatClassification.state;
+            healthResult = chatResult;
+            healthError = '';
+            resolvedMode = 'chat_completions';
+          } else if (!healthResult) {
+            stateName = chatClassification.state;
+            healthResult = chatResult;
+            healthError = chatClassification.error || chatResult.error;
+            if (stateName === 'ok') resolvedMode = 'chat_completions';
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback: if no real model probe succeeded
   if (!healthResult) {
     healthResult = probeResult(0, 0, '', 'no real model probe is configured for this upstream');
     stateName = 'unexpected_status';
     healthError = healthResult.error;
   }
-
-  // Step 2: Also grab /models list (supplementary, doesn't affect health state)
-  const models = await fetchSupplementalModels(upstream, config, key, timeoutMs, publicPrefix, pathSuffix);
 
   if (persistHealth && options.includeBilling) await safeProbeOneBilling(upstream, config);
 
@@ -8538,6 +8881,16 @@ function nonClaudeModels(models) {
   return (Array.isArray(models) ? models : []).filter((model) => !isClaudeModel(model));
 }
 
+function effectiveProbeModelForUpstream(upstream, requestedProbeModel = '', globalModel = '') {
+  const explicit = normalizeProbeModel(requestedProbeModel);
+  if (explicit) return explicit;
+  const fallback = normalizeProbeModel(globalModel);
+  if (upstream && isAnthropicUpstream(upstream) && (!fallback || !isClaudeModel(fallback))) {
+    return claudeModels(upstream.health?.models || [])[0] || fallback;
+  }
+  return fallback;
+}
+
 async function probeModelsForProtocol(upstream, config, protocol) {
   const healthConfig = config.health || {};
   const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
@@ -8574,7 +8927,8 @@ async function probeModelsForProtocol(upstream, config, protocol) {
     proxyUrl: upstream.proxyUrl
   });
   const stateName = classifyHealth(result.statusCode, result.error);
-  const models = extractModels(result.body);
+  const rawModels = extractModels(result.body);
+  const models = normalizeDiscoveredModelsForUpstream(upstream, rawModels);
   return {
     state: stateName,
     checkedAt,
@@ -8624,8 +8978,16 @@ async function checkClaudeCapability(upstream, config) {
   const models = mergeModels(openAiHealth.models || [], anthropicHealth.models || []);
   const claude = claudeModels(models);
   const nonClaude = nonClaudeModels(models);
-  const suggestedApi = supportsClaude ? (openAiWorks ? 'both' : 'anthropic') : openAiWorks ? 'openai' : null;
   const claudeOnly = supportsClaude && claude.length > 0 && nonClaude.length === 0;
+  const suggestedApi = supportsClaude
+    ? claudeOnly
+      ? 'anthropic'
+      : openAiWorks
+        ? 'both'
+        : 'anthropic'
+    : openAiWorks
+      ? 'openai'
+      : null;
   return {
     supports_claude: supportsClaude,
     claude_only: claudeOnly,
@@ -8667,10 +9029,15 @@ async function maybeAutoDetectApi(config, state, upstreamName, health, options, 
   const supportsClaude = anthropicHealth.state === 'ok' && hasClaudeModel(anthropicHealth.models);
   if (!openAiWorks && !supportsClaude) return { health, detectedApi: null };
 
-  const detectedApi = supportsClaude
-    ? openAiWorks ? 'both' : 'anthropic'
-    : 'openai';
   const detectedModels = mergeModels(openAiHealth.models || [], anthropicHealth.models || [], health?.models || []);
+  const detectedClaudeOnly = supportsClaude && claudeModels(detectedModels).length > 0 && nonClaudeModels(detectedModels).length === 0;
+  const detectedApi = supportsClaude
+    ? detectedClaudeOnly
+      ? 'anthropic'
+      : openAiWorks
+        ? 'both'
+        : 'anthropic'
+    : 'openai';
 
   const configIndex = (config.upstreams || []).findIndex((item) => item.name === upstreamName);
   if (configIndex >= 0) {
@@ -10378,7 +10745,7 @@ function dashboardHtml() {
       return models.length === 0 || models.includes(model);
     };
     const hasConfiguredKey = (upstream) => (upstream.keys || []).some((key) => key.configured);
-    const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key', 'missing_model_override', 'models_unsupported', 'unexpected_status'].includes(upstream.health?.state || '');
+    const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key', 'models_unsupported', 'unexpected_status'].includes(upstream.health?.state || '');
     function requestFailureText(request) {
       if (!request || request.outcome === 'ok') return '';
       if (request.error_display?.title || request.error_display?.message) {
@@ -11534,6 +11901,7 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     chatgpt_user_id: upstream.chatGptUserId || undefined,
     organization_id: upstream.organizationId || undefined,
     health_path: upstream.healthPath || config.health?.path || '/models',
+    model_suffix_strip: upstream.modelSuffixStrip || undefined,
     probe_auth: upstream.probeAuth,
     api: upstream.api,
     capabilities: normalizeProtocolCapabilities(upstream.capabilities),
@@ -11673,7 +12041,16 @@ function tokenMatches(req, envName) {
 }
 
 function isAuthorized(req, config) {
-  return tokenMatches(req, config.server?.auth_token_env);
+  const envName = config.server?.auth_token_env;
+  if (!envName) return true;
+  const expected = process.env[envName];
+  if (!expected) return false;
+
+  // Support both Authorization: Bearer and x-api-key headers
+  const authorization = req.headers.authorization || '';
+  const xApiKey = req.headers['x-api-key'] || '';
+
+  return authorization === `Bearer ${expected}` || xApiKey === expected;
 }
 
 function isAdminAuthorized(req, config) {
@@ -11868,6 +12245,7 @@ function normalizeImportItem(item, index, options = {}) {
     probe_auth: codexOAuth ? 'none' : probeAuth,
     request_mode: codexOAuth ? 'codex_oauth' : requestModeFromImportItem(item),
     api: api || undefined,
+    model_suffix_strip: firstString(item.model_suffix_strip, item.modelSuffixStrip),
     probe_headers: item.probe_headers || item.probeHeaders,
     protocol_capabilities: item.protocol_capabilities || item.protocolCapabilities,
     billing: item.billing,
@@ -12086,6 +12464,11 @@ function validateUpstreamPayload(payload, config) {
   const chatGptUserIdInput = hasOwn('chatgpt_user_id') ? payload.chatgpt_user_id : existing?.chatgpt_user_id;
   const organizationIdInput = hasOwn('organization_id') ? payload.organization_id : existing?.organization_id;
   const healthPathInput = hasOwn('health_path') ? payload.health_path : existing?.health_path;
+  const modelSuffixStripInput = hasOwn('model_suffix_strip')
+    ? payload.model_suffix_strip
+    : hasOwn('modelSuffixStrip')
+      ? payload.modelSuffixStrip
+      : existing?.model_suffix_strip;
   const probeAuthInput = hasOwn('probe_auth') ? payload.probe_auth : existing?.probe_auth;
   const apiInput = hasOwn('api') ? payload.api : existing?.api;
   const api = normalizeUpstreamApi(apiInput, probeAuthInput);
@@ -12125,6 +12508,9 @@ function validateUpstreamPayload(payload, config) {
     organization_id: typeof organizationIdInput === 'string' ? organizationIdInput.trim() : undefined,
     health_path: typeof healthPathInput === 'string'
       ? healthPathInput.trim()
+      : undefined,
+    model_suffix_strip: typeof modelSuffixStripInput === 'string'
+      ? normalizeModelSuffix(modelSuffixStripInput) || undefined
       : undefined,
     probe_auth: typeof probeAuthInput === 'string'
       ? probeAuthInput.trim()
@@ -12684,10 +13070,10 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (probeModel.length > 200) {
       return jsonResponse(res, 400, { error: 'probe_model must be 200 chars or fewer' });
     }
-    const effectiveProbeModel = probeModel || state.modelOverride;
-    const diagnosticOnly = effectiveProbeModel !== state.modelOverride;
     const upstream = state.upstreams.find((item) => item.name === name);
     if (!upstream) return jsonResponse(res, 404, { error: `upstream not found: ${name}` });
+    const effectiveProbeModel = effectiveProbeModelForUpstream(upstream, probeModel, state.modelOverride);
+    const diagnosticOnly = effectiveProbeModel !== state.modelOverride;
     const health = await probeOneUpstream(state, upstream, config, { live: true, probeModel: effectiveProbeModel });
     if (!diagnosticOnly) persistStats(state, statsPath);
     return jsonResponse(res, 200, { ok: true, ...probeResultPayload(health, effectiveProbeModel), upstream: name, probe_model: effectiveProbeModel, diagnostic_only: diagnosticOnly, health });
@@ -12751,6 +13137,7 @@ export function createPoolServer(config, options = {}) {
         }
 
         const originalBody = await readBody(req, maxBodyBytes);
+        const incomingHeaderSample = captureIncomingRequestHeaders(config, req.headers);
         let payload;
         try {
           payload = JSON.parse(originalBody.toString('utf8') || '{}');
@@ -12772,6 +13159,16 @@ export function createPoolServer(config, options = {}) {
         // Check for Messages-only Features when no Anthropic upstream is available
         const originalModel = payload.model;
         const requestedModel = state.modelOverride || originalModel;
+
+        // Strict validation: Messages API only supports Claude models
+        if (requestedModel && !isClaudeModel(requestedModel)) {
+          return anthropicErrorResponse(
+            res,
+            400,
+            'invalid_request_error',
+            `Messages API does not support model "${requestedModel}". Use /v1/responses or /v1/chat/completions for GPT models.`
+          );
+        }
 
         // Check if we have any Anthropic-capable upstreams
         const hasAnthropicUpstream = state.upstreams.some(upstream => {
@@ -12823,6 +13220,7 @@ export function createPoolServer(config, options = {}) {
           // Select upstream based on routing strategy
           const candidate = chooseCandidate(state, tried, {
             preferredModel: requestedModel,
+            preferredProtocol: 'anthropic_messages',
             allowUnknownModelFallback: networkAttempt > 1,
             candidateFilter: canUseAdapter
               ? null  // Allow any upstream when using adapter
@@ -12837,6 +13235,7 @@ export function createPoolServer(config, options = {}) {
 
           const { upstream, key } = candidate;
           tried.add(`${upstream.name}:${key.index}`);
+          const forwardedModel = forwardModelForUpstream(upstream, requestedModel);
 
           const attempt = networkAttempt;
           networkAttempt += 1;
@@ -12845,6 +13244,7 @@ export function createPoolServer(config, options = {}) {
           // Determine if we need to use the adapter for this upstream
           const upstreamApi = upstream.api || 'openai';
           const useAdapter = upstreamApi === 'openai' || (upstreamApi === 'both' && canUseAdapter);
+          const routeTrace = attachForwardedModelTrace(requestRouteTrace({ pathname }), requestedModel, forwardedModel);
 
           let targetUrl, requestBody, requestHeaders;
 
@@ -12853,8 +13253,8 @@ export function createPoolServer(config, options = {}) {
             targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
             try {
               requestBody = buildChatCompletionsFromMessages(
-                rewriteModelInBody(req, originalBody, requestedModel, { inferJsonLike: false }),
-                requestedModel,
+                rewriteModelInBody(req, originalBody, forwardedModel, { inferJsonLike: false }),
+                forwardedModel,
                 { stripMessagesOnlyFeatures }
               );
             } catch (error) {
@@ -12869,7 +13269,7 @@ export function createPoolServer(config, options = {}) {
           } else {
             // Native path: Messages → Messages
             targetUrl = joinUrlPath(upstream.baseUrl, anthropicMessagesPathForBaseUrl(upstream.baseUrl));
-            requestBody = rewriteModelInBody(req, originalBody, requestedModel, { inferJsonLike: false });
+            requestBody = rewriteModelInBody(req, originalBody, forwardedModel, { inferJsonLike: false });
             requestHeaders = buildAnthropicRequestHeaders(targetUrl, key.value, req.headers, upstream.probeHeaders);
           }
 
@@ -12902,14 +13302,17 @@ export function createPoolServer(config, options = {}) {
                   method: 'POST',
                   path: '/v1/messages',
                   entry_protocol: 'messages',
+                  ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
                   routing_strategy: routingStrategy,
                   upstream: upstream.name,
                   key: key.label,
                   model: requestedModel,
+                  actualModel: requestedModel,
                   status: statusCode,
                   streaming: isStreaming,
                   retried: attempt > 1,
-                  succeeded: true
+                  succeeded: true,
+                  route: routeTrace
                 });
 
                 // Handle response conversion if using adapter
@@ -12974,15 +13377,18 @@ export function createPoolServer(config, options = {}) {
                       method: 'POST',
                       path: '/v1/messages',
                       entry_protocol: 'messages',
+                      ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
                       routing_strategy: routingStrategy,
                       upstream: upstream.name,
                       key: key.label,
                       model: requestedModel,
+                      actualModel: requestedModel,
                       status: statusCode,
                       streaming: isStreaming,
                       retried: attempt > 1,
                       succeeded: false,
-                      reason: `HTTP ${statusCode}`
+                      reason: `HTTP ${statusCode}`,
+                      route: routeTrace
                     });
                   }
 
@@ -13023,15 +13429,18 @@ export function createPoolServer(config, options = {}) {
                     method: 'POST',
                     path: '/v1/messages',
                     entry_protocol: 'messages',
+                    ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
                     routing_strategy: routingStrategy,
                     upstream: upstream.name,
                     key: key.label,
                     model: requestedModel,
+                    actualModel: requestedModel,
                     status: 0,
                     streaming: isStreaming,
                     retried: attempt > 1,
                     succeeded: false,
-                    reason: error.message
+                    reason: error.message,
+                    route: routeTrace
                   });
                 }
 
@@ -13060,15 +13469,18 @@ export function createPoolServer(config, options = {}) {
                     method: 'POST',
                     path: '/v1/messages',
                     entry_protocol: 'messages',
+                    ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
                     routing_strategy: routingStrategy,
                     upstream: upstream.name,
                     key: key.label,
                     model: requestedModel,
+                    actualModel: requestedModel,
                     status: 504,
                     streaming: isStreaming,
                     retried: attempt > 1,
                     succeeded: false,
-                    reason: 'timeout'
+                    reason: 'timeout',
+                    route: routeTrace
                   });
                 }
               }
@@ -13104,6 +13516,7 @@ export function createPoolServer(config, options = {}) {
           method: 'POST',
           path: '/v1/messages',
           entry_protocol: 'messages',
+          ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
           routing_strategy: hasAnthropicUpstream ? 'native_messages' : (adapterModeEnabled ? 'messages_to_chat_completions' : 'none'),
           upstream: null,
           key: null,
@@ -13175,6 +13588,7 @@ export function createPoolServer(config, options = {}) {
         const routingAt = now();
         const candidate = chooseCandidate(state, tried, {
           preferredModel: requestedModel,
+          preferredProtocol: pathname === '/v1/responses' && !shouldUseAnthropicResponsesAdapter(pathname, requestedModel) ? 'responses' : '',
           allowUnknownModelFallback: networkAttempt > 1,
           candidateFilter: activeRequiresNativeResponses
             ? (upstream) => {
@@ -13207,6 +13621,7 @@ export function createPoolServer(config, options = {}) {
         const { upstream, key } = candidate;
         tried.add(`${upstream.name}:${key.index}`);
         const attemptedModel = requestedModel;
+        const forwardedModel = forwardModelForUpstream(upstream, attemptedModel);
         const learnedRouteStrategy = routeStrategyForUpstream(upstream, attemptedModel);
         const routePlan = planProtocolRoute({ pathname, upstream, model: attemptedModel, requiresNativeResponses: activeRequiresNativeResponses });
         const { useAnthropicAdapter, canUseChatAdapter, allowChatCompletionsAdapter, useCodexOAuth } = routePlan;
@@ -13254,10 +13669,10 @@ export function createPoolServer(config, options = {}) {
             ? codexOAuthTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix)
             : joinTargetUrl(upstream.baseUrl, req.url || '/', publicPrefix);
         let body = useAnthropicAdapter
-          ? buildAnthropicMessagesPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel)
+          ? buildAnthropicMessagesPayload(rewriteModelInBody(req, activeBody, forwardedModel, responsesJsonOptions), forwardedModel)
           : useChatCompletionsAdapter
-            ? buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel)
-          : rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions);
+            ? buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, forwardedModel, responsesJsonOptions), forwardedModel)
+          : rewriteModelInBody(req, activeBody, forwardedModel, responsesJsonOptions);
         const requestHeaders = useAnthropicAdapter
           ? buildAnthropicRequestHeaders(targetUrl, key.value, req.headers, upstream.probeHeaders)
           : useCodexOAuth
@@ -13265,7 +13680,7 @@ export function createPoolServer(config, options = {}) {
             : useChatCompletionsAdapter || originalBodyIsJson
               ? buildJsonRequestHeaders(targetUrl, key.value, req.headers)
               : undefined;
-        let routeTrace = requestRouteTrace({
+        let routeTrace = attachForwardedModelTrace(requestRouteTrace({
           pathname,
           useAnthropicAdapter,
           useChatCompletionsAdapter,
@@ -13275,7 +13690,7 @@ export function createPoolServer(config, options = {}) {
           unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
           unsupportedInputTypes,
           unsupportedFieldTypes
-        });
+        }), attemptedModel, forwardedModel);
         let compatibility = compatibilitySummary(compatibilityPlan, routeTrace);
         let requestHeadersForAttempt = requestHeaders;
         let requestMethod = useAnthropicAdapter || useChatCompletionsAdapter ? 'POST' : req.method;
@@ -13331,10 +13746,10 @@ export function createPoolServer(config, options = {}) {
           if (!activeRequiresNativeResponses) {
             useChatCompletionsAdapter = true;
             targetUrl = joinUrlPath(upstream.baseUrl, chatCompletionsPathForBaseUrl(upstream.baseUrl));
-            body = buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, attemptedModel, responsesJsonOptions), attemptedModel);
+            body = buildChatCompletionsPayload(rewriteModelInBody(req, activeBody, forwardedModel, responsesJsonOptions), forwardedModel);
             requestHeadersForAttempt = buildJsonRequestHeaders(targetUrl, key.value, req.headers);
             requestMethod = 'POST';
-            routeTrace = requestRouteTrace({
+            routeTrace = attachForwardedModelTrace(requestRouteTrace({
               pathname,
               useChatCompletionsAdapter: true,
               requiresNativeResponses: activeRequiresNativeResponses,
@@ -13342,7 +13757,7 @@ export function createPoolServer(config, options = {}) {
               unsupportedOutputFormatTypes: unsupportedChatOutputFormatTypes,
               unsupportedInputTypes,
               unsupportedFieldTypes
-            });
+            }), attemptedModel, forwardedModel);
             compatibility = compatibilitySummary(compatibilityPlan, routeTrace);
             result = await requestTrackedUpstream({
               req,
@@ -13413,7 +13828,7 @@ export function createPoolServer(config, options = {}) {
                   method: req.method,
                   path: pathname,
                   entry_protocol: 'responses',
-                  ...requestDebugFields(incomingHeaderSample),
+                  ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
                   upstream: upstream.name,
                   key: key.label,
                   originalModel: originalModel || null,
@@ -13445,7 +13860,7 @@ export function createPoolServer(config, options = {}) {
                 method: req.method,
                 path: pathname,
                 entry_protocol: 'responses',
-                ...requestDebugFields(incomingHeaderSample),
+                ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
                 upstream: upstream.name,
                 key: key.label,
                 originalModel: originalModel || null,
@@ -13555,6 +13970,7 @@ export function createPoolServer(config, options = {}) {
                 method: req.method,
                 pathname,
                 incomingHeaders: incomingHeaderSample,
+                incomingBody: config.debug?.capture_request_headers === true ? originalBody : undefined,
                 originalModel,
                 attemptedModel,
                 statusCode: result.statusCode,
@@ -13607,7 +14023,7 @@ export function createPoolServer(config, options = {}) {
             method: req.method,
             path: pathname,
             entry_protocol: 'responses',
-            ...requestDebugFields(incomingHeaderSample),
+            ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
             upstream: upstream.name,
             key: key.label,
             originalModel: originalModel || null,
@@ -13660,7 +14076,7 @@ export function createPoolServer(config, options = {}) {
           method: req.method,
           path: pathname,
           entry_protocol: 'responses',
-          ...requestDebugFields(incomingHeaderSample),
+          ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
           upstream: lastAttempt?.upstream || null,
           key: lastAttempt?.key || null,
           originalModel: originalModel || null,
@@ -13763,6 +14179,10 @@ export const __testInternals = {
   openHttpProxyTunnel,
   guardHttp2SessionSocket,
   runCurlTest,
+  classifyModelProbe,
+  buildAnthropicRequestHeaders,
+  buildProbeHeaders,
+  effectiveProbeModelForUpstream,
   buildChatCompletionsFromMessages,
   chatCompletionToMessagesJson,
   createChatToMessagesStreamAdapter

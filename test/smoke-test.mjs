@@ -6681,7 +6681,230 @@ try {
     await close(normalAuthErrorCurlBackend);
   }
 
-  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, automatic probe recovery, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, and immediate health probe all passed');
+  // ── Per-protocol representative model selection (issue #22) ──
+  let dualFamilyResponsesHits = 0;
+  let dualFamilyChatHits = 0;
+  let dualFamilyMessagesHits = 0;
+  const dualFamilyUpstream = createFakeUpstream('dual-family', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.5' }, { id: 'claude-opus-4-8' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      dualFamilyResponsesHits += 1;
+      const payload = JSON.parse(body);
+      if (payload.model === 'gpt-5.5') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'resp_dual', object: 'response', output_text: 'responses-ok' }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'wrong model for responses' }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      dualFamilyChatHits += 1;
+      const payload = JSON.parse(body);
+      if (payload.model === 'gpt-5.5') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'chat_dual', object: 'chat.completion', choices: [{ message: { role: 'assistant', content: 'chat-ok' } }] }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'wrong model for chat' }));
+      return;
+    }
+    if (req.url.endsWith('/messages')) {
+      dualFamilyMessagesHits += 1;
+      const payload = JSON.parse(body);
+      if (payload.model === 'claude-opus-4-8') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'msg_dual', type: 'message', role: 'assistant', model: 'claude-opus-4-8', content: [{ type: 'text', text: 'messages-ok' }], usage: { input_tokens: 1, output_tokens: 1 } }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'wrong model for messages' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  const dualFamilyInfo = await listen(dualFamilyUpstream);
+
+  try {
+    const dualFamilyPool = createTestPool({
+      server: { auth_token_env: 'TEST_POOL_TOKEN', admin_auth_token_env: 'TEST_POOL_TOKEN', port: 0 },
+      model_override: 'gpt-5.5',
+      health: { enabled: false, path: '/models', timeout_ms: 1000 },
+      upstreams: [
+        { name: 'dual-family-site', api: 'both', base_url: `${dualFamilyInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+      ]
+    });
+    const dualFamilyPoolInfo = await listen(dualFamilyPool);
+
+    // Probe should verify OpenAI family (responses) AND Anthropic family using their respective models.
+    // The key fix: anthropic_messages is probed with a Claude model even though model_override is gpt-5.5.
+    const probeResult = await postJson(`${dualFamilyPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      probeResult.response.status !== 200 ||
+      probeResult.json.probe_ok !== true ||
+      probeResult.json.probe_status !== 'ok' ||
+      dualFamilyResponsesHits !== 1 ||
+      dualFamilyMessagesHits !== 1
+    ) {
+      throw new Error(`expected dual-family probe to hit responses (gpt) and messages (claude): ${probeResult.text} responses=${dualFamilyResponsesHits} chat=${dualFamilyChatHits} messages=${dualFamilyMessagesHits}`);
+    }
+
+    const statusAfterProbe = (await getJson(`${dualFamilyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const dualFamilySite = statusAfterProbe.upstreams.find((u) => u.name === 'dual-family-site');
+    if (
+      dualFamilySite?.capabilities?.responses?.status !== 'verified' ||
+      dualFamilySite?.capabilities?.responses?.model !== 'gpt-5.5' ||
+      dualFamilySite?.capabilities?.anthropic_messages?.status !== 'verified' ||
+      dualFamilySite?.capabilities?.anthropic_messages?.model !== 'claude-opus-4-8'
+    ) {
+      throw new Error(`expected dual-family upstream to verify both families with correct per-protocol models: ${JSON.stringify(dualFamilySite?.capabilities)}`);
+    }
+
+    await close(dualFamilyPool);
+  } finally {
+    await close(dualFamilyUpstream);
+  }
+
+  // ── Test 2: Missing representative model skips probe gracefully ──
+  // model_override is Claude AND upstream lists only Claude models → no model to test OpenAI protocols.
+  // Those protocols must NOT be probed (and so NOT marked failed), while anthropic_messages verifies.
+  let claudeOnlyMessagesHits = 0;
+  let claudeOnlyOpenAiHits = 0;
+  const claudeOnlyUpstream = createFakeUpstream('claude-only', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'claude-opus-4-8' }] }));
+      return;
+    }
+    if (req.url.endsWith('/messages')) {
+      claudeOnlyMessagesHits += 1;
+      const payload = JSON.parse(body);
+      if (payload.model === 'claude-opus-4-8') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'msg_ok', type: 'message', role: 'assistant', model: 'claude-opus-4-8', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 1, output_tokens: 1 } }));
+        return;
+      }
+    }
+    if (req.url.endsWith('/responses') || req.url.endsWith('/chat/completions')) {
+      claudeOnlyOpenAiHits += 1;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  const claudeOnlyInfo = await listen(claudeOnlyUpstream);
+
+  try {
+    const claudeOnlyPool = createTestPool({
+      server: { auth_token_env: 'TEST_POOL_TOKEN', admin_auth_token_env: 'TEST_POOL_TOKEN', port: 0 },
+      model_override: 'claude-opus-4-8',
+      health: { enabled: false, path: '/models', timeout_ms: 1000 },
+      upstreams: [
+        { name: 'claude-only-site', api: 'both', base_url: `${claudeOnlyInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+      ]
+    });
+    const claudeOnlyPoolInfo = await listen(claudeOnlyPool);
+
+    // Override is Claude and only Claude models discovered → OpenAI protocols have no representative model.
+    const probeResult = await postJson(`${claudeOnlyPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      probeResult.response.status !== 200 ||
+      probeResult.json.probe_ok !== true ||
+      claudeOnlyMessagesHits !== 1 ||
+      claudeOnlyOpenAiHits !== 0
+    ) {
+      throw new Error(`expected claude-only probe to hit only messages and skip OpenAI protocols: ${probeResult.text} messages=${claudeOnlyMessagesHits} openai=${claudeOnlyOpenAiHits}`);
+    }
+
+    const statusAfterProbe = (await getJson(`${claudeOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const claudeOnlySite = statusAfterProbe.upstreams.find((u) => u.name === 'claude-only-site');
+    if (
+      claudeOnlySite?.capabilities?.anthropic_messages?.status !== 'verified' ||
+      claudeOnlySite?.capabilities?.responses?.status === 'failed' ||
+      claudeOnlySite?.capabilities?.responses?.status === 'unsupported' ||
+      claudeOnlySite?.capabilities?.chat_completions?.status === 'failed' ||
+      claudeOnlySite?.capabilities?.chat_completions?.status === 'unsupported'
+    ) {
+      throw new Error(`expected missing representative model not to mark OpenAI protocols failed/unsupported: ${JSON.stringify(claudeOnlySite?.capabilities)}`);
+    }
+
+    await close(claudeOnlyPool);
+  } finally {
+    await close(claudeOnlyUpstream);
+  }
+
+  // ── Test 3: Single-family upstreams backward compatibility ──
+  // Existing openai-only and anthropic-only upstreams should probe exactly as before
+  let openaiOnlyResponsesHits = 0;
+  let openaiOnlyChatHits = 0;
+  const openaiOnlyUpstream = createFakeUpstream('openai-only', ({ req, res, body }) => {
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-test' }] }));
+      return;
+    }
+    if (req.url.endsWith('/responses')) {
+      openaiOnlyResponsesHits += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'resp_ok', object: 'response', output_text: 'ok' }));
+      return;
+    }
+    if (req.url.endsWith('/chat/completions')) {
+      openaiOnlyChatHits += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'chat_ok', object: 'chat.completion', choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  const openaiOnlyInfo = await listen(openaiOnlyUpstream);
+
+  try {
+    const openaiOnlyPool = createTestPool({
+      server: { auth_token_env: 'TEST_POOL_TOKEN', admin_auth_token_env: 'TEST_POOL_TOKEN', port: 0 },
+      model_override: 'gpt-test',
+      health: { enabled: false, path: '/models', timeout_ms: 1000 },
+      upstreams: [
+        { name: 'openai-only-site', api: 'openai', base_url: `${openaiOnlyInfo.url}/v1`, weight: 10, keys: [{ env: 'TEST_UPSTREAM_KEY' }] }
+      ]
+    });
+    const openaiOnlyPoolInfo = await listen(openaiOnlyPool);
+
+    const probeResult = await postJson(`${openaiOnlyPoolInfo.url}/pool/probe`, 'pool-secret', {});
+    if (
+      probeResult.response.status !== 200 ||
+      probeResult.json.probe_ok !== true ||
+      openaiOnlyResponsesHits !== 1 ||
+      openaiOnlyChatHits !== 0
+    ) {
+      throw new Error(`expected openai-only upstream to probe responses (and skip chat on success): responses=${openaiOnlyResponsesHits} chat=${openaiOnlyChatHits}`);
+    }
+
+    const statusAfterProbe = (await getJson(`${openaiOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
+    const openaiOnlySite = statusAfterProbe.upstreams.find((u) => u.name === 'openai-only-site');
+    if (
+      openaiOnlySite?.capabilities?.responses?.status !== 'verified' ||
+      openaiOnlySite?.health?.state !== 'ok'
+    ) {
+      throw new Error(`expected openai-only backward compatibility: ${JSON.stringify(openaiOnlySite)}`);
+    }
+
+    await close(openaiOnlyPool);
+  } finally {
+    await close(openaiOnlyUpstream);
+  }
+
+  console.log('smoke ok: auth guard, fallback, upstream enable toggle, token usage accounting, chat completions fallback, availability scoring, automatic probe recovery, billing accounting, billing main-path isolation, billing huge-limit guard, billing blocked detection, runtime add, config-preserving edit, JSON import, Codex OAuth import/forwarding, Codex curl debugger, model discovery, anthropic model probe, model override, stream-error cooldown, 400/522 site fallback, recent requests, immediate health probe, per-protocol representative model selection, graceful skip when no representative model, and single-family backward compatibility all passed');
 } finally {
   await close(codexOauthProxy);
   await close(codexOauthCompactOnlyBackend);

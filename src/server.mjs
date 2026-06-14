@@ -11632,11 +11632,24 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     weight: upstream.weight,
     selection_weight: roundedSelectionValue(selectionWeight),
     selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, at)) : 0,
-    representative_availability: representativeAvailability(upstream, {
-      model: state.modelOverride,
-      protocol: 'responses',
-      at
-    }),
+    representative_availability: (() => {
+      // Choose protocol based on upstream API type and available evidence
+      if (upstream.api === 'anthropic') {
+        return representativeAvailability(upstream, { model: state.modelOverride, protocol: 'anthropic_messages', at });
+      }
+      if (upstream.api === 'openai') {
+        return representativeAvailability(upstream, { model: state.modelOverride, protocol: 'responses', at });
+      }
+      // For 'both', try both protocols and use the one with more evidence
+      const responsesResult = representativeAvailability(upstream, { model: state.modelOverride, protocol: 'responses', at });
+      const anthropicResult = representativeAvailability(upstream, { model: state.modelOverride, protocol: 'anthropic_messages', at });
+      // Prefer verified over unverified, then fresh over stale, then higher evidence count
+      if (anthropicResult.verified && !responsesResult.verified) return anthropicResult;
+      if (responsesResult.verified && !anthropicResult.verified) return responsesResult;
+      if (anthropicResult.fresh_evidence_count > responsesResult.fresh_evidence_count) return anthropicResult;
+      if (responsesResult.fresh_evidence_count > anthropicResult.fresh_evidence_count) return responsesResult;
+      return anthropicResult.evidence_count > responsesResult.evidence_count ? anthropicResult : responsesResult;
+    })(),
     available,
     cooldown_ms: Math.max(0, upstream.cooldownUntil - at),
     in_flight: upstream.inFlight,

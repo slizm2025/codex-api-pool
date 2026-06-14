@@ -56,6 +56,9 @@ import {
   ProtocolProbeOrchestrator,
   HttpProbeExecutor
 } from './protocol-probe-orchestrator.mjs';
+import {
+  RequestRoutingRules
+} from './request-routing-rules.mjs';
 
 const DEFAULT_CONFIG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config.local.json');
 const DEFAULT_RETRYABLE_STATUS = [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524];
@@ -10688,7 +10691,7 @@ function dashboardHtml() {
         availabilityHistory.innerHTML = historyNode.querySelector('[data-field="availability_history"]')?.innerHTML || '';
       }
       setText(card, '[data-field="failures"]', upstream.failures);
-      setText(card, '[data-field="calls"]', upstream.stats?.attempts || 0);
+      setText(card, '[data-field="calls"]', upstream.attempts || 0);
       setText(card, '[data-field="today_tokens"]', fmtToken(upstream.usage?.today_tokens));
       setText(card, '[data-field="total_tokens"]', fmtToken(upstream.usage?.total_tokens));
       const todayTokenNode = card.querySelector('[data-field="today_tokens"]');
@@ -10822,7 +10825,7 @@ function dashboardHtml() {
             <div class="mini-line">Failures <strong data-field="failures">\${u.failures}</strong></div>
           </div>
           <div class="workbench-cell">
-            <div class="mini-line">Calls <strong data-field="calls">\${u.stats?.attempts || 0}</strong></div>
+            <div class="mini-line">Calls <strong data-field="calls">\${u.attempts || 0}</strong></div>
             <div class="mini-line">Today <strong data-field="today_tokens" title="\${esc(tokenTitle('Today', u.usage?.today_tokens))}">\${fmtToken(u.usage?.today_tokens)}</strong></div>
             <div class="mini-line">Total <strong data-field="total_tokens" title="Total \${fullToken(u.usage?.total_tokens || 0)} · Input \${fullToken(u.usage?.input_tokens || 0)} · Output \${fullToken(u.usage?.output_tokens || 0)}">\${fmtToken(u.usage?.total_tokens)}</strong></div>
           </div>
@@ -11652,6 +11655,7 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     available,
     cooldown_ms: Math.max(0, upstream.cooldownUntil - at),
     in_flight: upstream.inFlight,
+    attempts: upstream.stats.attempts,
     successes: upstream.successes,
     failures: upstream.failures,
     ewma_latency_ms: upstream.ewmaLatencyMs,

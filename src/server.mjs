@@ -4498,7 +4498,7 @@ function availabilitySummary(stats, availabilityConfig = normalizeAvailabilityCo
     failures,
     rate,
     multiplier,
-    recent: samples.map(Boolean)
+    recent: samples.map(s => s ? '1' : '0').join('')
   };
 }
 
@@ -10445,7 +10445,9 @@ function dashboardHtml() {
       const windowSize = Number(availability.window_size || 50);
       const rate = Number.isFinite(availability.rate) ? availability.rate : 0;
       const percent = Math.max(0, Math.min(100, rate * 100));
-      const history = Array.isArray(availability.recent) ? availability.recent.slice(-windowSize) : [];
+      const history = typeof availability.recent === 'string'
+        ? availability.recent.slice(-windowSize).split('').map(c => c === '1')
+        : (Array.isArray(availability.recent) ? availability.recent.slice(-windowSize) : []);
       const emptyCount = Math.max(0, windowSize - history.length);
       const dots = [
         ...history.map((ok) => \`<span class="availability-dot \${ok ? 'is-success' : 'is-failure'}"></span>\`),
@@ -10577,7 +10579,7 @@ function dashboardHtml() {
       u.availability?.failures || 0,
       u.availability?.rate ?? '',
       u.availability?.multiplier ?? '',
-      (u.availability?.recent || []).map((value) => value ? '1' : '0').join(''),
+      typeof u.availability?.recent === 'string' ? u.availability.recent : ((u.availability?.recent || []).map((value) => value ? '1' : '0').join('')),
       (u.keys || []).map((k) => \`\${k.label}:\${k.configured}\`).join(','),
       (u.keys || []).map((k) => \`\${k.label}:\${k.health?.state || ''}:\${k.health?.error || ''}:\${k.health?.warning || ''}\`).join(','),
       JSON.stringify(u.capabilities || {}),

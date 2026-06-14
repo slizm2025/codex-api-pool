@@ -356,6 +356,409 @@ test('planProbes with empty models list should skip all probes', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: Recheck Strategy Integration
+// ══════════════════════════════════════════════════════════════════════════════
+
+test('planProbes should skip unsupported protocol when no recheck needed', () => {
+  // RED: Need to integrate recheck strategy
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({
+    api: 'openai',
+    capabilities: {
+      responses: {
+        status: 'unsupported',
+        endpoint_unsupported: true,
+        checked_at: new Date(Date.now() - 10 * 60 * 1000).toISOString() // 10 min ago
+      }
+    }
+  });
+  const models = ['gpt-5.5'];
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+  const plan = orchestrator.planProbes(upstream, models, Date.now());
+
+  // Should skip responses (unsupported, no recheck needed)
+  assertEquals(plan.responses, null, 'Should skip unsupported responses when no recheck needed');
+
+  // Should plan chat_completions directly
+  assert(plan.chat_completions, 'Should plan chat_completions directly');
+  assertEquals(plan.chat_completions.model, 'gpt-5.5');
+});
+
+test('planProbes should include unsupported protocol when recheck is due', () => {
+  // RED: Need to check recheck timing
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({
+    api: 'openai',
+    capabilities: {
+      responses: {
+        status: 'unsupported',
+        endpoint_unsupported: true,
+        checked_at: new Date(Date.now() - 40 * 60 * 1000).toISOString() // 40 min ago (past 30min recheck)
+      }
+    }
+  });
+  const models = ['gpt-5.5'];
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+  const plan = orchestrator.planProbes(upstream, models, Date.now());
+
+  // Should include responses (recheck is due)
+  assert(plan.responses, 'Should include responses when recheck is due');
+  assertEquals(plan.responses.model, 'gpt-5.5');
+  assertEquals(plan.responses.reason, 'recheck');
+});
+
+test('planProbes with resolvedRequestMode=chat_completions should skip responses unless recheck', () => {
+  // RED: Need to handle resolvedRequestMode
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({
+    api: 'openai',
+    resolvedRequestMode: 'chat_completions',
+    capabilities: {
+      responses: {
+        status: 'unknown',
+        checked_at: new Date(Date.now() - 10 * 60 * 1000).toISOString() // 10 min ago
+      }
+    }
+  });
+  const models = ['gpt-5.5'];
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+  const plan = orchestrator.planProbes(upstream, models, Date.now());
+
+  // Should skip responses (resolvedRequestMode=chat_completions, no recheck)
+  assertEquals(plan.responses, null);
+
+  // Should plan chat_completions
+  assert(plan.chat_completions, 'Should plan chat_completions');
+  assertEquals(plan.chat_completions.model, 'gpt-5.5');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: Classifier Integration
+// ══════════════════════════════════════════════════════════════════════════════
+
+test('executeProbes should use classifier when provided', async () => {
+  // RED: Need to integrate classifier
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'openai' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+
+  const probeExecutor = {
+    async probeResponses() {
+      return { statusCode: 401, ok: false, body: 'Unauthorized' };
+    },
+    async probeChatCompletions() {
+      return { statusCode: 200, ok: true };
+    },
+    async probeAnthropicMessages() {
+      return { statusCode: 200, ok: true };
+    }
+  };
+
+  // Mock classifier that properly classifies 401 as auth_error
+  const mockClassifier = (result, protocol) => {
+    if (result.statusCode === 401) {
+      return { state: 'auth_error', error: 'Invalid API key' };
+    }
+    if (result.statusCode === 200) {
+      return { state: 'ok', error: '' };
+    }
+    return { state: 'server_error', error: 'Server error' };
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor, mockClassifier);
+  const plan = {
+    responses: {
+      model: 'gpt-5.5',
+      reason: 'initial',
+      fallbackToChat: false
+    },
+    chat_completions: null,
+    anthropic_messages: null
+  };
+
+  const results = await orchestrator.executeProbes(upstream, {}, {}, plan, new Date().toISOString());
+
+  // Should have responses result with proper classification
+  assert(results.responses, 'Should have responses result');
+  assertEquals(results.responses.result.statusCode, 401);
+  assertEquals(results.responses.classified.state, 'auth_error');
+  assertEquals(results.responses.classified.error, 'Invalid API key');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: Health Status Determination
+// ══════════════════════════════════════════════════════════════════════════════
+
+test('determineHealthStatus: chat ok should be chosen over responses failure', () => {
+  // RED: Need to implement determineHealthStatus
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'openai' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+
+  const probeResults = {
+    responses: {
+      result: { statusCode: 500, error: 'Server error' },
+      classified: { state: 'server_error', error: 'Server error' }
+    },
+    chat_completions: {
+      result: { statusCode: 200, body: '{"id":"test"}' },
+      classified: { state: 'ok', error: '' }
+    }
+  };
+
+  const healthStatus = orchestrator.determineHealthStatus(probeResults, 'gpt-5.5');
+
+  // Should choose chat ok over responses failure
+  assertEquals(healthStatus.state, 'ok');
+  assertEquals(healthStatus.protocol, 'chat_completions');
+  assertEquals(healthStatus.result.statusCode, 200);
+  assert(healthStatus.warning, 'Should have warning about responses failure');
+  assertEquals(healthStatus.resolvedMode, 'chat_completions');
+});
+
+test('determineHealthStatus: responses ok should be preferred', () => {
+  // RED: responses success should be preferred protocol
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'openai' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+
+  const probeResults = {
+    responses: {
+      result: { statusCode: 200, body: '{"id":"test"}' },
+      classified: { state: 'ok', error: '' }
+    }
+  };
+
+  const healthStatus = orchestrator.determineHealthStatus(probeResults, 'gpt-5.5');
+
+  // Should choose responses when ok
+  assertEquals(healthStatus.state, 'ok');
+  assertEquals(healthStatus.protocol, 'responses');
+  assertEquals(healthStatus.resolvedMode, 'responses');
+});
+
+test('determineHealthStatus: anthropic ok should be used', () => {
+  // RED: anthropic_messages success
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'anthropic' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+
+  const probeResults = {
+    anthropic_messages: {
+      result: { statusCode: 200, body: '{"id":"test"}' },
+      classified: { state: 'ok', error: '' }
+    }
+  };
+
+  const healthStatus = orchestrator.determineHealthStatus(probeResults, 'claude-opus-4-8');
+
+  // Should use anthropic_messages
+  assertEquals(healthStatus.state, 'ok');
+  assertEquals(healthStatus.protocol, 'anthropic_messages');
+  assertEquals(healthStatus.resolvedMode, undefined); // No resolvedMode for anthropic
+});
+
+test('determineHealthStatus: both failed should report both errors', () => {
+  // RED: both protocols failed
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'openai' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+  const probeExecutor = {
+    async probeResponses() { return { statusCode: 200, ok: true }; },
+    async probeChatCompletions() { return { statusCode: 200, ok: true }; },
+    async probeAnthropicMessages() { return { statusCode: 200, ok: true }; }
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor);
+
+  const probeResults = {
+    responses: {
+      result: { statusCode: 500, error: 'Server error' },
+      classified: { state: 'server_error', error: 'Server error' }
+    },
+    chat_completions: {
+      result: { statusCode: 401, error: 'Unauthorized' },
+      classified: { state: 'auth_error', error: 'Invalid API key' }
+    }
+  };
+
+  const healthStatus = orchestrator.determineHealthStatus(probeResults, 'gpt-5.5');
+
+  // Should report auth_error (more authoritative than server_error)
+  assertEquals(healthStatus.state, 'auth_error');
+  assertEquals(healthStatus.protocol, 'chat_completions');
+  assert(healthStatus.error.includes('Invalid API key'), 'Should include auth error');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: End-to-End Probe Orchestration
+// ══════════════════════════════════════════════════════════════════════════════
+
+test('probeUpstream: full orchestration flow with responses success', async () => {
+  // RED: Need to implement high-level probeUpstream method
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'openai' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+
+  const probeExecutor = {
+    async probeResponses() {
+      return { statusCode: 200, ok: true, body: '{"id":"test"}' };
+    },
+    async probeChatCompletions() {
+      return { statusCode: 200, ok: true, body: '{"id":"test"}' };
+    },
+    async probeAnthropicMessages() {
+      return { statusCode: 200, ok: true };
+    }
+  };
+
+  const mockClassifier = (result) => {
+    return result.statusCode === 200
+      ? { state: 'ok', error: '' }
+      : { state: 'server_error', error: 'probe failed' };
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor, mockClassifier);
+
+  const result = await orchestrator.probeUpstream(
+    upstream,
+    { value: 'test-key' },
+    {},
+    ['gpt-5.5'],
+    Date.now()
+  );
+
+  // Should have successful health status
+  assertEquals(result.health.state, 'ok');
+  assertEquals(result.health.protocol, 'responses');
+  assertEquals(result.health.resolvedMode, 'responses');
+
+  // Should have probe results
+  assert(result.probeResults.responses, 'Should have responses result');
+  assertEquals(result.probeResults.responses.classified.state, 'ok');
+});
+
+test('probeUpstream: fallback to chat when responses fails', async () => {
+  // RED: Test fallback logic
+  if (!ProtocolProbeOrchestrator) {
+    throw new Error('ProtocolProbeOrchestrator not implemented yet');
+  }
+
+  const upstream = createMockUpstream({ api: 'openai' });
+  const capabilityManager = new ProtocolCapabilityManager(upstream);
+
+  const probeExecutor = {
+    async probeResponses() {
+      return { statusCode: 404, ok: false, body: 'Not Found' };
+    },
+    async probeChatCompletions() {
+      return { statusCode: 200, ok: true, body: '{"id":"test"}' };
+    },
+    async probeAnthropicMessages() {
+      return { statusCode: 200, ok: true };
+    }
+  };
+
+  const mockClassifier = (result) => {
+    if (result.statusCode === 404) {
+      return { state: 'unexpected_status', error: 'endpoint not found' };
+    }
+    return result.statusCode === 200
+      ? { state: 'ok', error: '' }
+      : { state: 'server_error', error: 'probe failed' };
+  };
+
+  const orchestrator = new ProtocolProbeOrchestrator(capabilityManager, probeExecutor, mockClassifier);
+
+  const result = await orchestrator.probeUpstream(
+    upstream,
+    { value: 'test-key' },
+    {},
+    ['gpt-5.5'],
+    Date.now()
+  );
+
+  // Should fall back to chat
+  assertEquals(result.health.state, 'ok');
+  assertEquals(result.health.protocol, 'chat_completions');
+  assertEquals(result.health.resolvedMode, 'chat_completions');
+  assert(result.health.warning, 'Should have warning about responses failure');
+
+  // Should have both probe results
+  assert(result.probeResults.responses, 'Should have responses result');
+  assert(result.probeResults.chat_completions, 'Should have chat result');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Test Suite: HttpProbeExecutor (Integration with real probe functions)
 // ══════════════════════════════════════════════════════════════════════════════
 

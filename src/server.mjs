@@ -32,10 +32,29 @@ import {
   materializeRuntimeConfig,
   saveSecrets
 } from './codex-oauth/account-store.mjs';
+import {
+  PROTOCOL_CAPABILITY_NAMES,
+  NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS,
+  ProtocolCapabilityManager,
+  emptyProtocolCapability,
+  normalizeProtocolCapabilities,
+  hasProtocolCapabilityEvidence,
+  protocolCapabilityOverridesRestored,
+  mergeRestoredProtocolCapabilities,
+  normalizeDeclaredProtocolCapabilities,
+  initialProtocolCapabilities,
+  protocolCapabilityStatus,
+  protocolCapabilityStatusFromProbeState,
+  protocolCapabilityReason,
+  upstreamHasVerifiedProtocolCapability,
+  upstreamHasUserDeclaredProtocolCapability,
+  shouldRecheckProtocolCapability,
+  recordProtocolCapabilityProbe,
+  recordProtocolCapabilityRealTraffic
+} from './protocol-capability-manager.mjs';
 
 const DEFAULT_CONFIG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config.local.json');
 const DEFAULT_RETRYABLE_STATUS = [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524];
-const NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS = new Set([404, 405, 501]);
 const DEFAULT_NATIVE_RESPONSES_RECHECK_MS = 30 * 60 * 1000;
 const STREAM_ERROR_STATUS = 502;
 const HOP_BY_HOP_HEADERS = new Set([
@@ -1318,7 +1337,6 @@ function isCodexOAuthConfig(input) {
   return input?.codex_oauth === true || String(input?.request_mode || '').trim().toLowerCase() === 'codex_oauth';
 }
 
-const PROTOCOL_CAPABILITY_NAMES = ['responses', 'chat_completions', 'anthropic_messages'];
 const ROUTE_STRATEGY_NAMES = new Set([
   'responses',
   'chat_completions',
@@ -1557,195 +1575,6 @@ function requestInterfaceForUpstream(upstream = {}, activeModel = '') {
   };
 }
 
-function emptyProtocolCapability(status = 'unknown', reason = '') {
-  return {
-    status,
-    source: '',
-    probe_type: '',
-    representative: null,
-    checked_at: null,
-    model: '',
-    http_status: 0,
-    reason
-  };
-}
-
-function normalizeProtocolCapabilities(input = {}) {
-  const capabilities = {};
-  for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
-    const value = input?.[protocol] && typeof input[protocol] === 'object' && !Array.isArray(input[protocol])
-      ? input[protocol]
-      : {};
-    capabilities[protocol] = {
-      ...emptyProtocolCapability(),
-      ...value,
-      status: String(value.status || 'unknown'),
-      source: String(value.source || ''),
-      probe_type: String(value.probe_type || value.probeType || ''),
-      representative: typeof value.representative === 'boolean' ? value.representative : value.representative ?? null,
-      checked_at: value.checked_at || value.checkedAt || null,
-      model: String(value.model || ''),
-      http_status: Number(value.http_status ?? value.httpStatus ?? 0) || 0,
-      reason: String(value.reason || '')
-    };
-  }
-  return capabilities;
-}
-
-function hasProtocolCapabilityEvidence(capability = {}) {
-  return capability.status !== 'unknown' ||
-    Boolean(capability.source) ||
-    Boolean(capability.probe_type) ||
-    capability.representative !== null ||
-    Boolean(capability.checked_at) ||
-    Boolean(capability.model) ||
-    Boolean(capability.http_status) ||
-    Boolean(capability.reason);
-}
-
-function protocolCapabilityOverridesRestored(configured = {}) {
-  if (configured.source === 'user_declared') return true;
-  if (configured.status !== 'disabled') return false;
-  return configured.reason === 'upstream disabled' ||
-    configured.reason.startsWith('configured ') ||
-    configured.reason.startsWith('Codex OAuth ');
-}
-
-function mergeRestoredProtocolCapabilities(restored = {}, configured = {}) {
-  const oldCapabilities = normalizeProtocolCapabilities(restored);
-  const configuredCapabilities = normalizeProtocolCapabilities(configured);
-  const merged = {};
-  for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
-    const oldCapability = oldCapabilities[protocol];
-    const configuredCapability = configuredCapabilities[protocol];
-    merged[protocol] = protocolCapabilityOverridesRestored(configuredCapability) || !hasProtocolCapabilityEvidence(oldCapability)
-      ? configuredCapability
-      : oldCapability;
-  }
-  return normalizeProtocolCapabilities(merged);
-}
-
-function normalizeDeclaredProtocolCapabilities(input = {}) {
-  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-  const declared = {};
-  for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
-    if (!Object.prototype.hasOwnProperty.call(source, protocol)) continue;
-    const value = source[protocol];
-    let status = '';
-    let reason = '';
-    if (value === true) {
-      status = 'assumed';
-      reason = 'user declared protocol support';
-    } else if (value === false) {
-      status = 'disabled';
-      reason = 'user declared protocol disabled';
-    } else if (typeof value === 'string') {
-      const normalized = value.trim().toLowerCase();
-      if (['assumed', 'supported', 'true', 'yes', 'on'].includes(normalized)) {
-        status = 'assumed';
-        reason = 'user declared protocol support';
-      } else if (['disabled', 'false', 'no', 'off'].includes(normalized)) {
-        status = 'disabled';
-        reason = 'user declared protocol disabled';
-      } else if (normalized === 'unknown') {
-        status = 'unknown';
-        reason = 'user declared protocol unknown';
-      }
-    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const normalized = String(value.status || '').trim().toLowerCase();
-      if (normalized === 'assumed') {
-        status = 'assumed';
-        reason = String(value.reason || 'user declared protocol support');
-      } else if (normalized === 'disabled') {
-        status = 'disabled';
-        reason = String(value.reason || 'user declared protocol disabled');
-      } else if (normalized === 'unknown') {
-        status = 'unknown';
-        reason = String(value.reason || 'user declared protocol unknown');
-      }
-    }
-    if (!status) continue;
-    declared[protocol] = {
-      status,
-      source: 'user_declared',
-      probe_type: '',
-      representative: null,
-      checked_at: null,
-      model: '',
-      http_status: 0,
-      reason
-    };
-  }
-  return declared;
-}
-
-function initialProtocolCapabilities(upstream) {
-  const capabilities = normalizeProtocolCapabilities();
-  if (upstream?.enabled === false) {
-    for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
-      capabilities[protocol] = emptyProtocolCapability('disabled', 'upstream disabled');
-    }
-    return normalizeProtocolCapabilities({ ...capabilities, ...normalizeDeclaredProtocolCapabilities(upstream?.protocol_capabilities || upstream?.protocolCapabilities) });
-  }
-
-  if (isCodexOAuthConfig(upstream)) {
-    capabilities.responses = {
-      ...emptyProtocolCapability('assumed', 'configured request_mode=codex_oauth'),
-      source: 'config'
-    };
-    capabilities.chat_completions = emptyProtocolCapability('disabled', 'Codex OAuth upstream uses native Responses protocol');
-    capabilities.anthropic_messages = emptyProtocolCapability('disabled', 'Codex OAuth upstream uses native Responses protocol');
-    return capabilities;
-  }
-
-  const requestMode = normalizeRequestMode(upstream?.request_mode);
-  const api = normalizeUpstreamApi(upstream?.api, upstream?.probe_auth);
-  if (requestMode === 'responses') {
-    capabilities.responses = {
-      ...emptyProtocolCapability('assumed', 'configured request_mode=responses'),
-      source: 'config'
-    };
-    capabilities.chat_completions = emptyProtocolCapability('disabled', 'configured request_mode=responses');
-  } else if (requestMode === 'chat_completions') {
-    capabilities.responses = emptyProtocolCapability('disabled', 'configured request_mode=chat_completions');
-    capabilities.chat_completions = {
-      ...emptyProtocolCapability('assumed', 'configured request_mode=chat_completions'),
-      source: 'config'
-    };
-  }
-
-  if (api === 'anthropic') {
-    capabilities.anthropic_messages = {
-      ...emptyProtocolCapability('assumed', 'configured api=anthropic'),
-      source: 'config'
-    };
-  } else if (api === 'openai') {
-    capabilities.responses = {
-      ...emptyProtocolCapability('assumed', 'configured api=openai'),
-      source: 'config'
-    };
-    capabilities.chat_completions = {
-      ...emptyProtocolCapability('assumed', 'configured api=openai'),
-      source: 'config'
-    };
-  } else if (api === 'both') {
-    capabilities.responses = {
-      ...emptyProtocolCapability('assumed', 'configured api=both'),
-      source: 'config'
-    };
-    capabilities.chat_completions = {
-      ...emptyProtocolCapability('assumed', 'configured api=both'),
-      source: 'config'
-    };
-    capabilities.anthropic_messages = {
-      ...emptyProtocolCapability('assumed', 'configured api=both'),
-      source: 'config'
-    };
-  }
-
-  return normalizeProtocolCapabilities({ ...capabilities, ...normalizeDeclaredProtocolCapabilities(upstream?.protocol_capabilities || upstream?.protocolCapabilities) });
-}
-
 function normalizeRequestMode(value, codexOAuth = false) {
   if (codexOAuth) return 'codex_oauth';
   const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_');
@@ -1863,35 +1692,6 @@ function canUseChatCompletionsAdapter(pathname, upstream, model) {
 function isChatCompletionsOnlyMode(upstream) {
   return upstream?.requestMode === 'chat_completions' ||
     upstream?.resolvedRequestMode === 'chat_completions';
-}
-
-function protocolCapabilityStatus(upstream, protocol) {
-  return String(upstream?.capabilities?.[protocol]?.status || 'unknown');
-}
-
-function upstreamHasVerifiedProtocolCapability(upstream, protocol) {
-  return protocolCapabilityStatus(upstream, protocol) === 'verified';
-}
-
-function shouldRecheckProtocolCapability(upstream, protocol) {
-  const capability = normalizeProtocolCapabilities(upstream?.capabilities)[protocol];
-  if (!capability) return false;
-
-  // 如果是明确的端点不支持（404/405/501）或探测失败，应该定期重检
-  if (capability.endpoint_unsupported === true || capability.status === 'unsupported' || capability.status === 'failed') {
-    const lastCheckedAt = timestampMs(capability.checked_at);
-    const at = now();
-    // 每 30 分钟重检一次端点是否恢复
-    const recheckIntervalMs = 30 * 60 * 1000;
-    return at - lastCheckedAt >= recheckIntervalMs;
-  }
-
-  return false;
-}
-
-function upstreamHasUserDeclaredProtocolCapability(upstream, protocol, status = 'assumed') {
-  const capability = upstream?.capabilities?.[protocol];
-  return capability?.source === 'user_declared' && capability?.status === status;
 }
 
 const NON_REPRESENTATIVE_NATIVE_RESPONSES_PROBE_STATES = new Set(['unexpected_status', 'server_error', 'models_unsupported', 'inconclusive']);
@@ -4478,7 +4278,13 @@ function createUpstreamState(upstream, index) {
     modelSuffixStrip: normalizeModelSuffix(upstream.model_suffix_strip || upstream.modelSuffixStrip),
     probeAuth: typeof upstream.probe_auth === 'string' ? upstream.probe_auth : 'bearer',
     api: normalizeUpstreamApi(upstream.api, upstream.probe_auth),
-    capabilities: initialProtocolCapabilities(upstream),
+    capabilities: initialProtocolCapabilities({
+      enabled: upstream.enabled,
+      codexOAuth: isCodexOAuthConfig(upstream),
+      requestMode: normalizeRequestMode(upstream.request_mode),
+      api: normalizeUpstreamApi(upstream.api, upstream.probe_auth),
+      declared: upstream.protocol_capabilities || upstream.protocolCapabilities
+    }),
     probeHeaders: upstream.probe_headers && typeof upstream.probe_headers === 'object' && !Array.isArray(upstream.probe_headers)
       ? { ...upstream.probe_headers }
       : {},
@@ -7237,121 +7043,6 @@ function codexForwardOnlyProbeError(responsesClassification, chatClassification)
   const responsesError = responsesClassification?.error || `responses probe ${responsesClassification?.state || 'unknown'}`;
   const chatError = chatClassification?.error || `chat probe ${chatClassification?.state || 'unknown'}`;
   return `native Responses capability is user-declared or configured, but the standard Health Probe is not representative of real Codex traffic: ${responsesError}; ${chatError}`;
-}
-
-function protocolCapabilityStatusFromProbeState(state, statusCode = 0) {
-  if (state === 'ok') return 'verified';
-  if (state === 'advanced_curl_required' || state === 'codex_forward_only') return 'unknown';
-
-  // Transient failures → unknown (short recheck interval)
-  if (state === 'network_error' || state === 'timeout') return 'unknown';
-  if (state === 'rate_limited') return 'unknown';
-  if (state === 'server_error') return 'unknown';
-  if (state === 'inconclusive') return 'unknown';
-
-  // Hard endpoint-unsupported (404/405/501) → unsupported (long recheck interval)
-  if (NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode)) return 'unsupported';
-
-  // Other failures (auth_error, etc.) → unknown
-  return 'unknown';
-}
-
-function protocolCapabilityReason(classified, result, protocol) {
-  if (classified?.error) return classified.error;
-  if (result?.error) return result.error;
-  if (classified?.state === 'ok') return '';
-  const statusCode = Number(result?.statusCode || 0);
-  return statusCode ? `${protocol} probe returned HTTP ${statusCode}` : `${protocol} probe ${classified?.state || 'unknown'}`;
-}
-
-function recordProtocolCapabilityProbe(upstream, protocol, result, classified, {
-  checkedAt = new Date().toISOString(),
-  model = '',
-  probeType = 'model_request',
-  representative = true
-} = {}) {
-  if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
-  const state = classified?.state || classifyModelProbe(result || {}, protocol).state;
-  const statusCode = Number(result?.statusCode || 0);
-
-  // ── 明确失败检测：404/405/501 表示端点明确不支持 ──
-  const isClearEndpointUnsupported = NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode);
-
-  // ── 保护机制 1: 用户声明优先 (除非明确失败) ──
-  if (state !== 'ok' && !isClearEndpointUnsupported && upstreamHasUserDeclaredProtocolCapability(upstream, protocol)) {
-    // 用户明确声明支持，但探测失败（非明确端点不存在）→ 保留用户声明，但记录探测失败时间
-    const existing = upstream.capabilities?.[protocol];
-    if (existing?.source === 'user_declared') {
-      // 更新 checked_at 和诊断信息，但保持 assumed 状态
-      upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
-      upstream.capabilities[protocol] = {
-        ...existing,
-        checked_at: checkedAt,
-        http_status: statusCode,
-        probe_failure_reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
-        probe_failure_at: checkedAt
-      };
-    }
-    return;
-  }
-
-  // ── 保护机制 2: 真实流量验证优先 (除非明确失败) ──
-  const existing = upstream.capabilities?.[protocol];
-  if (
-    state !== 'ok' &&
-    !isClearEndpointUnsupported &&
-    existing?.status === 'verified' &&
-    existing?.source === 'real_traffic' &&
-    existing?.representative === true &&
-    String(existing?.model || '').trim() === String(model || '').trim()
-  ) {
-    // 真实流量已验证成功，探测失败（非明确端点不存在）→ 保留真实流量证据，但记录探测失败
-    upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
-    upstream.capabilities[protocol] = {
-      ...existing,
-      probe_failure_reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
-      probe_failure_at: checkedAt
-    };
-    return;
-  }
-
-  // ── 记录新的协议能力状态 ──
-  upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
-  const newStatus = protocolCapabilityStatusFromProbeState(state, statusCode);
-
-  upstream.capabilities[protocol] = {
-    status: newStatus,
-    source: 'probe',
-    probe_type: probeType,
-    representative: state === 'advanced_curl_required' || state === 'codex_forward_only' ? false : representative,
-    checked_at: checkedAt,
-    model: String(model || ''),
-    http_status: statusCode,
-    reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
-    // 如果是明确失败，标记为可重检
-    endpoint_unsupported: isClearEndpointUnsupported,
-    last_probe_state: state
-  };
-}
-
-function recordProtocolCapabilityRealTraffic(upstream, protocol, {
-  checkedAt = new Date().toISOString(),
-  model = '',
-  httpStatus = 0,
-  reason = ''
-} = {}) {
-  if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
-  upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
-  upstream.capabilities[protocol] = {
-    status: 'verified',
-    source: 'real_traffic',
-    probe_type: 'real_traffic',
-    representative: true,
-    checked_at: checkedAt,
-    model: String(model || ''),
-    http_status: Number(httpStatus || 0) || 0,
-    reason: String(reason || '')
-  };
 }
 
 function updateHealthFromRealTraffic(upstream, key, {
@@ -14259,6 +13950,14 @@ export async function loadConfig(configPath = process.env.CODEX_POOL_CONFIG || D
   return { config, configPath: resolved };
 }
 
+// Construct a ProtocolCapabilityManager wired with this server's real time and
+// probe-classification dependencies. Manager state lives on upstream.capabilities,
+// so a fresh instance per call is cheap and is never attached to the upstream
+// (avoids circular references during stats serialization).
+function capabilityManagerFor(upstream) {
+  return new ProtocolCapabilityManager(upstream, { now, timestampMs, classifyModelProbe });
+}
+
 export const __testInternals = {
   openHttpProxyTunnel,
   guardHttp2SessionSocket,
@@ -14269,7 +13968,14 @@ export const __testInternals = {
   effectiveProbeModelForUpstream,
   buildChatCompletionsFromMessages,
   chatCompletionToMessagesJson,
-  createChatToMessagesStreamAdapter
+  createChatToMessagesStreamAdapter,
+  ProtocolCapabilityManager,
+  capabilityManagerFor,
+  normalizeProtocolCapabilities,
+  initialProtocolCapabilities,
+  recordProtocolCapabilityProbe,
+  recordProtocolCapabilityRealTraffic,
+  shouldRecheckProtocolCapability
 };
 
 export async function start(configPath) {

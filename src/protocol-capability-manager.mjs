@@ -63,7 +63,8 @@ export function emptyProtocolCapability(status = 'unknown', reason = '') {
     checked_at: null,
     model: '',
     http_status: 0,
-    reason
+    reason,
+    matches_current_override: null
   };
 }
 
@@ -83,7 +84,10 @@ export function normalizeProtocolCapabilities(input = {}) {
       checked_at: value.checked_at || value.checkedAt || null,
       model: String(value.model || ''),
       http_status: Number(value.http_status ?? value.httpStatus ?? 0) || 0,
-      reason: String(value.reason || '')
+      reason: String(value.reason || ''),
+      matches_current_override: value.matches_current_override === true ? true
+        : value.matches_current_override === false ? false
+        : null
     };
   }
   return capabilities;
@@ -316,16 +320,45 @@ export function shouldRecheckProtocolCapability(upstream, protocol, {
 
 // ── Recording ─────────────────────────────────────────────────────────────────
 
+/**
+ * Calculate whether the probe/traffic model matches the current model override.
+ *
+ * @param {string} model - The model used in the probe or real traffic
+ * @param {string|null|undefined} currentModelOverride - The current model_override setting
+ * @returns {boolean|null} - true if matches, false if doesn't match, null if no override
+ */
+function calculateMatchesCurrentOverride(model, currentModelOverride) {
+  // No override set or empty string → null (not applicable)
+  if (currentModelOverride === undefined || currentModelOverride === null || String(currentModelOverride).trim() === '') {
+    return null;
+  }
+
+  // Normalize both strings for comparison
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  const normalizedOverride = String(currentModelOverride).trim().toLowerCase();
+
+  // Empty probe model → false (cannot match)
+  if (normalizedModel === '') {
+    return false;
+  }
+
+  return normalizedModel === normalizedOverride;
+}
+
 export function recordProtocolCapabilityProbe(upstream, protocol, result, classified, {
   checkedAt = new Date().toISOString(),
   model = '',
   probeType = 'model_request',
   representative = true,
-  classifyModelProbe = defaultClassifyModelProbe
+  classifyModelProbe = defaultClassifyModelProbe,
+  currentModelOverride = undefined
 } = {}) {
   if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
   const state = classified?.state || classifyModelProbe(result || {}, protocol).state;
   const statusCode = Number(result?.statusCode || 0);
+
+  // Calculate matches_current_override flag
+  const matchesOverride = calculateMatchesCurrentOverride(model, currentModelOverride);
 
   // ── Explicit failure: 404/405/501 means the endpoint definitively does not exist ──
   const isClearEndpointUnsupported = NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode);
@@ -342,7 +375,8 @@ export function recordProtocolCapabilityProbe(upstream, protocol, result, classi
         checked_at: checkedAt,
         http_status: statusCode,
         probe_failure_reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
-        probe_failure_at: checkedAt
+        probe_failure_at: checkedAt,
+        matches_current_override: matchesOverride
       };
     }
     return;
@@ -364,7 +398,8 @@ export function recordProtocolCapabilityProbe(upstream, protocol, result, classi
     upstream.capabilities[protocol] = {
       ...existing,
       probe_failure_reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
-      probe_failure_at: checkedAt
+      probe_failure_at: checkedAt,
+      matches_current_override: matchesOverride
     };
     return;
   }
@@ -384,7 +419,8 @@ export function recordProtocolCapabilityProbe(upstream, protocol, result, classi
     reason: protocolCapabilityReason({ ...(classified || {}), state }, result, protocol),
     // Mark recheckable when the endpoint is clearly unsupported.
     endpoint_unsupported: isClearEndpointUnsupported,
-    last_probe_state: state
+    last_probe_state: state,
+    matches_current_override: matchesOverride
   };
 }
 
@@ -392,10 +428,14 @@ export function recordProtocolCapabilityRealTraffic(upstream, protocol, {
   checkedAt = new Date().toISOString(),
   model = '',
   httpStatus = 0,
-  reason = ''
+  reason = '',
+  currentModelOverride = undefined
 } = {}) {
   if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return;
   upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+
+  const matchesOverride = calculateMatchesCurrentOverride(model, currentModelOverride);
+
   upstream.capabilities[protocol] = {
     status: 'verified',
     source: 'real_traffic',
@@ -404,8 +444,41 @@ export function recordProtocolCapabilityRealTraffic(upstream, protocol, {
     checked_at: checkedAt,
     model: String(model || ''),
     http_status: Number(httpStatus || 0) || 0,
-    reason: String(reason || '')
+    reason: String(reason || ''),
+    matches_current_override: matchesOverride
   };
+}
+
+// ── Health State Derivation ───────────────────────────────────────────────────
+
+/**
+ * Map probe classification state to Health State.
+ *
+ * This documents the canonical mapping between the two state machines.
+ * Extracted from probe-result-applicator.mjs and integrated here.
+ */
+export function deriveHealthFromProbe(classified, probeResult) {
+  const state = classified?.state;
+
+  if (state === 'ok') return 'ok';
+
+  // Auth/rate limit failures
+  if (state === 'auth_error') return 'auth_error';
+  if (state === 'rate_limited') return 'rate_limited';
+
+  // Server/infrastructure failures
+  if (state === 'server_error') return 'server_error';
+  if (state === 'network_error') return 'network_error';
+  if (state === 'timeout') return 'timeout';
+
+  // Special states
+  if (state === 'models_unsupported') return 'models_unsupported';
+  if (state === 'unexpected_status') return 'unexpected_status';
+  if (state === 'advanced_curl_required') return 'advanced_curl_required';
+  if (state === 'codex_forward_only') return 'codex_forward_only';
+
+  // Default: inconclusive
+  return 'inconclusive';
 }
 
 // ── OO entry point ────────────────────────────────────────────────────────────
@@ -474,6 +547,75 @@ export class ProtocolCapabilityManager {
       timestampMs: this._deps.timestampMs,
       intervalMs: this._recheckIntervalMs
     });
+  }
+
+  /**
+   * Apply a probe result to both Health State and Protocol Capability.
+   *
+   * This is the single point where we document how a probe classification maps to:
+   * 1. Protocol Capability status (via recordProtocolCapabilityProbe)
+   * 2. Health State (upstream.health, key.health)
+   * 3. Cooldown decision (should we apply failure cooldown?)
+   *
+   * Integrates functionality from probe-result-applicator.mjs.
+   *
+   * @param {object} key - The key object
+   * @param {string} protocol - Protocol name (responses/chat_completions/anthropic_messages)
+   * @param {object} probeResult - Raw probe result
+   * @param {object} classified - Classified probe result (from classifyModelProbe)
+   * @param {object} options - { checkedAt, model }
+   * @returns {object} { shouldCooldown, cooldownReason }
+   */
+  applyProbeResult(key, protocol, probeResult, classified, options = {}) {
+    const { checkedAt, model } = options;
+
+    // 1. Update Protocol Capability (via existing function)
+    recordProtocolCapabilityProbe(this.upstream, protocol, probeResult, classified, {
+      classifyModelProbe: this._deps.classifyModelProbe,
+      checkedAt,
+      model
+    });
+
+    // 2. Derive Health State from classification
+    const healthState = deriveHealthFromProbe(classified, probeResult);
+
+    // 3. Update upstream.health
+    this.upstream.health = {
+      state: healthState,
+      source: 'probe',
+      checkedAt,
+      latencyMs: probeResult.latencyMs || 0,
+      httpStatus: probeResult.statusCode || 0,
+      error: healthState === 'ok' ? '' : (classified.error || probeResult.error || ''),
+      warning: '',
+      models: this.upstream.health?.models || [],
+      modelsCount: this.upstream.health?.modelsCount || 0,
+      keyLabel: key?.label || null,
+      probeModel: model || ''
+    };
+
+    // 4. Update key.health
+    if (key) {
+      key.health = {
+        state: healthState,
+        source: 'probe',
+        checkedAt,
+        latencyMs: probeResult.latencyMs || 0,
+        httpStatus: probeResult.statusCode || 0,
+        error: healthState === 'ok' ? '' : (classified.error || probeResult.error || ''),
+        warning: '',
+        probeModel: model || ''
+      };
+    }
+
+    // 5. Determine cooldown action
+    const cooldownStates = ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout'];
+    const shouldCooldown = cooldownStates.includes(healthState);
+
+    return {
+      shouldCooldown,
+      cooldownReason: shouldCooldown ? (classified.error || healthState) : ''
+    };
   }
 
   toJSON() {

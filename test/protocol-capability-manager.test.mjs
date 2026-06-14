@@ -608,6 +608,269 @@ test('ProtocolCapabilityManager.hasVerified works correctly', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: applyProbeResult - Integrated Health and Capability Management
+// ══════════════════════════════════════════════════════════════════════════════
+
+function createMockKey(overrides = {}) {
+  return {
+    value: 'test-key',
+    label: 'test-key-label',
+    health: {},
+    ...overrides
+  };
+}
+
+test('ProtocolCapabilityManager.applyProbeResult: ok probe updates both Health and Capability', () => {
+  // RED: applyProbeResult method doesn't exist yet
+  const upstream = createMockUpstream();
+  const key = createMockKey();
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(200, '{"id":"test"}', true);
+  const classified = createMockClassified('ok');
+
+  const action = manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Should update Protocol Capability to verified
+  assertEquals(manager.getStatus('responses'), 'verified');
+  assertEquals(upstream.capabilities.responses.source, 'probe');
+
+  // Should update Health State to ok
+  assertEquals(upstream.health.state, 'ok');
+  assertEquals(upstream.health.httpStatus, 200);
+  assertEquals(upstream.health.probeModel, 'gpt-5.5');
+
+  // Should update Key Health
+  assertEquals(key.health.state, 'ok');
+
+  // Should not trigger cooldown
+  assertEquals(action.shouldCooldown, false);
+});
+
+test('ProtocolCapabilityManager.applyProbeResult: auth_error probe triggers cooldown', () => {
+  const upstream = createMockUpstream();
+  const key = createMockKey();
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(401, 'Unauthorized', false);
+  const classified = createMockClassified('auth_error', 'Invalid API key');
+
+  const action = manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Should update Protocol Capability to unknown (auth_error maps to unknown)
+  assertEquals(manager.getStatus('responses'), 'unknown');
+
+  // Should update Health State to auth_error
+  assertEquals(upstream.health.state, 'auth_error');
+  assertEquals(upstream.health.httpStatus, 401);
+  assertEquals(upstream.health.error, 'Invalid API key');
+
+  // Should update Key Health
+  assertEquals(key.health.state, 'auth_error');
+
+  // Should trigger cooldown
+  assertEquals(action.shouldCooldown, true);
+  assert(action.cooldownReason, 'Should have cooldown reason');
+});
+
+test('ProtocolCapabilityManager.applyProbeResult: network_error probe triggers cooldown', () => {
+  const upstream = createMockUpstream();
+  const key = createMockKey();
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(0, '', false);
+  const classified = createMockClassified('network_error', 'ECONNREFUSED');
+
+  const action = manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Should update Protocol Capability to unknown
+  assertEquals(manager.getStatus('responses'), 'unknown');
+
+  // Should update Health State to network_error
+  assertEquals(upstream.health.state, 'network_error');
+  assertEquals(upstream.health.error, 'ECONNREFUSED');
+
+  // Should trigger cooldown
+  assertEquals(action.shouldCooldown, true);
+});
+
+test('ProtocolCapabilityManager.applyProbeResult: server_error probe triggers cooldown', () => {
+  const upstream = createMockUpstream();
+  const key = createMockKey();
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(500, 'Internal Server Error', false);
+  const classified = createMockClassified('server_error', 'Server error');
+
+  const action = manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Should update Protocol Capability to unknown
+  assertEquals(manager.getStatus('responses'), 'unknown');
+
+  // Should update Health State to server_error
+  assertEquals(upstream.health.state, 'server_error');
+  assertEquals(upstream.health.httpStatus, 500);
+
+  // Should trigger cooldown
+  assertEquals(action.shouldCooldown, true);
+});
+
+test('ProtocolCapabilityManager.applyProbeResult: inconclusive probe does NOT trigger cooldown', () => {
+  const upstream = createMockUpstream();
+  const key = createMockKey();
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(400, 'Bad Request', false);
+  const classified = createMockClassified('inconclusive', 'Ambiguous response');
+
+  const action = manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Should update Health State to inconclusive
+  assertEquals(upstream.health.state, 'inconclusive');
+
+  // Should NOT trigger cooldown (inconclusive is not in cooldown list)
+  assertEquals(action.shouldCooldown, false);
+});
+
+test('ProtocolCapabilityManager.applyProbeResult: synchronizes timestamps and models', () => {
+  const upstream = createMockUpstream();
+  const key = createMockKey();
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(200, '{"id":"test"}', true);
+  const classified = createMockClassified('ok');
+
+  manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Both Capability and Health should have same timestamp
+  assertEquals(upstream.capabilities.responses.checked_at, '2026-01-01T00:00:00Z');
+  assertEquals(upstream.health.checkedAt, '2026-01-01T00:00:00Z');
+
+  // Both should reference same model
+  assertEquals(upstream.capabilities.responses.model, 'gpt-5.5');
+  assertEquals(upstream.health.probeModel, 'gpt-5.5');
+});
+
+test('ProtocolCapabilityManager.applyProbeResult: updates key health and references key label', () => {
+  const upstream = createMockUpstream();
+  const key = createMockKey({ label: 'my-key-label' });
+  const manager = new ProtocolCapabilityManager(upstream);
+
+  const probeResult = createMockProbeResult(200, '{"id":"test"}', true);
+  const classified = createMockClassified('ok');
+
+  manager.applyProbeResult(key, 'responses', probeResult, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  // Key health should be updated
+  assertEquals(key.health.state, 'ok');
+  assertEquals(key.health.probeModel, 'gpt-5.5');
+
+  // Upstream health should reference key label
+  assertEquals(upstream.health.keyLabel, 'my-key-label');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: matches_current_override flag (Phase 2)
+// ══════════════════════════════════════════════════════════════════════════════
+
+test('recordProtocolCapabilityProbe: matches_current_override when models match', () => {
+  const upstream = createMockUpstream();
+  const result = createMockProbeResult(200, 'OK', true);
+  const classified = createMockClassified('ok');
+
+  recordProtocolCapabilityProbe(upstream, 'responses', result, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5',
+    currentModelOverride: 'gpt-5.5'  // Same as probe model
+  });
+
+  assertEquals(upstream.capabilities.responses.status, 'verified');
+  assertEquals(upstream.capabilities.responses.model, 'gpt-5.5');
+  assertEquals(upstream.capabilities.responses.matches_current_override, true);
+});
+
+test('recordProtocolCapabilityProbe: matches_current_override=false when models differ', () => {
+  const upstream = createMockUpstream();
+  const result = createMockProbeResult(200, 'OK', true);
+  const classified = createMockClassified('ok');
+
+  recordProtocolCapabilityProbe(upstream, 'responses', result, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'claude-opus-4-8',
+    currentModelOverride: 'gpt-5.5'  // Different
+  });
+
+  assertEquals(upstream.capabilities.responses.status, 'verified');
+  assertEquals(upstream.capabilities.responses.model, 'claude-opus-4-8');
+  assertEquals(upstream.capabilities.responses.matches_current_override, false);
+});
+
+test('recordProtocolCapabilityProbe: matches_current_override=null when no override', () => {
+  const upstream = createMockUpstream();
+  const result = createMockProbeResult(200, 'OK', true);
+  const classified = createMockClassified('ok');
+
+  recordProtocolCapabilityProbe(upstream, 'responses', result, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5',
+    currentModelOverride: null  // No override set
+  });
+
+  assertEquals(upstream.capabilities.responses.status, 'verified');
+  assertEquals(upstream.capabilities.responses.matches_current_override, null);
+});
+
+test('recordProtocolCapabilityProbe: matches_current_override=null when override is empty string', () => {
+  const upstream = createMockUpstream();
+  const result = createMockProbeResult(200, 'OK', true);
+  const classified = createMockClassified('ok');
+
+  recordProtocolCapabilityProbe(upstream, 'responses', result, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5',
+    currentModelOverride: ''  // Empty string
+  });
+
+  assertEquals(upstream.capabilities.responses.matches_current_override, null);
+});
+
+test('recordProtocolCapabilityRealTraffic: also tracks matches_current_override', () => {
+  const upstream = createMockUpstream();
+
+  recordProtocolCapabilityRealTraffic(upstream, 'responses', {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5',
+    httpStatus: 200,
+    currentModelOverride: 'gpt-5.5'
+  });
+
+  assertEquals(upstream.capabilities.responses.status, 'verified');
+  assertEquals(upstream.capabilities.responses.source, 'real_traffic');
+  assertEquals(upstream.capabilities.responses.matches_current_override, true);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Test Summary
 // ══════════════════════════════════════════════════════════════════════════════
 

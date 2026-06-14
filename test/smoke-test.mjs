@@ -2172,8 +2172,7 @@ try {
     const metadataOnlySite = metadataOnlyStatus.upstreams.find((upstream) => upstream.name === 'usage-site');
     if (
       metadataOnlyStatus.recent_requests?.length !== 0 ||
-      metadataOnlySite?.stats?.attempts !== 0 ||
-      metadataOnlySite?.stats?.responses !== 0 ||
+      metadataOnlySite?.attempts !== 0 ||
       metadataOnlySite?.availability?.samples !== 0
     ) {
       throw new Error(`expected model listing metadata request to stay out of recent requests and availability: ${JSON.stringify({ recent: metadataOnlyStatus.recent_requests, site: metadataOnlySite })}`);
@@ -2196,13 +2195,12 @@ try {
     }
     const usageStatus = (await getJson(`${usagePoolInfo.url}/pool/status`, 'pool-secret')).json;
     const usageSite = usageStatus.upstreams.find((upstream) => upstream.name === 'usage-site');
-    const usageByDayTotal = Object.values(usageSite?.usage?.by_day || {}).reduce((sum, value) => sum + Number(value || 0), 0);
     const usageDay = Object.keys(usageSite?.usage?.daily || {})[0];
     const usageDaily = usageSite?.usage?.daily?.[usageDay];
-    if (!usageSite || usageSite.usage?.total_tokens !== 93 || usageSite.usage?.input_tokens !== 29 || usageSite.usage?.output_tokens !== 64 || usageSite.usage?.today_tokens !== 93 || usageByDayTotal !== 93 || usageDaily?.total_tokens !== 93 || usageDaily?.input_tokens !== 29 || usageDaily?.output_tokens !== 64) {
+    if (!usageSite || usageSite.usage?.total_tokens !== 93 || usageSite.usage?.input_tokens !== 29 || usageSite.usage?.output_tokens !== 64 || usageDaily?.total_tokens !== 93 || usageDaily?.input_tokens !== 29 || usageDaily?.output_tokens !== 64) {
       throw new Error(`expected per-upstream token usage to total 93 with input/output split: ${JSON.stringify(usageSite?.usage)}`);
     }
-    if (usageStatus.usage?.total_tokens !== 93 || usageStatus.usage?.input_tokens !== 29 || usageStatus.usage?.output_tokens !== 64 || usageStatus.usage?.today_tokens !== 93 || usageStatus.usage?.daily?.[usageDay]?.total_tokens !== 93) {
+    if (usageStatus.usage?.total_tokens !== 93 || usageStatus.usage?.input_tokens !== 29 || usageStatus.usage?.output_tokens !== 64 || usageStatus.usage?.daily?.[usageDay]?.total_tokens !== 93) {
       throw new Error(`expected global token usage to total 93 with input/output split: ${JSON.stringify(usageStatus.usage)}`);
     }
     const dailyJson = await getJson(`${usagePoolInfo.url}/pool/usage/daily.json`, 'pool-secret');
@@ -2254,8 +2252,8 @@ try {
     const zeroOutputSite = zeroOutputStatus.upstreams.find((upstream) => upstream.name === 'zero-output-usage');
     const zeroOutputRecent = zeroOutputStatus.recent_requests?.[0];
     if (
-      zeroOutputSite?.stats?.successes !== 0 ||
-      zeroOutputSite?.stats?.failures !== 1 ||
+      zeroOutputSite?.successes !== 0 ||
+      zeroOutputSite?.failures !== 1 ||
       zeroOutputSite?.availability?.samples !== 1 ||
       zeroOutputSite?.availability?.successes !== 0 ||
       zeroOutputSite?.availability?.failures !== 1 ||

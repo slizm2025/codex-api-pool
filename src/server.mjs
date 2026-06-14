@@ -52,6 +52,10 @@ import {
   recordProtocolCapabilityProbe,
   recordProtocolCapabilityRealTraffic
 } from './protocol-capability-manager.mjs';
+import {
+  ProtocolProbeOrchestrator,
+  HttpProbeExecutor
+} from './protocol-probe-orchestrator.mjs';
 
 const DEFAULT_CONFIG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config.local.json');
 const DEFAULT_RETRYABLE_STATUS = [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524];
@@ -1173,15 +1177,32 @@ function representativeAvailability(upstream, {
   const evidence = [];
   for (const key of upstream?.keys || []) {
     const byModel = key?.representativeEvidence?.[protocol] || {};
-    const item = normalizedModel ? byModel[normalizedModel] : null;
-    if (!item) continue;
-    const checkedAtMs = Date.parse(item.checked_at || '');
-    evidence.push({
-      keyLabel: key.label || '',
-      source: String(item.source || ''),
-      checkedAtMs: Number.isFinite(checkedAtMs) ? checkedAtMs : 0,
-      fresh: representativeEvidenceFresh(item, at)
-    });
+
+    if (normalizedModel) {
+      // Specific model: collect evidence for that model only
+      const item = byModel[normalizedModel];
+      if (!item) continue;
+      const checkedAtMs = Date.parse(item.checked_at || '');
+      evidence.push({
+        keyLabel: key.label || '',
+        source: String(item.source || ''),
+        checkedAtMs: Number.isFinite(checkedAtMs) ? checkedAtMs : 0,
+        fresh: representativeEvidenceFresh(item, at)
+      });
+    } else {
+      // No model specified: aggregate evidence across ALL models
+      for (const [modelName, item] of Object.entries(byModel)) {
+        if (!item) continue;
+        const checkedAtMs = Date.parse(item.checked_at || '');
+        evidence.push({
+          keyLabel: key.label || '',
+          modelName: modelName,
+          source: String(item.source || ''),
+          checkedAtMs: Number.isFinite(checkedAtMs) ? checkedAtMs : 0,
+          fresh: representativeEvidenceFresh(item, at)
+        });
+      }
+    }
   }
   const freshEvidence = evidence.filter((item) => item.fresh);
   const latest = evidence
@@ -1195,6 +1216,7 @@ function representativeAvailability(upstream, {
   return {
     protocol,
     model: normalizedModel,
+    aggregated: !normalizedModel,
     state,
     verified: freshEvidence.length > 0,
     fresh_evidence_count: freshEvidence.length,

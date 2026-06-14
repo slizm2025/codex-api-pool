@@ -6218,21 +6218,15 @@ function tokenDailyPayload(usage) {
 
 function usagePayload(stats, today = localDateKey()) {
   const usage = ensureTokenUsage(stats);
-  const todayEntry = tokenDailyEntry(usage, today);
   return {
     total_tokens: usage.totalTokens,
     input_tokens: usage.inputTokens,
     output_tokens: usage.outputTokens,
-    today_tokens: todayEntry.total_tokens,
-    today_input_tokens: todayEntry.input_tokens,
-    today_output_tokens: todayEntry.output_tokens,
-    by_day: { ...usage.byDay },
     daily: tokenDailyPayload(usage)
   };
 }
 
 function aggregateUsage(upstreams, today = localDateKey()) {
-  const byDay = {};
   const daily = {};
   let totalTokens = 0;
   let inputTokens = 0;
@@ -6242,9 +6236,6 @@ function aggregateUsage(upstreams, today = localDateKey()) {
     totalTokens += usage.totalTokens;
     inputTokens += usage.inputTokens;
     outputTokens += usage.outputTokens;
-    for (const [day, value] of Object.entries(usage.byDay)) {
-      byDay[day] = numberFromUnknown(byDay[day]) + numberFromUnknown(value);
-    }
     for (const day of new Set([...Object.keys(usage.byDay || {}), ...Object.keys(usage.daily || {})])) {
       const entry = tokenDailyEntry(usage, day);
       const target = daily[day] || { total_tokens: 0, input_tokens: 0, output_tokens: 0 };
@@ -6254,15 +6245,10 @@ function aggregateUsage(upstreams, today = localDateKey()) {
       daily[day] = target;
     }
   }
-  const todayEntry = daily[today] || { total_tokens: numberFromUnknown(byDay[today]), input_tokens: 0, output_tokens: 0 };
   return {
     total_tokens: totalTokens,
     input_tokens: inputTokens,
     output_tokens: outputTokens,
-    today_tokens: todayEntry.total_tokens,
-    today_input_tokens: todayEntry.input_tokens,
-    today_output_tokens: todayEntry.output_tokens,
-    by_day: byDay,
     daily
   };
 }
@@ -9545,6 +9531,20 @@ function dashboardHtml() {
     const deletingUpstreams = new Set();
     let formClaudeCheck = null;
     adminTokenInput.value = adminToken;
+
+    // Helper functions for usage data
+    const today = () => new Date().toISOString().split('T')[0];
+    const getTodayUsage = (usage) => {
+      if (!usage || !usage.daily) return { total_tokens: 0, input_tokens: 0, output_tokens: 0 };
+      return usage.daily[today()] || { total_tokens: 0, input_tokens: 0, output_tokens: 0 };
+    };
+    const dailyToByDay = (usage) => {
+      if (!usage || !usage.daily) return {};
+      return Object.fromEntries(
+        Object.entries(usage.daily).map(([day, entry]) => [day, entry.total_tokens || 0])
+      );
+    };
+
     const authHeaders = () => adminToken ? { authorization: \`Bearer \${adminToken}\` } : {};
     const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char]));
     const ICON_PATHS = {
@@ -10223,16 +10223,15 @@ function dashboardHtml() {
         };
       }
       return {
-        total: Number(usage.by_day?.[day] || 0),
+        total: 0,
         input: 0,
         output: 0
       };
     }
     function dailyUsageRows(data = {}, ups = []) {
-      const days = new Set(Object.keys(data.usage?.daily || {}).concat(Object.keys(data.usage?.by_day || {})));
+      const days = new Set(Object.keys(data.usage?.daily || {}));
       for (const upstream of ups) {
         Object.keys(upstream.usage?.daily || {}).forEach((day) => days.add(day));
-        Object.keys(upstream.usage?.by_day || {}).forEach((day) => days.add(day));
       }
       return [...days].sort((a, b) => b.localeCompare(a)).slice(0, 14).map((day) => {
         const total = dailyEntry(data.usage || {}, day);
@@ -10557,11 +10556,11 @@ function dashboardHtml() {
       u.enabled,
       u.quarantined ? 'quarantined' : 'active',
       u.weight,
-      u.usage?.today_tokens || 0,
+      getTodayUsage(u.usage).total_tokens,
       u.usage?.total_tokens || 0,
       u.usage?.input_tokens || 0,
       u.usage?.output_tokens || 0,
-      JSON.stringify(u.usage?.by_day || {}),
+      JSON.stringify(dailyToByDay(u.usage)),
       u.billing?.state || '',
       u.billing?.balance_amount ?? '',
       u.billing?.used_amount ?? '',
@@ -10603,7 +10602,8 @@ function dashboardHtml() {
       }).join('');
     }
     function usageDaysHtml(upstream) {
-      const entries = Object.entries(upstream.usage?.by_day || {})
+      const entries = Object.entries(upstream.usage?.daily || {})
+        .map(([day, entry]) => [day, entry.total_tokens || 0])
         .sort(([a], [b]) => b.localeCompare(a))
         .slice(0, 14);
       return entries.length
@@ -10692,10 +10692,11 @@ function dashboardHtml() {
       }
       setText(card, '[data-field="failures"]', upstream.failures);
       setText(card, '[data-field="calls"]', upstream.attempts || 0);
-      setText(card, '[data-field="today_tokens"]', fmtToken(upstream.usage?.today_tokens));
+      const todayUsage = getTodayUsage(upstream.usage);
+      setText(card, '[data-field="today_tokens"]', fmtToken(todayUsage.total_tokens));
       setText(card, '[data-field="total_tokens"]', fmtToken(upstream.usage?.total_tokens));
       const todayTokenNode = card.querySelector('[data-field="today_tokens"]');
-      if (todayTokenNode) todayTokenNode.title = tokenTitle('Today', upstream.usage?.today_tokens);
+      if (todayTokenNode) todayTokenNode.title = tokenTitle('Today', todayUsage.total_tokens);
       const totalTokenNode = card.querySelector('[data-field="total_tokens"]');
       if (totalTokenNode) totalTokenNode.title = \`Total \${fullToken(upstream.usage?.total_tokens || 0)} · Input \${fullToken(upstream.usage?.input_tokens || 0)} · Output \${fullToken(upstream.usage?.output_tokens || 0)}\`;
       setText(card, '[data-field="billing_state"]', upstream.billing?.state || 'unknown');
@@ -10826,7 +10827,7 @@ function dashboardHtml() {
           </div>
           <div class="workbench-cell">
             <div class="mini-line">Calls <strong data-field="calls">\${u.attempts || 0}</strong></div>
-            <div class="mini-line">Today <strong data-field="today_tokens" title="\${esc(tokenTitle('Today', u.usage?.today_tokens))}">\${fmtToken(u.usage?.today_tokens)}</strong></div>
+            <div class="mini-line">Today <strong data-field="today_tokens" title="\${esc(tokenTitle('Today', getTodayUsage(u.usage).total_tokens))}">\${fmtToken(getTodayUsage(u.usage).total_tokens)}</strong></div>
             <div class="mini-line">Total <strong data-field="total_tokens" title="Total \${fullToken(u.usage?.total_tokens || 0)} · Input \${fullToken(u.usage?.input_tokens || 0)} · Output \${fullToken(u.usage?.output_tokens || 0)}">\${fmtToken(u.usage?.total_tokens)}</strong></div>
           </div>
           <div class="workbench-cell" data-billing-fact title="\${esc(u.billing?.error || '')}">

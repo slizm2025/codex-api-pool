@@ -7937,8 +7937,11 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
   );
 
   // Save diagnostics to state for dashboard display
-  // Always save diagnostics (success or failure) until explicitly unlocked
-  state.debugLock.last_diagnostics = diagnostics;
+  // Only save the first test diagnostics, ignore subsequent requests
+  if (!state.debugLock.first_test_completed) {
+    state.debugLock.first_test_completed = true;
+    state.debugLock.first_test_diagnostics = diagnostics;
+  }
 
   // Record to Recent Request Timeline
   rememberRequest(state, {
@@ -10338,26 +10341,36 @@ function dashboardHtml() {
       const panel = document.getElementById('debugLockDiagnostics');
       const content = document.getElementById('debugLockDiagnosticsContent');
 
-      if (!lockInfo.last_diagnostics) {
+      if (!lockInfo.first_test_diagnostics) {
         panel.style.display = 'none';
         return;
       }
 
       panel.style.display = 'block';
-      const diag = lockInfo.last_diagnostics;
+      const diag = lockInfo.first_test_diagnostics;
 
-      let html = '<div style="margin-bottom: 12px;">';
+      // Header: First test notice
+      let html = '<div style="margin-bottom: 12px; padding: 10px; background: rgba(10,100,200,0.08); border-left: 3px solid var(--accent); border-radius: 4px;">';
+      html += '<div style="font-size: 13px; font-weight: 600; margin-bottom: 4px;">🔒 首次测试结果（后续请求不会覆盖此信息）</div>';
+      html += \`<div style="font-size: 12px; color: var(--muted);">测试时间: \${new Date(diag.timestamp).toLocaleString('zh-CN')}</div>\`;
+      html += '</div>';
+
+      // Client info
+      html += '<div style="margin-bottom: 12px;">';
       html += \`<div style="margin-bottom: 8px; color: var(--muted); font-size: 13px;">\`;
       html += \`客户端协议: <strong>\${esc(diag.client_request?.protocol || 'N/A')}</strong> · \`;
       html += \`请求模型: <strong>\${esc(diag.client_request?.model || 'N/A')}</strong> · \`;
       html += \`发送模型: <strong>\${esc(diag.client_request?.model_sent || 'N/A')}</strong>\`;
       html += '</div>';
 
+      // Success/failure status
       if (diag.succeeded_with) {
         html += \`<div style="padding: 8px; background: rgba(18,128,92,0.1); border-left: 3px solid var(--good); border-radius: 4px;">\`;
         html += \`✅ 成功：协议 <strong>\${esc(diag.succeeded_with.protocol)}</strong>\`;
         if (diag.succeeded_with.adapter) {
           html += \` (使用适配器)\`;
+        } else {
+          html += \` (原生转发)\`;
         }
         html += \`</div>\`;
       } else {
@@ -10367,8 +10380,10 @@ function dashboardHtml() {
       }
       html += '</div>';
 
-      html += \`<div style="margin-bottom: 8px; color: var(--muted); font-size: 12px;">总尝试: \${diag.total_attempts} 次 · 总延迟: \${diag.total_latency_ms}ms</div>\`;
+      html += \`<div style="margin-bottom: 12px; color: var(--muted); font-size: 12px;">总尝试: \${diag.total_attempts} 次 · 总延迟: \${diag.total_latency_ms}ms</div>\`;
 
+      // Protocol attempts details
+      html += '<div style="margin-bottom: 12px;"><div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">协议尝试详情</div>';
       html += '<div style="display: grid; gap: 8px;">';
       for (const attempt of diag.attempts || []) {
         const isSuccess = attempt.status >= 200 && attempt.status < 300;
@@ -10380,28 +10395,36 @@ function dashboardHtml() {
 
         html += \`<span style="color: var(--muted);">序号:</span><strong>#\${attempt.sequence}</strong>\`;
         html += \`<span style="color: var(--muted);">协议:</span><strong>\${esc(attempt.protocol)}</strong>\`;
+
+        // Native vs adapter indicator
+        if (attempt.adapter) {
+          html += \`<span style="color: var(--muted);">类型:</span><span style="color: var(--accent);">🔀 适配器</span>\`;
+        } else {
+          html += \`<span style="color: var(--muted);">类型:</span><span style="color: var(--good);">✓ 原生转发</span>\`;
+        }
+
         html += \`<span style="color: var(--muted);">端点:</span><code style="font-size: 11px;">\${esc(attempt.endpoint)}</code>\`;
         html += \`<span style="color: var(--muted);">状态:</span><strong style="color: \${isSuccess ? 'var(--good)' : 'var(--bad)'};">\${attempt.status}</strong>\`;
         html += \`<span style="color: var(--muted);">延迟:</span><span>\${attempt.latency_ms}ms</span>\`;
 
-        if (attempt.adapter) {
-          html += \`<span style="color: var(--muted);">适配器:</span><span>✅ 已使用\`;
-          if (attempt.adapter_conversions?.length) {
-            html += \` (\${attempt.adapter_conversions.join(', ')})\`;
-          }
-          html += '</span>';
+        if (attempt.adapter && attempt.adapter_conversions?.length) {
+          html += \`<span style="color: var(--muted);">转换:</span><code style="font-size: 11px;">\${esc(attempt.adapter_conversions.join(', '))}</code>\`;
         }
 
         if (attempt.production_disabled) {
-          html += \`<span style="color: var(--muted);">生产配置:</span><span style="color: var(--warn);">⚠️ 未启用</span>\`;
+          html += \`<span style="color: var(--muted);">注意:</span><span style="color: var(--warn);">⚠️ 此适配器在生产环境未启用</span>\`;
         }
 
         if (attempt.error) {
-          html += \`<span style="color: var(--muted);">错误:</span><strong style="color: var(--bad);">\${esc(attempt.error)}</strong>\`;
+          html += \`<span style="color: var(--muted);">错误:</span><strong style="color: var(--bad); font-size: 12px;">\${esc(attempt.error)}</strong>\`;
         }
 
         if (attempt.fallback_reason) {
-          html += \`<span style="color: var(--muted);">回退原因:</span><span>\${esc(attempt.fallback_reason)}</span>\`;
+          html += \`<span style="color: var(--muted);">回退原因:</span><span style="font-size: 11px; color: var(--muted);">\${esc(attempt.fallback_reason)}</span>\`;
+        }
+
+        if (attempt.tokens) {
+          html += \`<span style="color: var(--muted);">Token:</span><span style="font-size: 11px;">输入 \${attempt.tokens.prompt_tokens} · 输出 \${attempt.tokens.completion_tokens}</span>\`;
         }
 
         html += '</div>';
@@ -10423,6 +10446,11 @@ function dashboardHtml() {
 
         html += '</div>';
       }
+      html += '</div></div>';
+
+      // Re-test instruction
+      html += '<div style="margin-top: 16px; padding: 8px; background: rgba(166,106,5,0.08); border-left: 3px solid var(--warn); border-radius: 4px; font-size: 12px; color: var(--muted);">';
+      html += '💡 提示：后续客户端重连/重试请求不会覆盖此信息。要重新测试，请先解锁，再重新锁定。';
       html += '</div>';
 
       content.innerHTML = html;

@@ -20,7 +20,9 @@ export function enableDebugLock(state, upstreamName, options = {}) {
     enabled: true,
     upstream: upstreamName,
     respect_model_override,
-    locked_at
+    locked_at,
+    first_test_completed: false,
+    first_test_diagnostics: null
   };
 
   return {
@@ -55,7 +57,8 @@ export function disableDebugLock(state) {
 
   state.debugLock = {
     enabled: false,
-    last_diagnostics: null  // Clear diagnostics when unlocking
+    first_test_completed: false,
+    first_test_diagnostics: null
   };
 
   return {
@@ -100,12 +103,13 @@ export function getDebugLockState(state) {
     upstream: state.debugLock.upstream,
     respect_model_override: state.debugLock.respect_model_override,
     locked_at: state.debugLock.locked_at,
-    locked_duration_seconds
+    locked_duration_seconds,
+    first_test_completed: state.debugLock.first_test_completed
   };
 
-  // Include last diagnostics if available
-  if (state.debugLock.last_diagnostics) {
-    result.last_diagnostics = state.debugLock.last_diagnostics;
+  // Include first test diagnostics if available
+  if (state.debugLock.first_test_diagnostics) {
+    result.first_test_diagnostics = state.debugLock.first_test_diagnostics;
   }
 
   return result;
@@ -128,7 +132,9 @@ export function buildProtocolAttemptSequence(clientProtocol) {
 
   if (clientProtocol === 'anthropic_messages') {
     return [
-      { protocol: 'anthropic_messages', adapter: false }
+      { protocol: 'anthropic_messages', adapter: false },
+      { protocol: 'chat_completions', adapter: true },
+      { protocol: 'responses', adapter: true }
     ];
   }
 

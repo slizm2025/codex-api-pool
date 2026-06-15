@@ -10321,7 +10321,8 @@ function dashboardHtml() {
         upstream: lock.upstream,
         locked_at: lock.locked_at,
         locked_duration_seconds: lock.locked_duration_seconds,
-        last_diagnostics: lock.last_diagnostics || null
+        first_test_completed: lock.first_test_completed || false,
+        first_test_diagnostics: lock.first_test_diagnostics || null
       };
     }
 

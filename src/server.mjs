@@ -7870,22 +7870,25 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
 
         // Check if successful
         if (statusCode >= 200 && statusCode < 300) {
-          succeeded = true;
-          successResponse = {
-            statusCode,
-            headers: response.headers,
-            body: responseBody
-          };
-          break;
-        }
+          // In debug lock mode, record success but continue testing other protocols
+          if (!succeeded) {
+            succeeded = true;
+            successResponse = {
+              statusCode,
+              headers: response.headers,
+              body: responseBody
+            };
+          }
+          // Don't break - continue to test remaining protocols
+        } else {
+          // Check if should fallback to next protocol
+          const { fallback, reason } = shouldFallbackToNextProtocol(statusCode, responseText);
+          attempts[attempts.length - 1].fallback_reason = reason;
 
-        // Check if should fallback
-        const { fallback, reason } = shouldFallbackToNextProtocol(statusCode, responseText);
-        attempts[attempts.length - 1].fallback_reason = reason;
-
-        if (!fallback || i === sequence.length - 1) {
-          // Don't fallback or this is the last attempt
-          break;
+          if (!fallback || i === sequence.length - 1) {
+            // Don't fallback or this is the last attempt
+            break;
+          }
         }
 
         // Continue to next protocol

@@ -29,36 +29,45 @@ We introduce **Debug Lock Mode**: a temporary, session-only diagnostic state tha
    - Disabled/Quarantined state (allows locking even quarantined/disabled Upstreams)
 
 2. **Tests protocols sequentially** according to client entry point:
-   - **Responses requests**: native Responses → adapted Chat Completions → adapted Anthropic Messages
-   - **Messages requests**: native Anthropic Messages only (no reverse adapters exist)
+   - **Codex Desktop Responses requests**: Native Responses → downgraded Chat Completions → downgraded Anthropic Messages
+   - **Claude CLI Messages requests**: Native Anthropic Messages → downgraded Chat Completions → downgraded Responses
+   - The Management Dashboard never sends a synthetic model test for Debug Lock. It only locks the Upstream; the first real client Model Interaction Request becomes the diagnostic sample.
 
-3. **Falls back conservatively** only on Endpoint Not Found Signal:
+3. **Records all protocol attempts for the first real client request**:
+   - Debug Lock continues testing the remaining Request Interfaces after success or non-protocol failure so the operator can see the locked Upstream's response for every compatible interface.
+   - Only the first real client request is saved to `first_test_diagnostics`; later client reconnects or retries are forwarded but do not overwrite the dashboard diagnostic panel.
+
+4. **Falls back conservatively in production semantics** only on Endpoint Not Found Signal:
    - HTTP 404, 405, 501
    - HTTP 400 with explicit "unsupported endpoint"/"invalid path" language in error body
    - Does NOT fallback on: 401/403 (auth), 429 (rate limit), 500/502/503 (server error), timeouts, or ambiguous 400s
    - Rationale: Non-protocol errors should be exposed immediately for diagnosis
 
-4. **Respects Streaming Boundary**: Once HTTP 200 and streaming starts, no protocol fallback (consistent with ADR-0001)
+5. **Respects Streaming Boundary**: Once HTTP 200 and streaming starts, no protocol fallback (consistent with ADR-0001)
 
-5. **Does NOT update Runtime State**:
+6. **Does NOT update Runtime State**:
    - Does NOT update: Availability, Health State, Cooldown, Protocol Capability, Usage
    - DOES record: Recent Request Timeline (with `debug_lock: true` marker)
    - Rationale: Debug traffic is forced routing, not representative of normal selection outcomes
 
-6. **Session-only (not persisted)**:
+7. **Session-only (not persisted)**:
    - Stored in `state.debugLock` (memory only)
    - Not written to `stats.local.json` or `config.local.json`
    - Cleared on Pool restart
    - Rationale: Prevents accidental production lockout if operator forgets to unlock
 
-7. **Returns complete diagnostics**:
+8. **Returns complete diagnostics**:
    - On success: Adds `X-Debug-Lock-*` response headers showing which protocols were tried
-   - On failure: Returns synthesized 502 response with per-attempt details (sequence, protocol, adapter status, HTTP status, error body, latency, fallback reason)
+   - On failure: Returns synthesized 502 response with per-attempt details (sequence, protocol, adapter status, sent model, HTTP status, error body, latency, fallback reason)
 
 ### Configuration Options
 
 When locking, operators can specify:
 - `respect_model_override` (default: true): Whether to apply Pool's Model Override or use client's original model
+
+Model selection for Debug Lock:
+- If the Dashboard has selected a Model Override, every protocol attempt sends that model.
+- If no Model Override is selected, every protocol attempt preserves the model from the first real client request.
 
 ### Adapter Behavior
 
@@ -88,7 +97,8 @@ Uses the **first valid Upstream Key** (first `keys[]` entry whose `env` variable
 - **When locked**: Top Diagnostic Bar shows prominent warning with [Unlock] button
 - **When unlocked**: Upstream Workbench rows show [🔒 Lock] button
 - **Lock confirmation dialog**: Explains behavior and shows `respect_model_override` checkbox
-- **Recent Request Timeline**: Marks debug requests with 🔒 icon and expandable per-attempt details
+- **Debug Lock Diagnostics Panel**: Displays the first real client request only, with one card per protocol attempt. Subsequent client reconnects do not refresh or overwrite the panel.
+- **Recent Request Timeline**: Marks debug requests with lock marker and per-attempt summary
 
 ## Consequences
 
@@ -116,7 +126,7 @@ Uses the **first valid Upstream Key** (first `keys[]` entry whose `env` variable
 2. **Conservative fallback** (chosen over "aggressive fallback"):
    - Exposes real problems (auth errors, rate limits) immediately
    - Avoids masking Upstream issues by trying other protocols
-   - But: Operator must manually retry if they want to see other protocol attempts after non-protocol errors
+   - But: Debug Lock diagnostics deliberately test every compatible interface for the first request, so operators can compare interface behavior without using Dashboard-generated synthetic requests
 
 3. **Session-only** (chosen over "persistent"):
    - Safer: can't accidentally leave production traffic locked

@@ -1,5 +1,33 @@
 # 更新日志
 
+## 2026-06-15 CST
+
+新增 Debug Lock 文件持久化功能，用于分析不同请求在 Debug Lock 模式下的详细诊断信息。
+
+- **文件持久化**：Debug Lock 模式下，每次请求的完整诊断信息（客户端原始请求体、Pool 修改后的请求体、完整响应体、协议尝试序列）可以自动保存到 JSON 文件。
+- **配置控制**：通过 `config.local.json` 中的 `debug_lock_persistence` 配置节控制是否启用、存储目录和文件格式。
+- **文件命名**：使用 `debug-lock-{timestamp}.json` 格式，避免文件名冲突，每个请求一个独立文件。
+- **自动目录创建**：配置的存储目录不存在时自动创建（含嵌套目录）。
+- **异步写入**：文件写入异步执行，不阻塞请求响应；写入失败仅记录错误日志。
+- **完整诊断**：每个文件包含 `client_request.original_body`（客户端发送的原始请求）、`attempts[].request_body`（发送给 upstream 的请求，可能经过协议适配）、`attempts[].response_body`（upstream 返回的响应）、协议 fallback 原因、延迟等信息。
+- **新增函数**：
+  - `persistDebugLockPage(diagnostics, options)` - 将诊断数据持久化到文件
+  - `getDebugLockPersistenceConfig(config)` - 从配置读取持久化设置
+- **测试覆盖**：单元测试（基本写入、多文件不冲突、目录自动创建、配置读取）、端到端测试（完整请求流程 + 文件验证）。
+- **文档**：新增 `docs/debug-lock-file-persistence.md`，包含配置示例、使用流程、文件格式说明、分析示例和清理方法。
+
+配置示例：
+
+```json
+{
+  "debug_lock_persistence": {
+    "enabled": true,
+    "directory": "./debug-lock-logs",
+    "format": "json"
+  }
+}
+```
+
 ## 2026-06-13 CST
 
 新增 Claude Desktop Messages API 支持（ADR-0004 Phase 1-2），让 Claude Desktop 可以通过本地 API Pool 复用多上游 failover、cooldown 和 Selection。

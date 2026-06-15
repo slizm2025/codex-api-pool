@@ -145,6 +145,7 @@ selection_score = weight * availability_multiplier
 | `docs/PROTOCOL-MAPPING.md` | 三协议族字段映射速查。 |
 | `docs/PROTOCOL_CAPABILITY_OPTIMIZATION.md` | 协议能力管理优化说明。 |
 | `docs/REQUEST_LOGGING.md` | 请求捕获与日志分析指南。 |
+| `docs/debug-lock-file-persistence.md` | Debug Lock 文件持久化配置与使用指南。 |
 | `docs/adr/0001-0005` | 架构决策记录（Streaming Boundary、Adapter 兼容模式、Probe 非权威性、Messages 支持、Debug Lock）。 |
 
 ## 快速启动

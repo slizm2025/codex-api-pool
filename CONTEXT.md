@@ -205,7 +205,7 @@ The Upstream that Debug Lock Mode forces all requests to, ignoring Health State,
 _Avoid_: pinned upstream, target upstream, fixed upstream
 
 **Protocol Attempt Sequence**:
-The ordered list of protocol and adapter combinations that Debug Lock Mode tests when the client request arrives. For Responses requests: native Responses, adapted Chat Completions, adapted Anthropic Messages. For Messages requests: native Anthropic Messages only. Each attempt proceeds only if the previous one failed with an Endpoint Not Found Signal.
+The ordered list of Request Interface and adapter combinations that Debug Lock Mode tests when the first client request arrives. For Codex Desktop Responses requests: Native Responses, downgraded Chat Completions, downgraded Anthropic Messages. For Claude CLI Messages requests: Native Messages, downgraded Chat Completions, downgraded Responses. Debug Lock uses the real client request body as the diagnostic sample, applies the current Model Override when present, otherwise preserves the Requested Model, and keeps the first diagnostic result frozen so later client reconnects do not overwrite it.
 _Avoid_: protocol fallback chain, adapter cascade, protocol retry list
 
 **Endpoint Not Found Signal**:
@@ -213,7 +213,7 @@ A response pattern (HTTP 404/405/501, or HTTP 400 with explicit unsupported-endp
 _Avoid_: protocol unsupported, endpoint failure, not found error
 
 **Debug Attempt Diagnostics**:
-The comprehensive per-attempt metadata that Debug Lock Mode returns when all protocols fail, including sequence number, protocol, endpoint URL, adapter status, HTTP status, error body, latency, fallback reason, and whether the adapter is disabled in production configuration.
+The comprehensive per-attempt metadata that Debug Lock Mode returns and displays for the first locked client request, including sequence number, Request Interface, endpoint URL, adapter status, sent model, HTTP status, error body, latency, fallback reason, conversion notes, and whether the adapter is disabled in production configuration.
 _Avoid_: debug log, attempt history, test results
 
 **Management Dashboard**:

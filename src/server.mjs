@@ -1042,7 +1042,8 @@ function codexResponsesProbeIncomingHeaders() {
   };
 }
 
-function codexResponsesProbePayload(model) {
+function codexResponsesProbePayload(model, options = {}) {
+  const stream = options.stream !== false;
   return {
     model,
     instructions: CODEX_OAUTH_TEST_INSTRUCTIONS,
@@ -1061,7 +1062,7 @@ function codexResponsesProbePayload(model) {
         ]
       }
     ],
-    stream: false,
+    stream,
     max_output_tokens: 64,
     tool_choice: 'none',
     metadata: {
@@ -1286,9 +1287,14 @@ async function readJsonBody(req, maxBytes) {
 }
 
 function rewriteModelInBody(req, body, model, options = {}) {
-  if (!model || body.length === 0) return body;
-  const payload = jsonObjectFromRequestBody(req, body, options);
+  // If no model specified, return body unchanged
+  if (!model) return body;
+
+  // Parse body (handle empty body case)
+  const payload = body.length === 0 ? {} : jsonObjectFromRequestBody(req, body, options);
   if (!payload) return body;
+
+  // Set model and return
   payload.model = model;
   return Buffer.from(JSON.stringify(payload));
 }
@@ -2897,6 +2903,70 @@ function buildChatCompletionsFromMessages(body, model, options = {}) {
   }
 
   return Buffer.from(JSON.stringify(chat));
+}
+
+function anthropicContentToResponsesContent(content, role = 'user') {
+  const textType = role === 'assistant' ? 'output_text' : 'input_text';
+  if (typeof content === 'string') {
+    return content ? [{ type: textType, text: content }] : [];
+  }
+  if (!Array.isArray(content)) return [];
+
+  const converted = [];
+  for (const block of content) {
+    if (typeof block === 'string') {
+      if (block) converted.push({ type: textType, text: block });
+      continue;
+    }
+    if (!block || typeof block !== 'object' || Array.isArray(block)) continue;
+    if (block.type === 'text' && typeof block.text === 'string') {
+      converted.push({ type: textType, text: block.text });
+    } else if (block.type === 'image' && block.source?.type === 'base64') {
+      converted.push({
+        type: 'input_image',
+        image_url: `data:${block.source.media_type || 'application/octet-stream'};base64,${block.source.data || ''}`
+      });
+    }
+  }
+  return converted;
+}
+
+function buildResponsesFromMessages(body, model, options = {}) {
+  let payload;
+  try {
+    payload = JSON.parse(body.toString('utf8') || '{}');
+  } catch (error) {
+    const err = new Error(`invalid JSON body: ${error.message}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const input = Array.isArray(payload.messages)
+    ? payload.messages.map((message) => ({
+      role: message?.role === 'assistant' ? 'assistant' : 'user',
+      content: anthropicContentToResponsesContent(message?.content, message?.role)
+    }))
+    : [];
+
+  const responses = {
+    model: model || payload.model,
+    input: input.length > 0 ? input : [{ role: 'user', content: [{ type: 'input_text', text: '' }] }],
+    stream: Boolean(payload.stream)
+  };
+
+  const systemText = anthropicSystemToChatSystem(payload.system, {
+    stripMessagesOnlyFeatures: options.stripMessagesOnlyFeatures || false
+  });
+  if (systemText) responses.instructions = systemText;
+  if (typeof payload.max_tokens === 'number') responses.max_output_tokens = payload.max_tokens;
+  if (typeof payload.temperature === 'number') responses.temperature = payload.temperature;
+  if (typeof payload.top_p === 'number') responses.top_p = payload.top_p;
+  if (Array.isArray(payload.stop_sequences)) responses.stop = payload.stop_sequences;
+  if (payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)) {
+    responses.metadata = payload.metadata;
+  }
+
+  return Buffer.from(JSON.stringify(responses));
 }
 
 // Chat Completions → Messages response conversion
@@ -7774,17 +7844,27 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
     };
 
     if (adapter) {
-      // Apply adapter conversion
       if (protocol === 'chat_completions') {
-        // Convert Responses to Chat Completions
         const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
-        requestBody = buildChatCompletionsPayload(bodyWithModel, requestedModel);
-        adapterInfo.conversions.push('responses->chat_completions');
+        if (clientProtocol === 'anthropic_messages') {
+          requestBody = buildChatCompletionsFromMessages(bodyWithModel, requestedModel, {
+            stripMessagesOnlyFeatures: true
+          });
+          adapterInfo.conversions.push('anthropic_messages->chat_completions');
+        } else {
+          requestBody = buildChatCompletionsPayload(bodyWithModel, requestedModel);
+          adapterInfo.conversions.push('responses->chat_completions');
+        }
       } else if (protocol === 'anthropic_messages') {
-        // Convert Responses to Anthropic Messages
         const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
         requestBody = buildAnthropicMessagesPayload(bodyWithModel, requestedModel);
         adapterInfo.conversions.push('responses->anthropic_messages');
+      } else if (protocol === 'responses' && clientProtocol === 'anthropic_messages') {
+        const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, { inferJsonLike: false });
+        requestBody = buildResponsesFromMessages(bodyWithModel, requestedModel, {
+          stripMessagesOnlyFeatures: true
+        });
+        adapterInfo.conversions.push('anthropic_messages->responses');
       }
     } else if (protocol !== clientProtocol) {
       // Native protocol but different from client (shouldn't happen with current logic)
@@ -7795,6 +7875,12 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
       const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
       requestBody = bodyWithModel;
     }
+
+    let attemptModelSent = requestedModel;
+    try {
+      const outgoingPayload = JSON.parse(requestBody.toString('utf8') || '{}');
+      if (typeof outgoingPayload.model === 'string') attemptModelSent = outgoingPayload.model;
+    } catch {}
 
     // Check if adapter is enabled in production config
     const productionDisabled = adapter && !isAdapterEnabledInConfig(protocol, config);
@@ -7859,6 +7945,7 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
           adapter_conversions: adapterInfo.conversions,
           adapter_stripped: adapterInfo.stripped,
           production_disabled: productionDisabled,
+          model_sent: attemptModelSent,
           url: targetUrl,
           status: statusCode,
           error: statusCode >= 400 ? `HTTP ${statusCode}` : undefined,
@@ -7900,6 +7987,7 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
           adapter_conversions: adapterInfo.conversions,
           adapter_stripped: adapterInfo.stripped,
           production_disabled: productionDisabled,
+          model_sent: attemptModelSent,
           url: targetUrl,
           status: result.statusCode || 0,
           error: result.reason || 'network error',
@@ -7916,6 +8004,7 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
         protocol,
         endpoint,
         adapter,
+        model_sent: attemptModelSent,
         url: targetUrl,
         status: 0,
         error: error.message,
@@ -7998,11 +8087,12 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
 }
 
 function isAdapterEnabledInConfig(protocol, config) {
+  const adapters = config.compatibility?.adapter_mode?.adapters || {};
   if (protocol === 'chat_completions') {
-    return config.compatibility?.adapter_mode?.adapters?.chatCompletions === true;
+    return adapters.chat_completions === true || adapters.chatCompletions === true;
   }
   if (protocol === 'anthropic_messages') {
-    return config.compatibility?.adapter_mode?.adapters?.anthropicMessages === true;
+    return adapters.anthropic_messages === true || adapters.anthropicMessages === true;
   }
   return false;
 }
@@ -8490,7 +8580,7 @@ function probeResponsesUpstream(upstream, key, config, model) {
     // strips public_prefix), so the health verdict matches real routing.
     const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
     const forwardedModel = forwardModelForUpstream(upstream, model);
-    const body = Buffer.from(JSON.stringify(codexResponsesProbePayload(forwardedModel)));
+    const body = Buffer.from(JSON.stringify(codexResponsesProbePayload(forwardedModel, { stream: true })));
     const headers = buildJsonRequestHeaders(targetUrl, key.value, {
       ...codexResponsesProbeIncomingHeaders(),
       ...(upstream.probeHeaders || {})
@@ -10406,6 +10496,9 @@ function dashboardHtml() {
         }
 
         html += \`<span style="color: var(--muted);">端点:</span><code style="font-size: 11px;">\${esc(attempt.endpoint)}</code>\`;
+        if (attempt.model_sent) {
+          html += \`<span style="color: var(--muted);">发送模型:</span><strong>\${esc(attempt.model_sent)}</strong>\`;
+        }
         html += \`<span style="color: var(--muted);">状态:</span><strong style="color: \${isSuccess ? 'var(--good)' : 'var(--bad)'};">\${attempt.status}</strong>\`;
         html += \`<span style="color: var(--muted);">延迟:</span><span>\${attempt.latency_ms}ms</span>\`;
 

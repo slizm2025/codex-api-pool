@@ -7833,7 +7833,7 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
 
         const responseBody = bodySize < maxBodySize
           ? Buffer.concat(chunks, bodySize)
-          : Buffer.concat(chunks.slice(0, 10), Math.min(bodySize, 10240)); // First 10KB for diagnostics
+          : Buffer.concat(chunks); // Full body for diagnostics in debug lock mode
 
         const responseText = responseBody.toString('utf8');
 
@@ -7862,7 +7862,7 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
           url: targetUrl,
           status: statusCode,
           error: statusCode >= 400 ? `HTTP ${statusCode}` : undefined,
-          error_body: statusCode >= 400 ? responseText.slice(0, 1000) : undefined,
+          error_body: statusCode >= 400 ? responseText : undefined,
           latency_ms: latencyMs,
           tokens,
           streaming: response.headers['content-type']?.includes('stream')
@@ -10438,11 +10438,11 @@ function dashboardHtml() {
             const parsed = JSON.parse(attempt.error_body);
             errorDisplay = JSON.stringify(parsed, null, 2);
           } catch {
-            // Not JSON, display as-is but truncate
-            errorDisplay = attempt.error_body.length > 500 ? attempt.error_body.slice(0, 500) + '...' : attempt.error_body;
+            // Not JSON, display as-is (no truncation in debug mode)
+            errorDisplay = attempt.error_body;
           }
-          html += \`<details style="margin-top: 8px;"><summary style="cursor: pointer; color: var(--muted); font-size: 12px;">上游错误详情</summary>\`;
-          html += \`<pre style="margin: 8px 0 0 0; padding: 8px; background: var(--paper); border-radius: 4px; font-size: 11px; overflow-x: auto; max-height: 300px;">\${esc(errorDisplay)}</pre>\`;
+          html += \`<details open style="margin-top: 8px;"><summary style="cursor: pointer; color: var(--muted); font-size: 12px;">上游错误详情</summary>\`;
+          html += \`<pre style="margin: 8px 0 0 0; padding: 8px; background: var(--paper); border-radius: 4px; font-size: 11px; overflow-x: auto; max-height: 500px;">\${esc(errorDisplay)}</pre>\`;
           html += '</details>';
         }
 

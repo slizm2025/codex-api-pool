@@ -16,7 +16,8 @@ import { __testInternals } from '../src/server.mjs';
 
 const {
   representativeAvailability,
-  representativeSelectionMultiplier
+  representativeSelectionMultiplier,
+  protocolCapabilitySelectionMultiplier
 } = __testInternals;
 
 let testCount = 0;
@@ -90,6 +91,19 @@ test('representativeSelectionMultiplier: scores the requested protocol evidence 
   const messagesMultiplier = representativeSelectionMultiplier(upstream, 'gpt-5.5', 'anthropic_messages');
   assertEquals(responsesMultiplier, expectedResponsesMultiplier, 'responses evidence should boost responses scoring');
   assertEquals(messagesMultiplier, 1, 'responses evidence must not boost messages scoring');
+});
+
+test('protocolCapabilitySelectionMultiplier: assumed is preferred over unknown without excluding exploration', () => {
+  const assumed = { capabilities: { responses: { status: 'assumed' } } };
+  const unknown = { capabilities: { responses: { status: 'unknown' } } };
+  const failed = { capabilities: { responses: { status: 'failed' } } };
+  assertEquals(protocolCapabilitySelectionMultiplier(unknown, 'responses'), 1, 'unknown should be neutral');
+  if (protocolCapabilitySelectionMultiplier(assumed, 'responses') <= protocolCapabilitySelectionMultiplier(unknown, 'responses')) {
+    throw new Error('assumed protocol support should score above unknown support');
+  }
+  if (protocolCapabilitySelectionMultiplier(failed, 'responses') >= protocolCapabilitySelectionMultiplier(unknown, 'responses')) {
+    throw new Error('failed protocol evidence should score below unknown support');
+  }
 });
 
 console.log('\n' + '═'.repeat(80));

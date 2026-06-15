@@ -486,6 +486,21 @@ test('recordProtocolCapabilityUnsupported ignores non-endpoint failures', () => 
   assertEquals(normalizeProtocolCapabilities(upstream.capabilities).responses.status, 'unknown');
 });
 
+test('recordProtocolCapabilityUnsupported accepts explicit endpoint unsupported signal', () => {
+  const upstream = createMockUpstream();
+
+  const recorded = recordProtocolCapabilityUnsupported(upstream, 'responses', {
+    httpStatus: 400,
+    reason: 'unsupported endpoint',
+    endpointUnsupported: true
+  });
+
+  assertEquals(recorded, true);
+  assertEquals(upstream.capabilities.responses.status, 'unsupported');
+  assertEquals(upstream.capabilities.responses.http_status, 400);
+  assertEquals(upstream.capabilities.responses.endpoint_unsupported, true);
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Test Suite: Recheck Logic
 // ══════════════════════════════════════════════════════════════════════════════

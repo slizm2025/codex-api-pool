@@ -484,11 +484,12 @@ export function recordProtocolCapabilityUnsupported(upstream, protocol, {
   model = '',
   httpStatus = 0,
   reason = '',
+  endpointUnsupported = false,
   currentModelOverride = undefined
 } = {}) {
   const statusCode = Number(httpStatus || 0) || 0;
   if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return false;
-  if (!NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode)) return false;
+  if (!endpointUnsupported && !NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode)) return false;
   upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
 
   const matchesOverride = calculateMatchesCurrentOverride(model, currentModelOverride);

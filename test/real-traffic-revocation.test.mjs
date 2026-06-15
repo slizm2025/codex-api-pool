@@ -13,6 +13,9 @@ import {
   revokeRealTrafficVerification
 } from '../src/protocol-capability-manager.mjs';
 import { deriveVerificationTier, deriveVerificationDetail } from '../src/verification-tier.mjs';
+import { __testInternals } from '../src/server.mjs';
+
+const { realTrafficEndpointUnsupported } = __testInternals;
 
 let testCount = 0;
 let passCount = 0;
@@ -162,6 +165,17 @@ test('after revoke the capability becomes recheck-eligible', async () => {
   const future = past + 31 * 60 * 1000; // > DEFAULT_PROTOCOL_CAPABILITY_RECHECK_MS (30min)
   assert(shouldRecheckProtocolCapability(upstream, 'responses', { now: () => future }),
     'revoked capability must be recheck-eligible after the interval');
+});
+
+test('real traffic endpoint unsupported detection accepts explicit endpoint errors', () => {
+  assert(realTrafficEndpointUnsupported(400, 'unsupported endpoint'),
+    '400 unsupported endpoint should be treated as endpoint unsupported');
+  assert(realTrafficEndpointUnsupported(400, 'route not found'),
+    '400 route not found should be treated as endpoint unsupported');
+  assert(!realTrafficEndpointUnsupported(400, 'model not found'),
+    'model not found must not mark the protocol endpoint unsupported');
+  assert(!realTrafficEndpointUnsupported(500, 'unsupported endpoint'),
+    '5xx endpoint wording should not be treated as authoritative endpoint unsupported');
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

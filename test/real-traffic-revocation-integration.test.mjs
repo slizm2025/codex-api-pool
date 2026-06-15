@@ -122,7 +122,7 @@ await test('quota-exhausted site drops from proven_by_traffic after 3 consecutiv
     model_override: 'gpt-5.5',
     retry: {
       max_attempts: 1,       // one upstream attempt per request so 3 requests = 3 failures
-      failure_threshold: 2,
+      failure_threshold: 4,  // higher than revocation threshold (3) to ensure streak completes
       base_cooldown_ms: 100, // short cooldown so the site is reselectable each time
       key_cooldown_ms: 100
     },
@@ -154,7 +154,7 @@ await test('quota-exhausted site drops from proven_by_traffic after 3 consecutiv
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     for (let i = 0; i < 3; i++) {
       await postResponses(poolInfo); // each hits the 403 branch
-      await sleep(150);
+      await sleep(250); // Wait for key cooldown to clear
     }
 
     // ── Assert: real_traffic verification revoked ──
@@ -200,7 +200,7 @@ await test('a success between failures resets the streak (no premature revoke)',
       request_timeout_ms: 5000
     },
     model_override: 'gpt-5.5',
-    retry: { max_attempts: 1, failure_threshold: 2, base_cooldown_ms: 100, key_cooldown_ms: 100 },
+    retry: { max_attempts: 1, failure_threshold: 4, base_cooldown_ms: 100, key_cooldown_ms: 100 },
     health: { enabled: false },
     upstreams: [{ name: 'flaky', base_url: upstreamInfo.url, api: 'openai', keys: [{ env: 'TEST_KEY' }] }]
   }, { statsPath: path.join(statsRoot, 'slice-2.json') });
@@ -246,7 +246,7 @@ await test('after revoke the dashboard detail shows real_pending (blue, waiting 
       request_timeout_ms: 5000
     },
     model_override: 'gpt-5.5',
-    retry: { max_attempts: 1, failure_threshold: 2, base_cooldown_ms: 100, key_cooldown_ms: 100 },
+    retry: { max_attempts: 1, failure_threshold: 4, base_cooldown_ms: 100, key_cooldown_ms: 100 },
     health: { enabled: false },
     upstreams: [{ name: 'venlacy2', base_url: upstreamInfo.url, api: 'openai', keys: [{ env: 'TEST_KEY' }] }]
   }, { statsPath: path.join(statsRoot, 'slice-3.json') });
@@ -258,7 +258,7 @@ await test('after revoke the dashboard detail shows real_pending (blue, waiting 
     await postResponses(poolInfo); // establish proof
     for (let i = 0; i < 3; i++) {
       await postResponses(poolInfo); // exhaust quota
-      await sleep(150);
+      await sleep(250); // Increased from 150ms to ensure cooldown clears
     }
 
     const after = pool.state.upstreams[0];

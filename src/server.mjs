@@ -4587,6 +4587,7 @@ function createUpstreamState(upstream, index) {
     inFlight: 0,
     ewmaLatencyMs: 0,
     cooldownUntil: 0,
+    realTrafficFailureStreak: 0,
     lastError: '',
     lastStatus: 0,
     health: {
@@ -4694,6 +4695,13 @@ function statsSnapshot(state) {
       ? state.recentRequests
       : stripRequestDebugFields(state.recentRequests),
     upstreams: Object.fromEntries(state.upstreams.map((upstream) => [upstream.name, {
+      failures: upstream.failures,
+      successes: upstream.successes,
+      ewmaLatencyMs: upstream.ewmaLatencyMs,
+      cooldownUntil: upstream.cooldownUntil,
+      realTrafficFailureStreak: upstream.realTrafficFailureStreak || 0,
+      lastError: upstream.lastError || '',
+      lastStatus: upstream.lastStatus || 0,
       stats: upstream.stats,
       quota: upstream.quota,
       capabilities: upstream.capabilities,
@@ -4714,6 +4722,9 @@ function statsSnapshot(state) {
         keyLabel: upstream.health.keyLabel
       },
       keys: Object.fromEntries(upstream.keys.map((key) => [key.label, {
+        failures: key.failures,
+        nonAuthoritativeFailures: key.nonAuthoritativeFailures || 0,
+        cooldownUntil: key.cooldownUntil,
         stats: key.stats,
         quota: key.quota,
         health: key.health,
@@ -4859,8 +4870,20 @@ function representativeSelectionMultiplier(upstream, model, protocol = 'response
   return representativeAvailability(upstream, { model, protocol: protocol || 'responses', at }).multiplier;
 }
 
+function protocolCapabilitySelectionMultiplier(upstream, protocol = '') {
+  if (!protocol) return 1;
+  const status = protocolCapabilityStatus(upstream, protocol);
+  if (status === 'verified') return 1.25;
+  if (status === 'assumed') return 1.12;
+  if (status === 'failed') return 0.75;
+  return 1;
+}
+
 function upstreamSelectionWeight(upstream, availability, model = '', protocol = '', at = now()) {
-  return upstream.weight * availability.multiplier * representativeSelectionMultiplier(upstream, model, protocol, at);
+  return upstream.weight *
+    availability.multiplier *
+    representativeSelectionMultiplier(upstream, model, protocol, at) *
+    protocolCapabilitySelectionMultiplier(upstream, protocol);
 }
 
 function upstreamSelectionScore(upstream, availability, model = '', protocol = '', at = now()) {
@@ -4961,6 +4984,13 @@ function restoreStats(state, statsPath) {
     for (const upstream of state.upstreams) {
       const old = saved.upstreams?.[upstream.name];
       if (!old) continue;
+      upstream.failures = Number(old.failures || 0) || 0;
+      upstream.successes = Number(old.successes || 0) || 0;
+      upstream.ewmaLatencyMs = Number(old.ewmaLatencyMs || 0) || 0;
+      upstream.cooldownUntil = Number(old.cooldownUntil || 0) || 0;
+      upstream.realTrafficFailureStreak = Number(old.realTrafficFailureStreak || 0) || 0;
+      upstream.lastError = String(old.lastError || '');
+      upstream.lastStatus = Number(old.lastStatus || 0) || 0;
       upstream.stats = { ...upstream.stats, ...(old.stats || {}) };
       ensureTokenUsage(upstream.stats);
       ensureAvailability(upstream.stats, state.availability);
@@ -4979,6 +5009,9 @@ function restoreStats(state, statsPath) {
       for (const key of upstream.keys) {
         const oldKey = old.keys?.[key.label];
         if (!oldKey) continue;
+        key.failures = Number(oldKey.failures || 0) || 0;
+        key.nonAuthoritativeFailures = Number(oldKey.nonAuthoritativeFailures || 0) || 0;
+        key.cooldownUntil = Number(oldKey.cooldownUntil || 0) || 0;
         key.stats = { ...key.stats, ...(oldKey.stats || {}) };
         ensureAvailability(key.stats, state.availability);
         key.quota = { ...key.quota, ...(oldKey.quota || {}) };
@@ -5069,6 +5102,7 @@ function copyRuntimeState(target, source, { preserveHealth, availabilityConfig }
   target.successes = source.successes;
   target.ewmaLatencyMs = source.ewmaLatencyMs;
   target.cooldownUntil = source.cooldownUntil;
+  target.realTrafficFailureStreak = source.realTrafficFailureStreak || 0;
   target.lastError = source.lastError;
   target.lastStatus = source.lastStatus;
   target.stats = { ...target.stats, ...source.stats };
@@ -6975,6 +7009,13 @@ function realTrafficFailureAuthoritative(statusCode, reason = '') {
   return /timeout|timed out|network|tls|socket|invalid[_ -]?api[_ -]?key|unauthorized|permission_denied|quota|rate.?limit/i.test(String(reason || ''));
 }
 
+function realTrafficEndpointUnsupported(statusCode, reason = '') {
+  const status = Number(statusCode || 0);
+  if (NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(status)) return true;
+  if (status < 400 || status >= 500) return false;
+  return /unsupported.*endpoint|endpoint.*not.*supported|invalid.*path|route.*not.*found|api .*not supported|unsupported[_ -]?api/i.test(String(reason || ''));
+}
+
 function upstreamHasRealTrafficVerification(upstream) {
   const capabilities = normalizeProtocolCapabilities(upstream?.capabilities);
   return PROTOCOL_CAPABILITY_NAMES.some((candidateProtocol) => {
@@ -6998,15 +7039,16 @@ function clearStaleRealTrafficHealth(upstream, reason) {
 function recordRealTrafficFailure(state, upstream, key, reason, statusCode, retryAfter, protocol) {
   const authoritative = realTrafficFailureAuthoritative(statusCode, reason);
   if (authoritative) {
-    if (key && protocol && PROTOCOL_CAPABILITY_NAMES.includes(protocol)) {
-      key.realTrafficFailures = key.realTrafficFailures && typeof key.realTrafficFailures === 'object' && !Array.isArray(key.realTrafficFailures)
-        ? key.realTrafficFailures
-        : {};
-      const nextFailures = Number(key.realTrafficFailures[protocol] || 0) + 1;
-      key.realTrafficFailures[protocol] = nextFailures;
-      if (nextFailures >= REAL_TRAFFIC_REVOCATION_FAILURE_THRESHOLD) {
-        key.realTrafficFailures[protocol] = 0;
-        const revoked = revokeRealTrafficVerification(upstream, protocol, {
+    // Track consecutive authoritative failures per-upstream (not per-protocol)
+    // to avoid protocol drift: when /v1/responses falls back to chat_completions
+    // adapter after initial failure, the streak must continue counting against
+    // the upstream's real_traffic verification regardless of adapter routing.
+    upstream.realTrafficFailureStreak = (upstream.realTrafficFailureStreak || 0) + 1;
+    if (upstream.realTrafficFailureStreak >= REAL_TRAFFIC_REVOCATION_FAILURE_THRESHOLD) {
+      upstream.realTrafficFailureStreak = 0;
+      // Revoke all real_traffic verifications for this upstream
+      for (const candidateProtocol of PROTOCOL_CAPABILITY_NAMES) {
+        const revoked = revokeRealTrafficVerification(upstream, candidateProtocol, {
           reason,
           httpStatus: statusCode
         });
@@ -7047,20 +7089,20 @@ function recordModelInteractionOutcome({
   recordResponseStats(upstream, key, statusCode, retried, succeeded);
   recordAttemptOutcome(state, upstream, key, succeeded, protocol);
   const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
-  if (!succeeded && protocol && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(Number(statusCode || 0))) {
+  if (!succeeded && protocol && realTrafficEndpointUnsupported(statusCode, reason)) {
     const failureReason = reason || `HTTP ${statusCode}`;
     const markedUnsupported = recordProtocolCapabilityUnsupported(upstream, protocol, {
       reason: failureReason,
-      httpStatus: statusCode
+      httpStatus: statusCode,
+      endpointUnsupported: true
     });
     if (markedUnsupported) clearStaleRealTrafficHealth(upstream, failureReason);
   }
   if (succeeded) {
     recordSuccess(upstream, startedAt, statusCode);
     key.nonAuthoritativeFailures = 0;
-    if (key.realTrafficFailures && protocol) {
-      key.realTrafficFailures[protocol] = 0;
-    }
+    // Reset upstream-level real traffic failure streak on any successful request
+    upstream.realTrafficFailureStreak = 0;
     // A real-traffic success clears any per-protocol cooldown for this protocol.
     if (protocol) clearProtocolCooldown(upstream, protocol);
   } else if (applyFailure) {
@@ -15161,6 +15203,10 @@ export const __testInternals = {
   chooseCandidate,
   representativeAvailability,
   representativeSelectionMultiplier,
+  protocolCapabilitySelectionMultiplier,
+  realTrafficEndpointUnsupported,
+  applyQuota,
+  statsSnapshot,
   refreshCodexOAuthToken,
   ensureCodexOAuthFresh,
   codexOAuthNeedsRefresh

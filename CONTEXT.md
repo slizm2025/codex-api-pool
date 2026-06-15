@@ -129,7 +129,7 @@ The Bearer token used to authorize access to the Management API. It may be confi
 _Avoid_: pool token, upstream key, API key
 
 **Health Probe**:
-An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but synthetic probe failures are authoritative only when they contain deterministic failure evidence. Health Probes use a browser-like User-Agent to avoid client restrictions imposed by some Upstreams.
+An operational availability check that the API Pool sends to an Upstream from the Management API. A Health Probe may discover models and protocol behavior, but Health Probes are **advisory-only**: their results do NOT gate Selection. They surface Health State for the Management Dashboard, drive soft selection ranking via the health penalty, and record Protocol Capability evidence used for the dashboard's Verification Tier — but an Upstream is never excluded from Selection, never cooled down, and never has its failure count changed by a probe result. Only real Model Interaction Request outcomes gate Selection. Health Probes use a browser-like User-Agent to avoid client restrictions imposed by some Upstreams.
 _Avoid_: test, check, ping, health check, real Codex check
 
 **Representative Model Probe**:
@@ -153,7 +153,7 @@ The Management Dashboard grouping that communicates the evidence level behind an
 _Avoid_: availability category, status group, priority queue
 
 **Authoritative Probe Failure**:
-A probe result with enough evidence to mark an Upstream or Upstream Key unavailable for Selection, such as authentication failure, rate limiting, network failure, or a clearly unsupported model/API. Non-representative and inconclusive probe results are not Authoritative Probe Failures.
+A probe result that carries deterministic failure evidence (authentication failure, rate limiting, network failure, or a clearly unsupported model/API). Under the advisory-only Health Probe contract, an Authoritative Probe Failure no longer marks an Upstream or Upstream Key unavailable for Selection — it is surfaced as Health State for the Management Dashboard and feeds soft selection ranking, but only real Model Interaction Request failures gate Selection. Non-representative and inconclusive probe results are not Authoritative Probe Failures.
 _Avoid_: failed test, bad response, inconclusive failure
 
 **Non-representative Probe Result**:
@@ -195,6 +195,26 @@ _Avoid_: model, active model, target model
 **Upstream Model Suffix**:
 A per-Upstream suffix that a non-standard Upstream appends to otherwise standard model names, such as `-cc` turning `claude-opus-4-8` into `claude-opus-4-8-cc`. The API Pool strips the Upstream Model Suffix from Discovered Models so Selection and diagnostics use the standard name, and reattaches it only to the model field of the request body sent to that Upstream. It does not change the Requested Model seen by clients, Recent Request Timeline, or availability statistics.
 _Avoid_: model alias, model rename, model override, custom model name
+
+**Debug Lock Mode**:
+A temporary diagnostic state where the API Pool bypasses Selection and forces all Model Interaction Requests to a specific Upstream, testing native and adapted protocols sequentially to isolate whether failures originate from the Pool's routing logic or the Upstream itself. Debug Lock is session-only (not persisted), does not update Runtime State (except Recent Request Timeline), and returns detailed protocol attempt diagnostics.
+_Avoid_: test mode, upstream pinning, direct routing, bypass mode
+
+**Locked Upstream**:
+The Upstream that Debug Lock Mode forces all requests to, ignoring Health State, Cooldown, Availability, and Selection weights until the lock is released.
+_Avoid_: pinned upstream, target upstream, fixed upstream
+
+**Protocol Attempt Sequence**:
+The ordered list of protocol and adapter combinations that Debug Lock Mode tests when the client request arrives. For Responses requests: native Responses, adapted Chat Completions, adapted Anthropic Messages. For Messages requests: native Anthropic Messages only. Each attempt proceeds only if the previous one failed with an Endpoint Not Found Signal.
+_Avoid_: protocol fallback chain, adapter cascade, protocol retry list
+
+**Endpoint Not Found Signal**:
+A response pattern (HTTP 404/405/501, or HTTP 400 with explicit unsupported-endpoint language in the error body) that Debug Lock Mode interprets as authoritative evidence that the Upstream does not support the attempted protocol, triggering fallback to the next protocol in the Protocol Attempt Sequence.
+_Avoid_: protocol unsupported, endpoint failure, not found error
+
+**Debug Attempt Diagnostics**:
+The comprehensive per-attempt metadata that Debug Lock Mode returns when all protocols fail, including sequence number, protocol, endpoint URL, adapter status, HTTP status, error body, latency, fallback reason, and whether the adapter is disabled in production configuration.
+_Avoid_: debug log, attempt history, test results
 
 **Management Dashboard**:
 The local operations interface for the API Pool, used to understand Upstream availability, explain why Codex requests may fail, and perform safe Management API actions such as Health Probes, Billing refreshes, Upstream enable toggles, Model Override changes, and Upstream creation.

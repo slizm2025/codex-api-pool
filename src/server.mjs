@@ -14,6 +14,7 @@ import {
   CODEX_CLI_USER_AGENT,
   CODEX_CLI_VERSION,
   CODEX_OAUTH_CLIENT_ID,
+  CODEX_OAUTH_TOKEN_URL,
   CODEX_OAUTH_TEST_INSTRUCTIONS
 } from './codex-oauth/constants.mjs';
 import { codexOauthMetadataFromToken, firstString } from './codex-oauth/jwt.mjs';
@@ -59,9 +60,38 @@ import {
 import {
   RequestRoutingRules
 } from './request-routing-rules.mjs';
+import {
+  enableDebugLock,
+  disableDebugLock,
+  isDebugLockActive,
+  getDebugLockState,
+  buildProtocolAttemptSequence,
+  shouldFallbackToNextProtocol,
+  buildDebugAttemptDiagnostics,
+  addDebugLockHeaders
+} from './debug-lock.mjs';
+import {
+  deriveVerificationTier,
+  deriveVerificationDetail
+} from './verification-tier.mjs';
+import {
+  normalizeAvailability as normalizeLayeredAvailability,
+  recordAvailabilityAttempt,
+  getProtocolAvailabilityMultiplier
+} from './protocol-availability.mjs';
+import {
+  deriveRecordingProtocol
+} from './recording-protocol.mjs';
+import {
+  isUpstreamInProtocolCooldown,
+  applyProtocolCooldown,
+  clearProtocolCooldown,
+  clearExpiredCooldowns as clearExpiredProtocolCooldowns
+} from './protocol-cooldown.mjs';
 
 const DEFAULT_CONFIG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config.local.json');
 const DEFAULT_RETRYABLE_STATUS = [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524];
+const KEY_SCOPED_FAILURE_STATUS = new Set([401, 403, 429]);
 const DEFAULT_NATIVE_RESPONSES_RECHECK_MS = 30 * 60 * 1000;
 const STREAM_ERROR_STATUS = 502;
 const HOP_BY_HOP_HEADERS = new Set([
@@ -88,6 +118,16 @@ const DEFAULT_AVAILABILITY_WINDOW_SIZE = 50;
 const DEFAULT_AVAILABILITY_MIN_SAMPLES = 10;
 const DEFAULT_GRACEFUL_SHUTDOWN_MS = 15000;
 const BROWSER_LIKE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const DEFAULT_CLAUDE_CLI_ANTHROPIC_BETA = [
+  'claude-code-20250219',
+  'interleaved-thinking-2025-05-14',
+  'redact-thinking-2026-02-12',
+  'context-management-2025-06-27',
+  'prompt-caching-scope-2026-01-05',
+  'mid-conversation-system-2026-04-07',
+  'effort-2025-11-24',
+  'context-1m-2025-08-07'
+].join(',');
 const STRIPPABLE_RESPONSES_INPUT_ITEM_TYPES = new Set(['reasoning']);
 const RESPONSE_COMPATIBILITY_SCRUB_FIELDS = [
   'previous_response_id',
@@ -699,7 +739,7 @@ function buildAnthropicRequestHeaders(targetUrl, keyValue, incomingHeaders = {},
     || extraHeaders['Anthropic-Beta']
     || incomingHeaders['anthropic-beta']
     || incomingHeaders['Anthropic-Beta']
-    || 'claude-code-20250219';  // Default Claude CLI beta
+    || DEFAULT_CLAUDE_CLI_ANTHROPIC_BETA;
   if (beta) headers['anthropic-beta'] = beta;
 
   // Add Claude CLI specific headers
@@ -729,7 +769,7 @@ function buildProbeHeaders(targetUrl, keyValue, authType = 'bearer', extraHeader
     headers['x-api-key'] = keyValue;
     headers['user-agent'] = 'claude-cli/2.1.177 (external, cli)';
     headers['anthropic-version'] = extraHeaders['anthropic-version'] || extraHeaders['Anthropic-Version'] || '2023-06-01';
-    headers['anthropic-beta'] = extraHeaders['anthropic-beta'] || 'claude-code-20250219';
+    headers['anthropic-beta'] = extraHeaders['anthropic-beta'] || DEFAULT_CLAUDE_CLI_ANTHROPIC_BETA;
     headers['anthropic-dangerous-direct-browser-access'] = 'true';
     headers['x-app'] = 'cli';
   } else if (keyValue && type !== 'none') {
@@ -1616,6 +1656,108 @@ function codexOAuthExpired(upstream, at = Date.now()) {
   return Number.isFinite(expiresMs) && expiresMs <= at;
 }
 
+// Codex OAuth access tokens are short-lived (~1h). Refresh proactively before the
+// token expires so an upstream does not silently drop out of Selection (CORE_FEATURES §12).
+// A small safety margin avoids refreshing in the last few seconds.
+const OAUTH_REFRESH_SAFETY_MARGIN_MS = 60 * 1000;
+
+function codexOAuthNeedsRefresh(upstream, at = Date.now()) {
+  if (!upstream?.codexOAuth || !upstream.oauthExpiresAt) return false;
+  const expiresMs = Date.parse(upstream.oauthExpiresAt);
+  return Number.isFinite(expiresMs) && expiresMs <= at + OAUTH_REFRESH_SAFETY_MARGIN_MS;
+}
+
+// Exchange a stored refresh_token for a fresh access token. Returns
+// { access_token, expires_at, refresh_token? } on success, or null on any
+// failure (HTTP error, network error, malformed body). Never throws.
+async function refreshCodexOAuthToken({ tokenUrl = CODEX_OAUTH_TOKEN_URL, clientId, refreshToken, timeoutMs = 8000 } = {}) {
+  const client = String(clientId || CODEX_OAUTH_CLIENT_ID || '').trim();
+  const rt = String(refreshToken || '').trim();
+  if (!rt) return null;
+
+  const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt, client_id: client });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'accept': 'application/json',
+        'user-agent': CODEX_CLI_USER_AGENT
+      },
+      body: body.toString(),
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+    const json = await response.json().catch(() => null);
+    if (!json || typeof json !== 'object' || typeof json.access_token !== 'string' || !json.access_token) {
+      return null;
+    }
+    const expiresIn = Number(json.expires_in);
+    const expiresInMs = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn * 1000 : 3600 * 1000;
+    return {
+      access_token: json.access_token,
+      expires_at: new Date(Date.now() + expiresInMs).toISOString(),
+      refresh_token: typeof json.refresh_token === 'string' && json.refresh_token ? json.refresh_token : undefined
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Ensure a Codex OAuth upstream has a fresh access token before forwarding.
+// On success: updates the runtime upstream's key value + oauthExpiresAt, and
+// persists the refreshed secret. On failure: returns false so the caller can
+// fall back to excluding the upstream from Selection.
+async function ensureCodexOAuthFresh({ upstream, runtime, config, at = Date.now() } = {}) {
+  if (!upstream?.codexOAuth) return true;
+  if (!codexOAuthNeedsRefresh(upstream, at)) return true;
+
+  const credentialRef = upstream.credentialRef || upstream.keys?.[0]?.label || '';
+  const secrets = runtime?.secrets || {};
+  const secret = (secrets[credentialRef] && typeof secrets[credentialRef] === 'object') ? secrets[credentialRef] : {};
+  const refreshToken = secret.refresh_token || '';
+  if (!refreshToken) return false; // nothing to refresh with -> stay excluded
+
+  const refreshed = await refreshCodexOAuthToken({
+    tokenUrl: CODEX_OAUTH_TOKEN_URL,
+    clientId: upstream.oauthClientId || CODEX_OAUTH_CLIENT_ID,
+    refreshToken
+  });
+  if (!refreshed) return false;
+
+  // Update persisted secret.
+  secrets[credentialRef] = {
+    ...secret,
+    access_token: refreshed.access_token,
+    ...(refreshed.refresh_token ? { refresh_token: refreshed.refresh_token } : {}),
+    expires_at: refreshed.expires_at
+  };
+  if (runtime && typeof runtime.secretsPath === 'string' && runtime.secretsPath) {
+    try { await saveSecrets(secrets, runtime.secretsPath); } catch { /* best-effort */ }
+  }
+
+  // Update in-memory runtime upstream so Selection can use it immediately.
+  upstream.oauthExpiresAt = refreshed.expires_at;
+  if (Array.isArray(upstream.keys) && upstream.keys[0]) {
+    upstream.keys[0] = { ...upstream.keys[0], value: refreshed.access_token };
+  }
+
+  // Keep config.codex_oauth.accounts[*].oauth_expires_at in sync when possible.
+  try {
+    const accounts = config?.codex_oauth?.accounts;
+    if (Array.isArray(accounts)) {
+      const acct = accounts.find((a) => a && a.name === upstream.name);
+      if (acct) acct.oauth_expires_at = refreshed.expires_at;
+    }
+  } catch { /* best-effort */ }
+
+  return true;
+}
+
 function cleanName(value, fallback = 'upstream') {
   const raw = String(value || '').trim();
   const cleaned = raw
@@ -1878,6 +2020,15 @@ function chatCompletionsPathForBaseUrl(baseUrl) {
     return pathname.endsWith('/v1') ? '/chat/completions' : '/v1/chat/completions';
   } catch {
     return '/v1/chat/completions';
+  }
+}
+
+function responsesPathForBaseUrl(baseUrl) {
+  try {
+    const pathname = new URL(baseUrl).pathname.replace(/\/$/, '');
+    return pathname.endsWith('/v1') ? '/responses' : '/v1/responses';
+  } catch {
+    return '/v1/responses';
   }
 }
 
@@ -2498,6 +2649,39 @@ function anthropicMessagesToChatMessages(messages, options = {}) {
             type: 'image_url',
             image_url: { url: source.url }
           });
+        }
+      }
+
+      // Document blocks (Anthropic document → Chat file / inline text).
+      // CORE_FEATURES §3: user multimodal content (PDF/text docs) must NOT be
+      // silently dropped during Messages → Chat conversion.
+      else if (block.type === 'document') {
+        const source = block.source;
+        if (source && source.type === 'base64') {
+          textParts.push({
+            type: 'file',
+            file: {
+              file_data: `data:${source.media_type || 'application/pdf'};base64,${source.data || ''}`,
+              filename: block.title || 'document'
+            }
+          });
+        } else if (source && source.type === 'url') {
+          textParts.push({
+            type: 'file',
+            file: {
+              file_data: source.url || '',
+              filename: block.title || 'document'
+            }
+          });
+        } else if (source && source.type === 'text') {
+          // Chat Completions has no inline text-document type; preserve content
+          // as a text part so the document payload is never silently dropped.
+          if (typeof source.data === 'string' && source.data.length) {
+            textParts.push(source.data);
+          }
+        } else if (typeof block.content === 'string' && block.content) {
+          // Fallback: some document blocks carry inline text in .content.
+          textParts.push(block.content);
         }
       }
 
@@ -3895,6 +4079,71 @@ function compatibilityStrippedHeader(stripped = {}) {
   return compatibilityBucketHeader(stripped);
 }
 
+// Build a compatibility record for the Messages→Chat adapter by inspecting the
+// original Anthropic Messages request body for Messages-only features that will
+// be stripped during conversion. Returns a plan-shaped object whose `stripped`
+// bucket lists the removed features, so the response header and Recent Request
+// Timeline can surface the conversion transparently.
+function buildMessagesAdapterCompatibility(body) {
+  let payload = null;
+  try {
+    payload = typeof body === 'string' || Buffer.isBuffer(body)
+      ? JSON.parse(String(body))
+      : body;
+  } catch { return null; }
+  if (!payload || typeof payload !== 'object') return null;
+
+  const fields = new Set();
+  const contentTypes = new Set();
+  const toolTypes = new Set();
+
+  // cache_control anywhere (system / message / content / tool)
+  if (Array.isArray(payload.system)) {
+    for (const block of payload.system) {
+      if (block && typeof block === 'object' && block.cache_control) fields.add('cache_control');
+    }
+  }
+  if (Array.isArray(payload.messages)) {
+    for (const message of payload.messages) {
+      if (!message || typeof message !== 'object') continue;
+      if (message.cache_control) fields.add('cache_control');
+      if (Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (!block || typeof block !== 'object') continue;
+          if (block.type === 'thinking') contentTypes.add('thinking');
+          if (block.cache_control) fields.add('cache_control');
+        }
+      }
+    }
+  }
+  if (Array.isArray(payload.tools)) {
+    for (const tool of payload.tools) {
+      if (!tool || typeof tool !== 'object') continue;
+      if (typeof tool.type === 'string' && COMPUTER_USE_TOOL_TYPES.has(tool.type)) toolTypes.add(tool.type);
+      if (tool.cache_control) fields.add('cache_control');
+    }
+  }
+
+  const stripped = {
+    tool_types: [...toolTypes].sort(),
+    input_types: [],
+    output_format_types: [],
+    content_types: [...contentTypes].sort(),
+    fields: [...fields].sort()
+  };
+  const hasStripped = stripped.tool_types.length || stripped.content_types.length || stripped.fields.length;
+  if (!hasStripped) return null;
+
+  return {
+    mode: 'messages_to_chat_completions',
+    trigger: 'strip_messages_only_features',
+    target_adapter: 'chat_completions',
+    converted: { tool_types: [], input_types: [], output_format_types: [], content_types: [], fields: [] },
+    downgraded: { tool_types: [], input_types: [], output_format_types: [], content_types: [], fields: [] },
+    stripped
+  };
+}
+
 function chatResponseFormatFromResponsesTextFormat(format) {
   if (!format) return undefined;
   const type = responsesTextFormatTypeLabel(format);
@@ -4300,7 +4549,7 @@ function createUpstreamState(upstream, index) {
     chatGptUserId: typeof upstream.chatgpt_user_id === 'string' ? upstream.chatgpt_user_id : '',
     organizationId: typeof upstream.organization_id === 'string' ? upstream.organization_id : '',
     healthPath: typeof upstream.health_path === 'string' ? upstream.health_path : '',
-    modelSuffixStrip: normalizeModelSuffix(upstream.model_suffix_strip || upstream.modelSuffixStrip),
+    modelSuffixStrip: normalizeModelSuffix(upstream.model_suffix_strip || upstream.modelSuffixStrip || upstream.model_suffix),
     probeAuth: typeof upstream.probe_auth === 'string' ? upstream.probe_auth : 'bearer',
     api: normalizeUpstreamApi(upstream.api, upstream.probe_auth),
     capabilities: initialProtocolCapabilities({
@@ -4350,7 +4599,11 @@ function createUpstreamState(upstream, index) {
       },
       availability: { samples: [] }
     },
-    quota: {}
+    quota: {},
+    // Per-protocol availability (overall + by_protocol). Layered structure
+    // tracked separately from the flat stats.availability.samples window which
+    // still feeds availabilitySummary / Dashboard / Selection.
+    availability: normalizeLayeredAvailability(null)
   };
 }
 
@@ -4520,15 +4773,12 @@ function selectionHealthPenalty(upstream) {
 }
 
 function healthAllowsSelection(upstream, expectedModel = undefined) {
-  const state = healthProbeEffectiveState(upstream.health, expectedModel);
-  return state === 'ok'
-    || state === 'unknown'
-    || state === 'oauth_ready'
-    || state === 'stale_model_override'
-    || state === 'missing_model_override'
-    || state === 'advanced_curl_required'
-    || state === 'codex_forward_only'
-    || state === 'inconclusive';
+  // Probe layer is advisory-only: the probe-derived Health State must NEVER
+  // exclude an upstream from Selection. Only real Model Interaction Request
+  // outcomes (cooldown / failure) gate Selection, and those are checked by the
+  // caller via `upstream.cooldownUntil` and key availability. Health State still
+  // feeds a SOFT weight penalty via selectionHealthPenalty() for ranking.
+  return true;
 }
 
 function normalizeProbeModel(value) {
@@ -4587,16 +4837,16 @@ function probeResultPayload(health, expectedModel) {
   };
 }
 
-function representativeSelectionMultiplier(upstream, model, at = now()) {
-  return representativeAvailability(upstream, { model, protocol: 'responses', at }).multiplier;
+function representativeSelectionMultiplier(upstream, model, protocol = 'responses', at = now()) {
+  return representativeAvailability(upstream, { model, protocol: protocol || 'responses', at }).multiplier;
 }
 
-function upstreamSelectionWeight(upstream, availability, model = '', at = now()) {
-  return upstream.weight * availability.multiplier * representativeSelectionMultiplier(upstream, model, at);
+function upstreamSelectionWeight(upstream, availability, model = '', protocol = '', at = now()) {
+  return upstream.weight * availability.multiplier * representativeSelectionMultiplier(upstream, model, protocol, at);
 }
 
-function upstreamSelectionScore(upstream, availability, model = '', at = now()) {
-  return upstreamSelectionWeight(upstream, availability, model, at) / (
+function upstreamSelectionScore(upstream, availability, model = '', protocol = '', at = now()) {
+  return upstreamSelectionWeight(upstream, availability, model, protocol, at) / (
     1 +
     upstream.inFlight +
     selectionLatencyPenalty(upstream) +
@@ -4609,7 +4859,7 @@ function roundedSelectionValue(value) {
   return Math.round(value * 1000) / 1000;
 }
 
-function recordAvailability(upstream, key, succeeded, availabilityConfig) {
+function recordAvailability(upstream, key, succeeded, availabilityConfig, protocol) {
   const value = succeeded ? 1 : 0;
   for (const stats of [upstream.stats, key.stats]) {
     const availability = ensureAvailability(stats, availabilityConfig);
@@ -4617,6 +4867,11 @@ function recordAvailability(upstream, key, succeeded, availabilityConfig) {
     if (availability.samples.length > availabilityConfig.windowSize) {
       availability.samples.splice(0, availability.samples.length - availabilityConfig.windowSize);
     }
+  }
+  // Per-protocol availability (top-level upstream.availability). Optional
+  // protocol: when provided, also buckets by_protocol + overall.
+  if (protocol) {
+    recordAvailabilityAttempt(upstream, protocol, Boolean(succeeded));
   }
 }
 
@@ -4873,9 +5128,13 @@ function upstreamSupportsModel(upstream, model) {
   // Check Codex OAuth model compatibility
   if (upstream.codexOAuth && !isCodexOAuthModel(model)) return false;
 
-  // Check if model is in discovered models list (if available)
-  const models = upstream.health?.models || [];
-  return models.length === 0 || models.includes(model);
+  // NOTE: the probe-discovered model list (upstream.health.models) is NOT used
+  // to hard-exclude an upstream here. Probes are advisory-only; an upstream
+  // whose /models list omits the Requested Model still participates in
+  // Selection (and may still serve it). Only real Model Interaction Request
+  // failures gate Selection. Model-list evidence may be used for dashboard
+  // display and ranking elsewhere, but never as a Selection gate.
+  return true;
 }
 
 function upstreamHasKnownModel(upstream, model) {
@@ -4890,20 +5149,26 @@ function chooseCandidate(state, tried, options = {}) {
   const allowUnknownModelFallback = options.allowUnknownModelFallback === true;
   const candidateFilter = typeof options.candidateFilter === 'function' ? options.candidateFilter : null;
   const preferredProtocol = options.preferredProtocol || '';
+  const targetProtocol = options.targetProtocol || '';
   let candidates = state.upstreams.filter((upstream) => {
     if (!upstreamAvailable(upstream, at)) return false;
+    // Per-protocol cooldown: an upstream may be cooled for one protocol while
+    // still serving others. Additive to the global cooldownUntil check above.
+    if (targetProtocol && isUpstreamInProtocolCooldown(upstream, targetProtocol, at)) return false;
     if (candidateFilter && !candidateFilter(upstream)) return false;
     return upstream.keys.some((key) => keyAvailable(key, at) && !tried.has(`${upstream.name}:${key.index}`));
   });
 
   if (preferredModel) {
+    // Filter to upstreams that pass the (config-driven) protocol-family /
+    // Codex OAuth compatibility check. Probe-discovered model lists do NOT
+    // participate in this filter — probes are advisory-only and must not
+    // exclude an upstream from Selection.
     const modelCandidates = candidates.filter((upstream) => upstreamSupportsModel(upstream, preferredModel));
     if (modelCandidates.length > 0) {
-      const knownModelCandidates = modelCandidates.filter((upstream) => upstreamHasKnownModel(upstream, preferredModel));
-      candidates = knownModelCandidates.length > 0 && !allowUnknownModelFallback
-        ? knownModelCandidates
-        : modelCandidates;
+      candidates = modelCandidates;
     }
+    void allowUnknownModelFallback;
   }
 
   // Prioritize upstreams with verified protocol capability for lossless forwarding
@@ -4922,7 +5187,7 @@ function chooseCandidate(state, tried, options = {}) {
   let total = 0;
   const weighted = candidates.map((upstream) => {
     const availability = availabilitySummary(upstream.stats, state.availability);
-    const score = upstreamSelectionScore(upstream, availability, preferredModel, at);
+    const score = upstreamSelectionScore(upstream, availability, preferredModel, preferredProtocol, at);
     total += score;
     return { upstream, score };
   });
@@ -6638,8 +6903,8 @@ function recordResponseStats(upstream, key, statusCode, retried = false, succeed
   }
 }
 
-function recordAttemptOutcome(state, upstream, key, succeeded) {
-  recordAvailability(upstream, key, succeeded, state.availability);
+function recordAttemptOutcome(state, upstream, key, succeeded, protocol) {
+  recordAvailability(upstream, key, succeeded, state.availability, protocol);
 }
 
 function recordSuccess(upstream, startedAt, statusCode = 200) {
@@ -6661,11 +6926,12 @@ function recordFailure(state, upstream, key, reason, statusCode, retryAfter) {
   const failureMultiplier = Math.min(8, Math.max(1, upstream.failures));
   const cooldownMs = parseRetryAfterMs(retryAfter, cooldownBase * failureMultiplier);
 
-  if (statusCode === 401 || statusCode === 403 || statusCode === 429) {
+  const keyScopedFailure = KEY_SCOPED_FAILURE_STATUS.has(statusCode);
+  if (keyScopedFailure) {
     key.cooldownUntil = now() + cooldownMs;
   }
 
-  if (upstream.failures >= state.retry.failureThreshold || statusCode === 0 || statusCode === 429 || state.retry.retryableStatus.has(statusCode)) {
+  if (!keyScopedFailure && (upstream.failures >= state.retry.failureThreshold || statusCode === 0 || state.retry.retryableStatus.has(statusCode))) {
     upstream.cooldownUntil = now() + cooldownMs;
   }
 }
@@ -6708,22 +6974,38 @@ function recordModelInteractionOutcome({
   reason = '',
   retryAfter,
   tokenCount = 0,
-  applyFailure = true
+  applyFailure = true,
+  protocol
 }) {
   recordResponseStats(upstream, key, statusCode, retried, succeeded);
-  recordAttemptOutcome(state, upstream, key, succeeded);
+  recordAttemptOutcome(state, upstream, key, succeeded, protocol);
   const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
   if (succeeded) {
     recordSuccess(upstream, startedAt, statusCode);
     key.nonAuthoritativeFailures = 0;
+    // A real-traffic success clears any per-protocol cooldown for this protocol.
+    if (protocol) clearProtocolCooldown(upstream, protocol);
   } else if (applyFailure) {
     const failureReason = reason || `HTTP ${statusCode}`;
     recordRealTrafficFailure(state, upstream, key, failureReason, statusCode, retryAfter);
+    // Apply per-protocol cooldown alongside the global cooldown. This is additive:
+    // recordRealTrafficFailure / recordFailure already set upstream.cooldownUntil
+    // when warranted; here we additionally cool the specific protocol when the
+    // same condition holds, so the other protocols can still serve traffic.
+    if (protocol && !KEY_SCOPED_FAILURE_STATUS.has(statusCode) && (upstream.failures >= state.retry.failureThreshold || statusCode === 0 || state.retry.retryableStatus.has(statusCode))) {
+      const cooldownBase = statusCode === 429 ? state.retry.keyCooldownMs : state.retry.baseCooldownMs;
+      const failureMultiplier = Math.min(8, Math.max(1, upstream.failures));
+      const cooldownMs = parseRetryAfterMs(retryAfter, cooldownBase * failureMultiplier);
+      applyProtocolCooldown(upstream, protocol, {
+        until: new Date(now() + cooldownMs).toISOString(),
+        reason: failureReason
+      });
+    }
   }
   return recordedTokens;
 }
 
-function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, incomingBody, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath }) {
+function finishResponseAttempt({ state, upstream, key, method, pathname, incomingHeaders, incomingBody, originalModel, attemptedModel, statusCode, startedAt, attempt, reason = '', retryAfter, tokenCount = 0, succeeded = statusCode >= 200 && statusCode < 400, routeTrace, compatibility = null, statsPath, protocol }) {
   const failureReason = reason || (statusCode >= 200 && statusCode < 400 ? 'HTTP success without concrete output' : `HTTP ${statusCode}`);
   const recordedTokens = recordModelInteractionOutcome({
     state,
@@ -6735,7 +7017,8 @@ function finishResponseAttempt({ state, upstream, key, method, pathname, incomin
     succeeded,
     reason: failureReason,
     retryAfter,
-    tokenCount
+    tokenCount,
+    protocol
   });
   rememberRequest(state, {
     method,
@@ -6783,7 +7066,8 @@ function parseJsonBody(body) {
 
 function advancedCurlRequiredProbeError(result) {
   const statusCode = Number(result?.statusCode || 0);
-  if (![400, 401, 403].includes(statusCode)) return '';
+  const hasErrorEnvelope = responseHasErrorEnvelope(result);
+  if (![400, 401, 403].includes(statusCode) && !(statusCode >= 200 && statusCode < 300 && hasErrorEnvelope)) return '';
   const json = parseJsonBody(result?.body);
   const error = json && typeof json === 'object' ? json.error : null;
   const code = String(
@@ -6815,6 +7099,9 @@ function advancedCurlRequiredProbeError(result) {
   if (/missing .*codex .*context|codex .*context .*required|requires .*codex .*context|真实 codex .*上下文|缺少.*codex.*上下文/i.test(body)) {
     return '该上游要求真实 Codex 请求上下文。标准 Health Probe 只能做合成验证，不能单独证明该上游不可用；请用真实 Codex 请求转发的响应结果验证可用性。';
   }
+  if (/1m.*上下文|上下文.*1m|1m .*context|context .*1m|enable .*1m|启用.*1m/i.test(body)) {
+    return '该上游要求 Claude 1m 上下文 beta 或等价真实客户端能力。标准 Health Probe 只能做合成验证，不能单独证明该上游不可用；请用真实 Claude 请求转发的响应结果验证可用性。';
+  }
   return '';
 }
 
@@ -6834,6 +7121,21 @@ function responseErrorParts(result) {
         : json?.message || result?.body || ''
   ).trim();
   return { code, message };
+}
+
+function responseHasErrorEnvelope(result) {
+  const json = parseJsonBody(result?.body);
+  return Boolean(json && typeof json === 'object' && (
+    Object.prototype.hasOwnProperty.call(json, 'error') ||
+    String(json.type || '').trim().toLowerCase() === 'error'
+  ));
+}
+
+function genericUnavailableErrorEnvelope(result) {
+  if (!responseHasErrorEnvelope(result)) return false;
+  const { code, message } = responseErrorParts(result);
+  const value = `${code} ${message}`.toLowerCase();
+  return /service unavailable|temporarily unavailable|upstream unavailable/.test(value);
 }
 
 function responseLooksLikeBrowserChallenge(result) {
@@ -6945,6 +7247,9 @@ function classifyModelProbe(result, protocol, options = {}) {
     return { state, outcome: 'authoritative_failure', authoritative: true, representative: true, error: result.error || '' };
   }
   const validationError = modelProbeValidationError(result, protocol);
+  if (validationError && options.representative !== true && genericUnavailableErrorEnvelope(result)) {
+    return inconclusiveProbeClassification(result, protocol, `${protocol} probe returned a provider unavailable error envelope; result is not authoritative`);
+  }
   return validationError
     ? { state: 'unexpected_status', outcome: 'authoritative_failure', authoritative: true, representative: options.representative === true, error: validationError }
     : { state: 'ok', outcome: 'ok', authoritative: true, representative: options.representative === true, error: '' };
@@ -7124,7 +7429,10 @@ function healthProbeEffectiveState(health, expectedModel) {
   if (state === 'ok' && health?.source === 'real_traffic') return 'ok';
   if (state !== 'ok' || expectedModel === undefined) return state;
   const expected = normalizeProbeModel(expectedModel);
-  if (!expected) return 'missing_model_override';
+  // No model_override set (following client request) → use raw probe state.
+  // The probe was run without a specific model target, so stale/missing
+  // override checks are not applicable.
+  if (!expected) return state;
   return healthMatchesProbeModel(health, expected) ? 'ok' : 'stale_model_override';
 }
 
@@ -7135,7 +7443,11 @@ function healthProbeEffectiveError(health, expectedModel) {
     const current = normalizeProbeModel(expectedModel) || 'missing';
     return `Health Probe was last run for model_override ${previous}; current model_override is ${current}`;
   }
-  if (state === 'missing_model_override' && !normalizeProbeModel(expectedModel)) {
+  // Only surface the missing_model_override error when the raw health state
+  // itself is missing_model_override (i.e., no discovered models to probe),
+  // not when the override is simply empty (following client request).
+  const rawState = health?.state || 'unknown';
+  if (state === 'missing_model_override' && rawState === 'missing_model_override') {
     return health?.error || 'Health Probe requires model_override so it can test the exact active model';
   }
   return health?.error || '';
@@ -7269,6 +7581,306 @@ async function requestTrackedUpstream(options) {
     upstream.inFlight = Math.max(0, upstream.inFlight - 1);
     throw error;
   }
+}
+
+// ============================================================================
+// DEBUG LOCK MODE - Request Execution
+// ============================================================================
+
+async function executeDebugLockedRequest(req, res, state, config, options) {
+  const { pathname, clientProtocol, statsPath, maxBodyBytes } = options;
+  const startTime = now();
+
+  // Read request body
+  const originalBody = await readBody(req, maxBodyBytes);
+  const responsesJsonOptions = { inferJsonLike: pathname === '/v1/responses' };
+
+  // Parse model
+  const originalModel = modelFromBody(req, originalBody, responsesJsonOptions);
+
+  // Apply model override if configured
+  const shouldApplyOverride = state.debugLock.respect_model_override && state.modelOverride;
+  const requestedModel = shouldApplyOverride ? state.modelOverride : originalModel;
+
+  // Get locked upstream
+  const upstream = state.upstreams.find(u => u.name === state.debugLock.upstream);
+  if (!upstream) {
+    return jsonResponse(res, 500, {
+      error: {
+        message: `Debug lock: upstream not found: ${state.debugLock.upstream}`,
+        type: 'debug_lock_error',
+        upstream: state.debugLock.upstream
+      }
+    });
+  }
+
+  // Get first valid key
+  const key = (upstream.keys || []).find(k => k.value);
+  if (!key) {
+    return jsonResponse(res, 500, {
+      error: {
+        message: `Debug lock: no valid key for upstream: ${state.debugLock.upstream}`,
+        type: 'debug_lock_error',
+        upstream: state.debugLock.upstream
+      }
+    });
+  }
+
+  // Build protocol attempt sequence
+  const sequence = buildProtocolAttemptSequence(clientProtocol);
+  const attempts = [];
+  let succeeded = false;
+  let successResponse = null;
+
+  // Try each protocol in sequence
+  for (let i = 0; i < sequence.length; i++) {
+    const { protocol, adapter } = sequence[i];
+    const attemptStart = now();
+
+    // Determine endpoint using smart path functions to avoid duplicate /v1
+    const endpoint = protocol === 'responses'
+      ? responsesPathForBaseUrl(upstream.baseUrl)
+      : protocol === 'anthropic_messages'
+      ? anthropicMessagesPathForBaseUrl(upstream.baseUrl)
+      : chatCompletionsPathForBaseUrl(upstream.baseUrl);
+
+    const targetUrl = joinUrlPath(upstream.baseUrl, endpoint);
+
+    // Prepare request body (apply adapter if needed)
+    let requestBody = originalBody;
+    const adapterInfo = {
+      conversions: [],
+      stripped: []
+    };
+
+    if (adapter) {
+      // Apply adapter conversion
+      if (protocol === 'chat_completions') {
+        // Convert Responses to Chat Completions
+        const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
+        requestBody = buildChatCompletionsPayload(bodyWithModel, requestedModel);
+        adapterInfo.conversions.push('responses->chat_completions');
+      } else if (protocol === 'anthropic_messages') {
+        // Convert Responses to Anthropic Messages
+        const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
+        requestBody = buildAnthropicMessagesPayload(bodyWithModel, requestedModel);
+        adapterInfo.conversions.push('responses->anthropic_messages');
+      }
+    } else if (protocol !== clientProtocol) {
+      // Native protocol but different from client (shouldn't happen with current logic)
+      const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
+      requestBody = bodyWithModel;
+    } else {
+      // Native protocol, same as client
+      const bodyWithModel = rewriteModelInBody(req, originalBody, requestedModel, responsesJsonOptions);
+      requestBody = bodyWithModel;
+    }
+
+    // Check if adapter is enabled in production config
+    const productionDisabled = adapter && !isAdapterEnabledInConfig(protocol, config);
+
+    // Send request
+    try {
+      const result = await requestUpstream({
+        req,
+        body: requestBody,
+        targetUrl,
+        upstream,
+        key,
+        timeoutMs: config.server?.request_timeout_ms || 180000,
+        allowRetry: false,  // No retry in debug mode
+        retryableStatus: new Set(),
+        method: 'POST',
+        headers: null
+      });
+
+      const latencyMs = now() - attemptStart;
+
+      if (result.type === 'response') {
+        const { response, statusCode } = result;
+
+        // Collect response body
+        const chunks = [];
+        let bodySize = 0;
+        const maxBodySize = config.server?.max_body_bytes || 50 * 1024 * 1024;
+
+        for await (const chunk of response) {
+          if (bodySize < maxBodySize) {
+            chunks.push(chunk);
+            bodySize += chunk.length;
+          }
+        }
+
+        const responseBody = bodySize < maxBodySize
+          ? Buffer.concat(chunks, bodySize)
+          : Buffer.concat(chunks.slice(0, 10), Math.min(bodySize, 10240)); // First 10KB for diagnostics
+
+        const responseText = responseBody.toString('utf8');
+
+        // Extract tokens if present
+        let tokens = null;
+        try {
+          const parsed = JSON.parse(responseText);
+          if (parsed.usage) {
+            tokens = {
+              prompt_tokens: parsed.usage.prompt_tokens || parsed.usage.input_tokens || 0,
+              completion_tokens: parsed.usage.completion_tokens || parsed.usage.output_tokens || 0,
+              total_tokens: parsed.usage.total_tokens || 0
+            };
+          }
+        } catch {}
+
+        // Record attempt
+        attempts.push({
+          sequence: i + 1,
+          protocol,
+          endpoint,
+          adapter,
+          adapter_conversions: adapterInfo.conversions,
+          adapter_stripped: adapterInfo.stripped,
+          production_disabled: productionDisabled,
+          url: targetUrl,
+          status: statusCode,
+          error: statusCode >= 400 ? `HTTP ${statusCode}` : undefined,
+          error_body: statusCode >= 400 ? responseText.slice(0, 1000) : undefined,
+          latency_ms: latencyMs,
+          tokens,
+          streaming: response.headers['content-type']?.includes('stream')
+        });
+
+        // Check if successful
+        if (statusCode >= 200 && statusCode < 300) {
+          succeeded = true;
+          successResponse = {
+            statusCode,
+            headers: response.headers,
+            body: responseBody
+          };
+          break;
+        }
+
+        // Check if should fallback
+        const { fallback, reason } = shouldFallbackToNextProtocol(statusCode, responseText);
+        attempts[attempts.length - 1].fallback_reason = reason;
+
+        if (!fallback || i === sequence.length - 1) {
+          // Don't fallback or this is the last attempt
+          break;
+        }
+
+        // Continue to next protocol
+      } else {
+        // type === 'retry' (network error, timeout, etc.)
+        attempts.push({
+          sequence: i + 1,
+          protocol,
+          endpoint,
+          adapter,
+          adapter_conversions: adapterInfo.conversions,
+          adapter_stripped: adapterInfo.stripped,
+          production_disabled: productionDisabled,
+          url: targetUrl,
+          status: result.statusCode || 0,
+          error: result.reason || 'network error',
+          latency_ms: latencyMs,
+          fallback_reason: 'network_error'
+        });
+
+        // Network errors don't fallback
+        break;
+      }
+    } catch (error) {
+      attempts.push({
+        sequence: i + 1,
+        protocol,
+        endpoint,
+        adapter,
+        url: targetUrl,
+        status: 0,
+        error: error.message,
+        latency_ms: now() - attemptStart,
+        fallback_reason: 'exception'
+      });
+      break;
+    }
+  }
+
+  // Build diagnostics
+  const diagnostics = buildDebugAttemptDiagnostics(
+    attempts,
+    state.debugLock,
+    {
+      protocol: clientProtocol,
+      model: originalModel,
+      model_sent: requestedModel
+    }
+  );
+
+  // Save diagnostics to state for dashboard display
+  // Always save diagnostics (success or failure) until explicitly unlocked
+  state.debugLock.last_diagnostics = diagnostics;
+
+  // Record to Recent Request Timeline
+  rememberRequest(state, {
+    method: 'POST',
+    path: pathname,
+    entry_protocol: clientProtocol,
+    debug_lock: true,
+    locked_upstream: state.debugLock.upstream,
+    upstream: upstream.name,
+    model: requestedModel,
+    status: succeeded ? successResponse.statusCode : 502,
+    succeeded,
+    durationMs: now() - startTime,
+    attempts: attempts.length,
+    final_protocol: succeeded ? diagnostics.succeeded_with.protocol : null
+  });
+
+  // Return response
+  if (succeeded) {
+    // Add debug headers
+    addDebugLockHeaders(res, diagnostics);
+
+    // Forward successful response
+    res.writeHead(successResponse.statusCode, successResponse.headers);
+    res.end(successResponse.body);
+    persistStats(state, statsPath);
+    return;
+  }
+
+  // All attempts failed - return diagnostic response
+  persistStats(state, statsPath);
+
+  if (pathname === '/v1/messages') {
+    // Anthropic error format
+    return anthropicErrorResponse(
+      res,
+      502,
+      'api_error',
+      `Debug lock: all protocols failed for upstream '${state.debugLock.upstream}'`,
+      { debug_diagnostics: diagnostics }
+    );
+  } else {
+    // OpenAI error format
+    return jsonResponse(res, 502, {
+      error: {
+        message: `Debug lock: all protocols failed for upstream '${state.debugLock.upstream}'`,
+        type: 'debug_lock_all_failed',
+        upstream: state.debugLock.upstream,
+        ...diagnostics
+      }
+    });
+  }
+}
+
+function isAdapterEnabledInConfig(protocol, config) {
+  if (protocol === 'chat_completions') {
+    return config.compatibility?.adapter_mode?.adapters?.chatCompletions === true;
+  }
+  if (protocol === 'anthropic_messages') {
+    return config.compatibility?.adapter_mode?.adapters?.anthropicMessages === true;
+  }
+  return false;
 }
 
 function probeHttp(targetUrl, keyValue, timeoutMs, options = {}) {
@@ -7750,6 +8362,8 @@ function probeResponsesUpstream(upstream, key, config, model) {
   return new Promise((resolve) => {
     const timeoutMs = Number(config.health?.timeout_ms || 10000);
     const publicPrefix = normalizePrefix(config.server?.public_prefix || '/v1');
+    // Probe the exact URL native Responses traffic forwards to (joinTargetUrl
+    // strips public_prefix), so the health verdict matches real routing.
     const targetUrl = joinTargetUrl(upstream.baseUrl, `${publicPrefix}/responses`, publicPrefix);
     const forwardedModel = forwardModelForUpstream(upstream, model);
     const body = Buffer.from(JSON.stringify(codexResponsesProbePayload(forwardedModel)));
@@ -8195,7 +8809,7 @@ async function fetchSupplementalModels(upstream, config, key, timeoutMs, publicP
   let models = upstream.health?.models || [];
   try {
     const modelsUrl = upstream.healthPath
-      ? joinUrlPath(upstream.baseUrl, pathSuffix)
+      ? joinDebugRequestUrl(upstream.baseUrl, pathSuffix)
       : joinTargetUrl(upstream.baseUrl, `${publicPrefix}${pathSuffix.startsWith('/') ? pathSuffix : `/${pathSuffix}`}`, publicPrefix);
     const modelsResult = await probeHttp(modelsUrl, key.value, Math.min(timeoutMs, 5000), {
       authType: upstream.probeAuth,
@@ -8360,8 +8974,11 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
       if (stateName === 'ok') {
         upstream.lastError = '';
         upstream.lastStatus = result.statusCode;
-      } else if (['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout'].includes(stateName)) {
-        recordFailure(state, upstream, key, error || `health ${stateName}`, result.statusCode, result.retryAfter);
+      } else {
+        // Probe layer is advisory-only: a probe failure must NOT set a cooldown
+        // or bump the failure count. Only real Model Interaction Request
+        // outcomes gate Selection. Keep lastStatus for dashboard display.
+        upstream.lastStatus = result.statusCode;
       }
     }
     return probeHealthDebugPayload(health, result);
@@ -8523,12 +9140,9 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
   if (persistHealth && resolvedMode) {
     upstream.resolvedRequestMode = resolvedMode;
   }
-  if (persistHealth && stateName === 'ok') {
-    upstream.cooldownUntil = 0;
-    upstream.failures = 0;
-    key.cooldownUntil = 0;
-    key.failures = 0;
-  }
+  // NOTE: a successful probe intentionally does NOT clear cooldown / failures.
+  // Probes are advisory-only; only real Model Interaction Request outcomes
+  // (recordSuccess / recordFailure in the proxy path) gate Selection.
 
   const health = {
     state: stateName,
@@ -8569,8 +9183,12 @@ async function probeOneUpstream(state, upstream, config, options = {}) {
     return returnedHealth;
   }
 
+  // Probe layer is advisory-only: a probe failure must NOT set a cooldown or
+  // bump the failure count. Only real Model Interaction Request outcomes gate
+  // Selection. We keep lastStatus/lastError for dashboard display only.
   if (persistHealth && (stateName === 'auth_error' || stateName === 'rate_limited' || stateName === 'server_error' || stateName === 'network_error' || stateName === 'timeout')) {
-    recordFailure(state, upstream, key, healthError || `health ${stateName}`, healthResult.statusCode, healthResult.retryAfter);
+    upstream.lastError = healthError || `health ${stateName}`;
+    upstream.lastStatus = healthResult.statusCode;
   }
 
   return returnedHealth;
@@ -8626,7 +9244,7 @@ async function probeModelsForProtocol(upstream, config, protocol) {
   const targetUrl = protocol === 'anthropic'
     ? joinUrlPath(upstream.baseUrl, anthropicModelsPathForBaseUrl(upstream.baseUrl))
     : upstream.healthPath
-      ? joinUrlPath(upstream.baseUrl, pathSuffix)
+      ? joinDebugRequestUrl(upstream.baseUrl, pathSuffix)
       : joinTargetUrl(upstream.baseUrl, `${publicPrefix}${pathSuffix.startsWith('/') ? pathSuffix : `/${pathSuffix}`}`, publicPrefix);
   const result = await probeHttp(targetUrl, key.value, timeoutMs, {
     authType: protocol === 'anthropic'
@@ -9063,6 +9681,14 @@ function dashboardHtml() {
     .signin-filter, .verification-filter { min-height: 32px; padding: 6px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.32); }
     .signin-filter.active, .verification-filter.active { color: var(--paper); background: var(--ink); border-color: var(--ink); }
     .signin-count { color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .verification-dot { font-size: 12px; margin-right: 4px; vertical-align: middle; }
+    .verification-dot[data-indicator="green"] { color: #16a34a; }
+    .verification-dot[data-indicator="yellow"] { color: #ca8a04; }
+    .verification-dot[data-indicator="blue"] { color: #2563eb; }
+    .verification-dot[data-indicator="grey"] { color: #9ca3af; }
+    .verification-dot[data-indicator="orange"] { color: #ea580c; }
+    .verification-dot[data-indicator="red"] { color: #dc2626; }
+    .verification-label { font-size: 11px; color: var(--muted); margin-right: 6px; vertical-align: middle; }
     .probe-site { min-width: 58px; padding: 7px 10px; font-size: 12px; box-shadow: none; background: rgba(255,255,255,.28); }
     .probe-site[disabled] { cursor: wait; opacity: .68; transform: none; }
     .probe-inline { grid-column: 1 / -1; display: grid; gap: 8px; border-top: 1px dashed var(--line); padding-top: 10px; cursor: default; }
@@ -9188,6 +9814,7 @@ function dashboardHtml() {
     .request-row { display: grid; grid-template-columns: 1.1fr .9fr 1.2fr 1.2fr .6fr; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: rgba(255,255,255,.48); font-size: 12px; }
     .request-row strong { font-size: 13px; overflow-wrap: anywhere; }
     .request-row small { color: var(--muted); display: block; letter-spacing: .08em; text-transform: uppercase; }
+    .request-row.debug-lock-request { border-left: 3px solid var(--warn); background: rgba(166, 106, 5, 0.08); }
     .models { display: flex; gap: 7px; flex-wrap: wrap; max-height: 142px; overflow: auto; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.42); }
     .model-chip { color: var(--ink); background: rgba(255,255,255,.66); border-color: var(--line); box-shadow: none; padding: 7px 9px; font-size: 12px; line-height: 1.25; max-width: 260px; min-height: 30px; text-align: left; white-space: normal; overflow-wrap: anywhere; }
     .model-chip.active { color: var(--paper); background: var(--ink); border-color: var(--ink); }
@@ -9275,6 +9902,17 @@ function dashboardHtml() {
             <div><span>Unclassified</span><strong id="unknownTokens">0</strong></div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- Debug Lock Diagnostics Panel -->
+    <section id="debugLockDiagnostics" class="panel top-diagnostic dashboard-region" style="margin-top: 12px; display: none;">
+      <div style="padding: 16px;">
+        <div class="section-head" style="margin-bottom: 16px;">
+          <h2 style="margin: 0; font-size: 16px;">🔒 Debug Lock 诊断信息</h2>
+          <p style="margin: 0; color: var(--muted); font-size: 12px;">最近一次 Debug Lock 请求的详细协议尝试记录</p>
+        </div>
+        <div id="debugLockDiagnosticsContent"></div>
       </div>
     </section>
 
@@ -9545,6 +10183,181 @@ function dashboardHtml() {
       );
     };
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Debug Lock Mode - Helper Functions
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function isDebugLockActive(status) {
+      return Boolean(status?.debug_lock?.enabled);
+    }
+
+    function getDebugLockInfo(status) {
+      if (!isDebugLockActive(status)) return null;
+      const lock = status.debug_lock;
+      return {
+        upstream: lock.upstream,
+        locked_at: lock.locked_at,
+        locked_duration_seconds: lock.locked_duration_seconds,
+        last_diagnostics: lock.last_diagnostics || null
+      };
+    }
+
+    function formatDebugLockDuration(seconds) {
+      if (seconds === 0) return '0秒';
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const secs = seconds % 60;
+      const parts = [];
+      if (hours > 0) parts.push(\`\${hours}小时\`);
+      if (minutes > 0) parts.push(\`\${minutes}分\`);
+      if (secs > 0 && hours === 0) parts.push(\`\${secs}秒\`);
+      return parts.join('');
+    }
+
+    function updateDebugLockDiagnostics(lockInfo) {
+      const panel = document.getElementById('debugLockDiagnostics');
+      const content = document.getElementById('debugLockDiagnosticsContent');
+
+      if (!lockInfo.last_diagnostics) {
+        panel.style.display = 'none';
+        return;
+      }
+
+      panel.style.display = 'block';
+      const diag = lockInfo.last_diagnostics;
+
+      let html = '<div style="margin-bottom: 12px;">';
+      html += \`<div style="margin-bottom: 8px; color: var(--muted); font-size: 13px;">\`;
+      html += \`客户端协议: <strong>\${esc(diag.client_request?.protocol || 'N/A')}</strong> · \`;
+      html += \`请求模型: <strong>\${esc(diag.client_request?.model || 'N/A')}</strong> · \`;
+      html += \`发送模型: <strong>\${esc(diag.client_request?.model_sent || 'N/A')}</strong>\`;
+      html += '</div>';
+
+      if (diag.succeeded_with) {
+        html += \`<div style="padding: 8px; background: rgba(18,128,92,0.1); border-left: 3px solid var(--good); border-radius: 4px;">\`;
+        html += \`✅ 成功：协议 <strong>\${esc(diag.succeeded_with.protocol)}</strong>\`;
+        if (diag.succeeded_with.adapter) {
+          html += \` (使用适配器)\`;
+        }
+        html += \`</div>\`;
+      } else {
+        html += \`<div style="padding: 8px; background: rgba(180,59,50,0.1); border-left: 3px solid var(--bad); border-radius: 4px;">\`;
+        html += \`❌ 所有协议尝试均失败\`;
+        html += \`</div>\`;
+      }
+      html += '</div>';
+
+      html += \`<div style="margin-bottom: 8px; color: var(--muted); font-size: 12px;">总尝试: \${diag.total_attempts} 次 · 总延迟: \${diag.total_latency_ms}ms</div>\`;
+
+      html += '<div style="display: grid; gap: 8px;">';
+      for (const attempt of diag.attempts || []) {
+        const isSuccess = attempt.status >= 200 && attempt.status < 300;
+        const borderColor = isSuccess ? 'var(--good)' : 'var(--bad)';
+        const bgColor = isSuccess ? 'rgba(18,128,92,0.05)' : 'rgba(180,59,50,0.05)';
+
+        html += \`<div style="border: 1px solid var(--line); border-left: 3px solid \${borderColor}; background: \${bgColor}; border-radius: 4px; padding: 12px; font-size: 13px;">\`;
+        html += \`<div style="display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: baseline;">\`;
+
+        html += \`<span style="color: var(--muted);">序号:</span><strong>#\${attempt.sequence}</strong>\`;
+        html += \`<span style="color: var(--muted);">协议:</span><strong>\${esc(attempt.protocol)}</strong>\`;
+        html += \`<span style="color: var(--muted);">端点:</span><code style="font-size: 11px;">\${esc(attempt.endpoint)}</code>\`;
+        html += \`<span style="color: var(--muted);">状态:</span><strong style="color: \${isSuccess ? 'var(--good)' : 'var(--bad)'};">\${attempt.status}</strong>\`;
+        html += \`<span style="color: var(--muted);">延迟:</span><span>\${attempt.latency_ms}ms</span>\`;
+
+        if (attempt.adapter) {
+          html += \`<span style="color: var(--muted);">适配器:</span><span>✅ 已使用\`;
+          if (attempt.adapter_conversions?.length) {
+            html += \` (\${attempt.adapter_conversions.join(', ')})\`;
+          }
+          html += '</span>';
+        }
+
+        if (attempt.production_disabled) {
+          html += \`<span style="color: var(--muted);">生产配置:</span><span style="color: var(--warn);">⚠️ 未启用</span>\`;
+        }
+
+        if (attempt.error) {
+          html += \`<span style="color: var(--muted);">错误:</span><strong style="color: var(--bad);">\${esc(attempt.error)}</strong>\`;
+        }
+
+        if (attempt.fallback_reason) {
+          html += \`<span style="color: var(--muted);">回退原因:</span><span>\${esc(attempt.fallback_reason)}</span>\`;
+        }
+
+        html += '</div>';
+
+        if (attempt.error_body && attempt.error_body.length > 0) {
+          // Try to parse as JSON first
+          let errorDisplay = attempt.error_body;
+          try {
+            const parsed = JSON.parse(attempt.error_body);
+            errorDisplay = JSON.stringify(parsed, null, 2);
+          } catch {
+            // Not JSON, display as-is but truncate
+            errorDisplay = attempt.error_body.length > 500 ? attempt.error_body.slice(0, 500) + '...' : attempt.error_body;
+          }
+          html += \`<details style="margin-top: 8px;"><summary style="cursor: pointer; color: var(--muted); font-size: 12px;">上游错误详情</summary>\`;
+          html += \`<pre style="margin: 8px 0 0 0; padding: 8px; background: var(--paper); border-radius: 4px; font-size: 11px; overflow-x: auto; max-height: 300px;">\${esc(errorDisplay)}</pre>\`;
+          html += '</details>';
+        }
+
+        html += '</div>';
+      }
+      html += '</div>';
+
+      content.innerHTML = html;
+    }
+
+    function isDebugLockRequest(request) {
+      return Boolean(request?.debug_lock);
+    }
+
+    async function unlockDebugLock() {
+      try {
+        const response = await fetch('/pool/debug-unlock', {
+          method: 'POST',
+          headers: authHeaders()
+        });
+        const result = await response.json();
+        if (response.ok) {
+          setToast('Debug Lock 已解除');
+          await load();
+        } else {
+          setToast(\`解锁失败: \${result.error || response.status}\`);
+        }
+      } catch (error) {
+        setToast(\`解锁失败: \${error.message}\`);
+      }
+    }
+
+    function showLockDialog(upstreamName) {
+      const confirmed = confirm(\`🔒 Debug Lock Mode\n\n确认将所有请求锁定到 "\${upstreamName}"？\n\n这将绕过正常的selection逻辑，强制路由所有请求到此upstream，用于诊断protocol支持问题。\n\n注意：这会影响所有客户端的请求。\`);
+      if (confirmed) {
+        lockToUpstream(upstreamName);
+      }
+    }
+
+    async function lockToUpstream(upstreamName) {
+      try {
+        const response = await fetch(\`/pool/upstreams/\${encodeURIComponent(upstreamName)}/debug-lock\`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'content-type': 'application/json' },
+          body: JSON.stringify({
+            respect_model_override: true
+          })
+        });
+        const result = await response.json();
+        if (response.ok) {
+          setToast(\`已锁定到 \${upstreamName}\`);
+          await load();
+        } else {
+          setToast(\`锁定失败: \${result.error?.message || result.error || response.status}\`);
+        }
+      } catch (error) {
+        setToast(\`锁定失败: \${error.message}\`);
+      }
+    }
+
     const authHeaders = () => adminToken ? { authorization: \`Bearer \${adminToken}\` } : {};
     const esc = (value) => String(value ?? '').replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char]));
     const ICON_PATHS = {
@@ -9558,6 +10371,7 @@ function dashboardHtml() {
       external: '<path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>',
       gauge: '<path d="M21 12a9 9 0 1 0-18 0"></path><path d="M12 12l4-4"></path><path d="M8 21h8"></path>',
       heart: '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8Z"></path>',
+      lock: '<rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path>',
       pause: '<path d="M10 4H6v16h4V4Z"></path><path d="M18 4h-4v16h4V4Z"></path>',
       play: '<path d="m6 3 14 9-14 9V3Z"></path>',
       plus: '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
@@ -10077,6 +10891,32 @@ function dashboardHtml() {
       if (state === 'unknown' || state === 'disabled' || state === 'advanced_curl_required' || state === 'codex_forward_only') return 'cold';
       return 'bad';
     };
+    // Localized health-state label for the workbench pill. Keeps the raw
+    // English state in tooltips/data-attributes for diagnostics while showing
+    // a calm Chinese label to operators.
+    const HEALTH_STATE_LABELS = {
+      ok: '正常',
+      missing_key: '缺 Key',
+      missing_model_override: '缺 Model',
+      stale_model_override: 'Model 过期',
+      auth_error: '认证失败',
+      rate_limited: '限流',
+      server_error: '服务异常',
+      network_error: '网络错误',
+      timeout: '超时',
+      disabled: '已禁用',
+      oauth_ready: '待 OAuth',
+      inconclusive: '不确定',
+      models_unsupported: '模型不支持',
+      unsupported: '不支持',
+      advanced_curl_required: '需高级 curl',
+      codex_forward_only: '仅 Codex',
+      unexpected_status: '异常状态',
+      blocked: '受限',
+      no_amount: '无额度',
+      unknown: '未知'
+    };
+    const healthStateLabel = (state) => HEALTH_STATE_LABELS[state] || state || '未知';
     const capabilityClass = (status) => {
       if (status === 'verified') return 'ok';
       if (status === 'assumed' || status === 'skipped') return 'warn';
@@ -10101,14 +10941,25 @@ function dashboardHtml() {
       ].filter(Boolean);
       return parts.join(' · ');
     }
+    // Distinguish evidence source so a probe-verified capability is not
+    // confused with real-traffic verification. Mirrors the Verification Tier
+    // split (一层检测通过 vs 真实请求验证).
+    const capabilitySourceSuffix = (capability = {}) => {
+      if (capability.status !== 'verified') return '';
+      if (capability.source === 'probe') return ' (探针)';
+      if (capability.source === 'real_traffic') return ' (真实)';
+      return '';
+    };
     function protocolCapabilitiesHtml(upstream) {
       const capabilities = upstream.capabilities || {};
       return '<div class="protocols" data-field="protocol_capabilities">'
         + capabilityOrder.map((name) => {
           const capability = capabilities[name] || {};
           const status = capability.status || 'unknown';
+          const declaredTag = capability.source === 'user_declared' ? ' (声明)'
+            : capability.source === 'config' ? ' (配置)' : '';
           return '<span class="protocol ' + capabilityClass(status) + '" title="' + esc(capabilityTitle(name, capability)) + '">'
-            + esc(capabilityLabels[name] || name) + ': ' + esc(status)
+            + esc(capabilityLabels[name] || name) + ': ' + esc(status) + esc(capabilitySourceSuffix(capability)) + esc(declaredTag)
             + '</span>';
         }).join('')
         + '</div>';
@@ -10340,9 +11191,9 @@ function dashboardHtml() {
       not_required: '无需签到'
     };
     const verificationTierLabels = {
-      real_verified: '真实请求验证',
-      probe_only: '一层检测通过',
-      real_pending: '可选待真实验证',
+      real_verified: '真实流量验证',
+      probe_only: '探测验证',
+      real_pending: '未验证',
       unavailable: '不可用'
     };
     const verificationFilterLabels = {
@@ -10355,11 +11206,55 @@ function dashboardHtml() {
     if (!signinFilterLabels[signinFilter]) signinFilter = 'all';
     if (!verificationFilterLabels[verificationFilter]) verificationFilter = 'all';
     const signinFilterMatches = (upstream) => signinFilter === 'all' || signinStatusValue(upstream) === signinFilter;
+
+    // Inline verification tier logic (from verification-tier.mjs)
+    const PROTOCOL_CAPABILITY_NAMES = ['responses', 'chat_completions', 'anthropic_messages'];
+    function deriveVerificationTier(upstream) {
+      if (!upstream || !upstream.capabilities) {
+        return 'not_verified';
+      }
+
+      const capabilities = upstream.capabilities;
+      let hasProbeVerified = false;
+
+      for (const protocol of PROTOCOL_CAPABILITY_NAMES) {
+        const capability = capabilities[protocol];
+        if (!capability || capability.status !== 'verified') {
+          continue;
+        }
+
+        if (capability.source === 'real_traffic') {
+          return 'proven_by_traffic';
+        }
+
+        if (capability.source === 'probe') {
+          hasProbeVerified = true;
+        }
+      }
+
+      return hasProbeVerified ? 'proven_by_probe' : 'not_verified';
+    }
+
+    // Map a verification detail tier to the 4 dashboard filter buckets.
+    const VERIFICATION_TIER_TO_FILTER = {
+      proven_by_traffic: 'real_verified',
+      proven_by_probe: 'probe_only',
+      real_pending: 'real_pending',
+      unavailable: 'unavailable'
+    };
+    function verificationDetail(upstream) {
+      // Prefer the server-precomputed detail (canonical decision flowchart).
+      if (upstream?.verification_detail?.tier) return upstream.verification_detail;
+      // Inline fallback (kept for back-compat if the field is absent).
+      const tier = deriveVerificationTier(upstream);
+      if (tier === 'proven_by_traffic') return { tier: 'proven_by_traffic', indicator: 'green', label: '真实请求验证' };
+      if (tier === 'proven_by_probe') return { tier: 'proven_by_probe', indicator: 'yellow', label: '一层检测通过' };
+      if (upstream?.enabled === false) return { tier: 'unavailable', indicator: 'grey', label: '已禁用' };
+      if (upstream?.quarantined) return { tier: 'unavailable', indicator: 'orange', label: '已隔离' };
+      return { tier: 'real_pending', indicator: 'blue', label: '待验证' };
+    }
     function verificationTier(upstream) {
-      if (upstream.available && upstream.representative_availability?.verified === true) return 'real_verified';
-      if (upstream.available && upstream.health?.state === 'ok') return 'probe_only';
-      if (upstream.available) return 'real_pending';
-      return 'unavailable';
+      return VERIFICATION_TIER_TO_FILTER[verificationDetail(upstream).tier] || 'real_pending';
     }
     const verificationFilterMatches = (upstream) => verificationFilter === 'all' || verificationTier(upstream) === verificationFilter;
     function setSigninFilter(nextFilter) {
@@ -10465,10 +11360,13 @@ function dashboardHtml() {
       if (!template) return 'missing';
       return template.fresh ? 'fresh' : 'stale';
     }
-    const upstreamSupportsModel = (upstream, model) => {
+    const upstreamMatchesModelFamily = (upstream, model) => {
       if (!model) return true;
-      const models = upstream.health?.models || [];
-      return models.length === 0 || models.includes(model);
+      const value = String(model || '').toLowerCase();
+      const api = String(upstream.api || 'openai').toLowerCase();
+      if (value.includes('claude')) return api === 'anthropic' || api === 'both';
+      if (upstream.codex_oauth) return value.startsWith('gpt-');
+      return api === 'openai' || api === 'both';
     };
     const hasConfiguredKey = (upstream) => (upstream.keys || []).some((key) => key.configured);
     const isHardHealthFailure = (upstream) => ['auth_error', 'rate_limited', 'server_error', 'network_error', 'timeout', 'missing_key', 'models_unsupported', 'unexpected_status'].includes(upstream.health?.state || '');
@@ -10494,18 +11392,15 @@ function dashboardHtml() {
       const cooling = active.filter((upstream) => upstream.cooldown_ms > 0);
       const missingKeys = active.filter((upstream) => !hasConfiguredKey(upstream));
       const disabled = ups.filter((upstream) => !upstream.enabled);
-      const modelExcluded = activeModel
-        ? available.filter((upstream) => {
-          const models = upstream.health?.models || [];
-          return models.length > 0 && !models.includes(activeModel);
-        })
+      const modelFamilyExcluded = activeModel
+        ? available.filter((upstream) => !upstreamMatchesModelFamily(upstream, activeModel))
         : [];
       const hardFailures = active.filter(isHardHealthFailure);
       if (ups.length === 0) return 'Blocked: no Upstreams configured.';
       if (enabled.length === 0) return 'Blocked: all Upstreams are Disabled.';
       if (active.length === 0 && quarantined.length > 0) return 'Blocked: all Active Upstreams are in Quarantine.';
       if (eligible.length === 0 && missingKeys.length === active.length) return 'Blocked: no configured Upstream Keys are available.';
-      if (eligible.length === 0 && modelExcluded.length > 0) return 'Blocked: Model Override ' + activeModel + ' is not a Discovered Model on any available Upstream.';
+      if (eligible.length === 0 && modelFamilyExcluded.length > 0) return 'Blocked: Model Override ' + activeModel + ' is incompatible with available Upstream protocol families.';
       if (eligible.length === 0 && cooling.length > 0) return 'Blocked: all Selection candidates are in Cooldown.';
       if (eligible.length === 0) return 'Blocked: zero Upstreams can currently participate in Selection.';
       if (latestFailure) return latestFailure;
@@ -10513,13 +11408,35 @@ function dashboardHtml() {
       if (disabled.length > 0) return 'Degraded: ' + disabled.length + ' Upstream' + (disabled.length === 1 ? '' : 's') + ' Disabled.';
       if (cooling.length > 0) return 'Degraded: ' + cooling.length + ' Upstream' + (cooling.length === 1 ? '' : 's') + ' in Cooldown.';
       if (missingKeys.length > 0) return 'Degraded: ' + missingKeys.length + ' enabled Upstream' + (missingKeys.length === 1 ? '' : 's') + ' missing configured Upstream Keys.';
-      if (modelExcluded.length > 0) return 'Degraded: ' + modelExcluded.length + ' available Upstream' + (modelExcluded.length === 1 ? '' : 's') + ' excluded by Model Override.';
+      if (modelFamilyExcluded.length > 0) return 'Degraded: ' + modelFamilyExcluded.length + ' available Upstream' + (modelFamilyExcluded.length === 1 ? '' : 's') + ' outside the Model Override protocol family.';
       if (hardFailures.length > 0) return 'Degraded: ' + hardFailures.length + ' enabled Upstream' + (hardFailures.length === 1 ? '' : 's') + ' reporting hard Health State.';
       if (available.length < enabled.length) return 'Degraded: ' + available.length + ' of ' + enabled.length + ' enabled Upstreams are available.';
       return 'Usable: Selection has eligible Upstreams and no current blocking reason.';
     }
     function updateTopDiagnostic(data, ups, activeModel) {
-      const eligible = ups.filter((upstream) => upstream.available && upstreamSupportsModel(upstream, activeModel));
+      // Check for debug lock first
+      const lockInfo = getDebugLockInfo(data);
+      if (lockInfo) {
+        poolDiagnostic.dataset.state = 'degraded';
+        poolUsability.innerHTML = '<span style="color: var(--warn);">🔒 Debug Locked</span>';
+        const duration = formatDebugLockDuration(lockInfo.locked_duration_seconds || 0);
+        diagnosticReason.innerHTML = \`<strong style="color: var(--warn);">⚠️ Debug Lock Mode Active</strong><br>所有请求已锁定到 <code>\${esc(lockInfo.upstream)}</code> (已锁定 \${duration})。<button onclick="unlockDebugLock()" style="margin-left: 8px; padding: 4px 8px; font-size: 12px;">🔓 解锁</button>\`;
+        selectionCount.textContent = '锁定模式';
+        selectionCount.title = 'Debug Lock: All requests routed to ' + lockInfo.upstream;
+        modelOverrideState.textContent = activeModel || 'Following request';
+        modelOverrideState.title = activeModel ? 'Model Override: ' + activeModel : 'No Model Override; use Requested Model.';
+        adminTokenState.textContent = adminToken ? 'Accepted' : 'Not required';
+
+        // Show/update debug lock diagnostics panel
+        updateDebugLockDiagnostics(lockInfo);
+        return;
+      }
+
+      // Hide debug lock diagnostics panel when not locked
+      document.getElementById('debugLockDiagnostics').style.display = 'none';
+
+      // Normal diagnostic flow
+      const eligible = ups.filter((upstream) => upstream.available && upstreamMatchesModelFamily(upstream, activeModel));
       const latestFailure = requestFailureText((data.recent_requests || [])[0]);
       const active = ups.filter((upstream) => upstream.enabled && !upstream.quarantined);
       const degraded = eligible.length > 0 && (
@@ -10531,7 +11448,7 @@ function dashboardHtml() {
       poolDiagnostic.dataset.state = state;
       poolUsability.textContent = state[0].toUpperCase() + state.slice(1);
       selectionCount.textContent = eligible.length + ' / ' + ups.length + ' eligible';
-      selectionCount.title = eligible.length + ' Upstreams can participate in Selection; ' + ups.filter((upstream) => upstream.available).length + ' are currently available before Model Override filtering.';
+      selectionCount.title = eligible.length + ' Upstreams can participate in Selection after protocol-family compatibility; Discovered Models are advisory evidence only. ' + ups.filter((upstream) => upstream.available).length + ' are currently available before that compatibility check.';
       modelOverrideState.textContent = activeModel || 'Following request';
       modelOverrideState.title = activeModel ? 'Model Override: ' + activeModel : 'No Model Override; use Requested Model.';
       adminTokenState.textContent = adminToken ? 'Accepted' : 'Not required';
@@ -10805,9 +11722,9 @@ function dashboardHtml() {
     function workbenchCardHtml(u, activeModel, data, index) {
       const probeModel = probeModelValue(u.name, activeModel);
       return \`
-        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'} \${u.quarantined ? 'quarantined' : ''}" data-upstream="\${esc(u.name)}" data-verification-tier="\${verificationTier(u)}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
+        <article class="card workbench-row panel \${u.name === editingName ? 'editing' : ''} \${u.enabled ? '' : 'paused'} \${u.quarantined ? 'quarantined' : ''}" data-upstream="\${esc(u.name)}" data-verification-tier="\${verificationTier(u)}" data-verification-indicator="\${verificationDetail(u).indicator}" tabindex="0" role="button" aria-label="编辑站点 \${esc(u.name)}" style="animation-delay:\${index * 35}ms">
           <div class="workbench-cell">
-            <div class="name">\${esc(u.name)}</div>
+            <div class="name"><span class="verification-dot" data-indicator="\${verificationDetail(u).indicator}" title="\${esc(verificationDetail(u).label)}: \${esc(verificationDetail(u).reason)}">●</span><span class="verification-label">\${esc(verificationDetail(u).label)}</span>\${esc(u.name)}</div>
             <div class="url">\${esc(u.base_url)}</div>
             <div class="keys">\${keySummaryHtml(u)}</div>
             \${protocolCapabilitiesHtml(u)}
@@ -10854,6 +11771,7 @@ function dashboardHtml() {
               <button class="ghost probe-site" type="button" data-probe="\${esc(u.name)}" \${probingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : probingUpstreams.has(u.name) ? '测试中' : '测试'}</button>
               <button class="ghost claude-site" type="button" data-claude-check="\${esc(u.name)}" \${claudeCheckingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('radar')}\${!u.enabled ? '停用中' : claudeCheckingUpstreams.has(u.name) ? '检测中' : 'Claude'}</button>
               <button class="ghost billing-site" type="button" data-billing="\${esc(u.name)}" \${billingUpstreams.has(u.name) || !u.enabled ? 'disabled' : ''}>\${icon('wallet')}\${!u.enabled ? '停用中' : billingUpstreams.has(u.name) ? '刷新中' : '余额'}</button>
+              <button class="ghost lock-site" type="button" data-lock="\${esc(u.name)}" title="Lock all requests to this upstream for debugging">\${icon('lock')}Lock</button>
               \${u.site_url ? \`<a class="site-link" href="\${esc(u.site_url)}" target="_blank" rel="noopener noreferrer">\${icon('external')}签到</a>\` : ''}
               <button class="ghost signin-action \${canSignin(u) ? '' : 'is-off'}" type="button" data-signin-available="\${esc(u.name)}" data-available="\${canSignin(u) ? 'true' : 'false'}" aria-pressed="\${canSignin(u) ? 'true' : 'false'}">\${icon(canSignin(u) ? 'x' : 'check')}\${canSignin(u) ? '设不可签' : '设可签'}</button>
               <button class="ghost signin-action \${!canSignin(u) ? 'is-off' : signinCompleted(u) ? 'is-complete' : ''}" type="button" data-signin-complete="\${esc(u.name)}" \${!canSignin(u) ? 'disabled' : ''}>\${icon(!canSignin(u) || signinCompleted(u) ? 'x' : 'signin')}\${!canSignin(u) ? '不可签' : signinCompleted(u) ? '撤销' : '完成'}</button>
@@ -10892,14 +11810,18 @@ function dashboardHtml() {
         }
         return \`\${compatibility.mode || 'adapter'} · \${compatibility.adapter || 'adapter'} · \${parts.join(' | ') || 'no changes'}\`;
       };
-      requestList.innerHTML = items.length ? items.map((item) => \`
-        <div class="request-row">
-          <div><small>Model</small><strong>\${esc(item.originalModel || 'none')} -> \${esc(item.actualModel || 'none')}</strong></div>
-          <div><small>Upstream</small><strong>\${esc(item.upstream || 'unknown')}</strong></div>
+      requestList.innerHTML = items.length ? items.map((item) => {
+        const isDebugLock = isDebugLockRequest(item);
+        const debugLockIcon = isDebugLock ? '<span title="Debug Lock Request" style="margin-right: 4px;">🔒</span>' : '';
+        return \`
+        <div class="request-row \${isDebugLock ? 'debug-lock-request' : ''}">
+          <div><small>Model</small><strong>\${debugLockIcon}\${esc(item.originalModel || 'none')} -> \${esc(item.actualModel || 'none')}</strong></div>
+          <div><small>Upstream</small><strong>\${esc(item.upstream || 'unknown')}\${isDebugLock ? ' (locked)' : ''}</strong></div>
           <div><small>Status</small><strong title="\${esc(\`Tokens \${fullToken(item.tokens ?? 0)} · Input \${fullToken(item.inputTokens ?? 0)} · Output \${fullToken(item.outputTokens ?? 0)}\`)}">\${esc(item.outcome || '')} · \${esc(item.status ?? 0)} · \${esc(item.durationMs ?? 0)}ms · \${esc(fmtToken(item.tokens ?? 0))} tok · in \${esc(fmtToken(item.inputTokens ?? 0))} / out \${esc(fmtToken(item.outputTokens ?? 0))}</strong></div>
           <div><small>Compatibility</small><strong title="\${esc(compatibilityText(item.compatibility))}">\${esc(compatibilityText(item.compatibility))}</strong></div>
           <div><small>When</small><strong>\${new Date(item.at).toLocaleTimeString()}</strong></div>
-        </div>\`).join('') : '<div class="empty">暂无请求记录。</div>';
+        </div>\`;
+      }).join('') : '<div class="empty">暂无请求记录。</div>';
     }
     function resetEdit(clearValues = true) {
       editingName = '';
@@ -11504,6 +12426,11 @@ function dashboardHtml() {
         deleteUpstream(deleteButton.dataset.delete || '');
         return;
       }
+      const lockButton = event.target.closest('[data-lock]');
+      if (lockButton) {
+        showLockDialog(lockButton.dataset.lock || '');
+        return;
+      }
       const button = event.target.closest('[data-model]');
       if (button) {
         const name = button.dataset.modelUpstream || button.closest('[data-upstream]')?.dataset.upstream || '';
@@ -11603,7 +12530,7 @@ function createKeyStatusView(key, state, at) {
 function createUpstreamStatusView(upstream, config, state, at, today) {
   const availability = availabilitySummary(upstream.stats, state.availability);
   const available = upstreamAvailable(upstream, at, state.modelOverride);
-  const selectionWeight = upstreamSelectionWeight(upstream, availability, state.modelOverride, at);
+  const selectionWeight = upstreamSelectionWeight(upstream, availability, state.modelOverride, '', at);
   const effectiveHealthState = healthProbeEffectiveState(upstream.health, state.modelOverride);
   return {
     name: upstream.name,
@@ -11632,11 +12559,13 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     probe_auth: upstream.probeAuth,
     api: upstream.api,
     capabilities: normalizeProtocolCapabilities(upstream.capabilities),
+    verification_tier: deriveVerificationTier(upstream),
+    verification_detail: deriveVerificationDetail(upstream, { now: at }),
     enabled: upstream.enabled,
     quarantined: upstream.quarantined === true,
     weight: upstream.weight,
     selection_weight: roundedSelectionValue(selectionWeight),
-    selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, at)) : 0,
+    selection_score: available ? roundedSelectionValue(upstreamSelectionScore(upstream, availability, state.modelOverride, '', at)) : 0,
     representative_availability: (() => {
       // Choose protocol based on upstream API type and available evidence
       if (upstream.api === 'anthropic') {
@@ -11707,6 +12636,7 @@ function createStatusPayload(config, state) {
         }
       }
     },
+    debug_lock: getDebugLockState(state),
     representative_templates: representativeTemplatesPayload(state, at),
     recent_requests: config.debug?.capture_request_headers === true
       ? state.recentRequests
@@ -11985,7 +12915,7 @@ function normalizeImportItem(item, index, options = {}) {
     probe_auth: codexOAuth ? 'none' : probeAuth,
     request_mode: codexOAuth ? 'codex_oauth' : requestModeFromImportItem(item),
     api: api || undefined,
-    model_suffix_strip: firstString(item.model_suffix_strip, item.modelSuffixStrip),
+    model_suffix_strip: firstString(item.model_suffix_strip, item.modelSuffixStrip, item.model_suffix),
     probe_headers: item.probe_headers || item.probeHeaders,
     protocol_capabilities: item.protocol_capabilities || item.protocolCapabilities,
     billing: item.billing,
@@ -12208,7 +13138,9 @@ function validateUpstreamPayload(payload, config) {
     ? payload.model_suffix_strip
     : hasOwn('modelSuffixStrip')
       ? payload.modelSuffixStrip
-      : existing?.model_suffix_strip;
+      : hasOwn('model_suffix')
+        ? payload.model_suffix
+        : existing?.model_suffix_strip;
   const probeAuthInput = hasOwn('probe_auth') ? payload.probe_auth : existing?.probe_auth;
   const apiInput = hasOwn('api') ? payload.api : existing?.api;
   const api = normalizeUpstreamApi(apiInput, probeAuthInput);
@@ -12502,6 +13434,43 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     state.compatibility = normalizeCompatibilityConfig(config.compatibility);
     await saveConfig(config, options.configPath);
     return jsonResponse(res, 200, { ok: true, compatibility: createStatusPayload(config, state).compatibility });
+  }
+
+  const debugLockMatch = pathname.match(/^\/pool\/upstreams\/([^/]+)\/debug-lock$/);
+  if (req.method === 'POST' && debugLockMatch) {
+    const name = decodeURIComponent(debugLockMatch[1]);
+    const payload = await readJsonBody(req, maxBodyBytes);
+    const upstream = state.upstreams.find((item) => item.name === name);
+    if (!upstream) {
+      return jsonResponse(res, 404, { error: `upstream not found: ${name}` });
+    }
+    if (upstream.codexOAuth || upstream.api === 'codex-oauth') {
+      return jsonResponse(res, 400, {
+        error: `Codex OAuth upstreams cannot be locked (require per-request authentication): ${name}`
+      });
+    }
+    const result = enableDebugLock(state, name, {
+      respect_model_override: payload.respect_model_override
+    });
+    // Add advisory notes for quarantined/disabled/missing-key upstreams
+    if (upstream.quarantined) {
+      result.debug_lock.note = 'Upstream is quarantined but accessible in debug lock mode';
+    } else if (upstream.disabled || upstream.enabled === false) {
+      result.debug_lock.note = 'Upstream is disabled but accessible in debug lock mode';
+    }
+    const validKeys = (upstream.keys || []).filter((k) => k.env && process.env[k.env]);
+    if (validKeys.length === 0) {
+      result.debug_lock.warning = 'No valid upstream keys found. Requests will fail with auth error.';
+    }
+    return jsonResponse(res, 200, result);
+  }
+
+  if (req.method === 'POST' && pathname === '/pool/debug-unlock') {
+    const result = disableDebugLock(state);
+    if (!result.ok) {
+      return jsonResponse(res, 400, result);
+    }
+    return jsonResponse(res, 200, result);
   }
 
   if (req.method === 'POST' && pathname === '/pool/codex-oauth/import') {
@@ -12961,6 +13930,7 @@ export function createPoolServer(config, options = {}) {
           const candidate = chooseCandidate(state, tried, {
             preferredModel: requestedModel,
             preferredProtocol: 'anthropic_messages',
+            targetProtocol: 'anthropic_messages',
             allowUnknownModelFallback: networkAttempt > 1,
             candidateFilter: canUseAdapter
               ? null  // Allow any upstream when using adapter
@@ -12984,6 +13954,13 @@ export function createPoolServer(config, options = {}) {
           // Determine if we need to use the adapter for this upstream
           const upstreamApi = upstream.api || 'openai';
           const useAdapter = upstreamApi === 'openai' || (upstreamApi === 'both' && canUseAdapter);
+          // When the Messages→Chat adapter strips Messages-only features, surface
+          // the conversion in the response header and Recent Request Timeline so
+          // stripping is never silent (CORE_FEATURES §3, §11).
+          const messagesAdapterCompatibility = useAdapter && stripMessagesOnlyFeatures
+            ? buildMessagesAdapterCompatibility(originalBody)
+            : null;
+          const messagesProtocol = deriveRecordingProtocol({ pathname: '/v1/messages', useAdapter });
           const routeTrace = attachForwardedModelTrace(requestRouteTrace({ pathname }), requestedModel, forwardedModel);
 
           let targetUrl, requestBody, requestHeaders;
@@ -12999,6 +13976,7 @@ export function createPoolServer(config, options = {}) {
               );
             } catch (error) {
               recordFailure(state, upstream, key, `conversion error: ${error.message}`, 0, null);
+              recordAvailabilityAttempt(upstream, messagesProtocol, false);
               if (!allowRetry) {
                 persistStats(state, statsPath);
                 return anthropicErrorResponse(res, 500, 'api_error', `Request conversion failed: ${error.message}`);
@@ -13032,6 +14010,7 @@ export function createPoolServer(config, options = {}) {
               if (statusCode >= 200 && statusCode < 300) {
                 streamingBoundaryReached = true;
                 recordSuccess(upstream, attemptStart, statusCode);
+                recordAvailabilityAttempt(upstream, messagesProtocol, true);
 
                 // Create usage capture for native forwarding
                 const usageCapture = createUsageCapture(response.headers);
@@ -13042,11 +14021,17 @@ export function createPoolServer(config, options = {}) {
 
                   if (isStreaming && contentType.includes('text/event-stream')) {
                     // Streaming adapter: Chat SSE → Messages SSE
-                    res.writeHead(200, {
+                    const adapterHeaders = {
                       'content-type': 'text/event-stream',
                       'cache-control': 'no-cache',
-                      'connection': 'keep-alive'
-                    });
+                      'connection': 'keep-alive',
+                      'x-codex-api-pool-upstream': upstream.name
+                    };
+                    if (messagesAdapterCompatibility) {
+                      adapterHeaders['x-codex-api-pool-stripped'] = compatibilityStrippedHeader(messagesAdapterCompatibility.stripped);
+                      adapterHeaders['x-codex-api-pool-compatibility'] = messagesAdapterCompatibility.mode;
+                    }
+                    res.writeHead(200, adapterHeaders);
 
                     const adapter = createChatToMessagesStreamAdapter(res, requestedModel);
                     response.on('data', (chunk) => {
@@ -13078,7 +14063,8 @@ export function createPoolServer(config, options = {}) {
                         inputTokens: recordedTokens.inputTokens,
                         outputTokens: recordedTokens.outputTokens,
                         durationMs: now() - attemptStart,
-                        outcome: 'ok'
+                        outcome: 'ok',
+                        compatibility: messagesAdapterCompatibility ? compatibilitySummary(messagesAdapterCompatibility, routeTrace) : null
                       });
                       persistStats(state, statsPath);
                     });
@@ -13096,10 +14082,16 @@ export function createPoolServer(config, options = {}) {
                     response.on('end', () => {
                       try {
                         const convertedBody = chatCompletionToMessagesJson(responseBody, requestedModel);
-                        res.writeHead(200, {
+                        const jsonAdapterHeaders = {
                           'content-type': 'application/json',
-                          'content-length': convertedBody.length
-                        });
+                          'content-length': convertedBody.length,
+                          'x-codex-api-pool-upstream': upstream.name
+                        };
+                        if (messagesAdapterCompatibility) {
+                          jsonAdapterHeaders['x-codex-api-pool-stripped'] = compatibilityStrippedHeader(messagesAdapterCompatibility.stripped);
+                          jsonAdapterHeaders['x-codex-api-pool-compatibility'] = messagesAdapterCompatibility.mode;
+                        }
+                        res.writeHead(200, jsonAdapterHeaders);
                         res.end(convertedBody);
 
                         const capturedUsage = usageCapture.result();
@@ -13125,7 +14117,8 @@ export function createPoolServer(config, options = {}) {
                           inputTokens: recordedTokens.inputTokens,
                           outputTokens: recordedTokens.outputTokens,
                           durationMs: now() - attemptStart,
-                          outcome: 'ok'
+                          outcome: 'ok',
+                          compatibility: messagesAdapterCompatibility ? compatibilitySummary(messagesAdapterCompatibility, routeTrace) : null
                         });
                         persistStats(state, statsPath);
                       } catch (error) {
@@ -13136,7 +14129,7 @@ export function createPoolServer(config, options = {}) {
                   }
                 } else {
                   // Native forwarding: capture usage while forwarding
-                  res.writeHead(statusCode, response.headers);
+                  res.writeHead(statusCode, sanitizeResponseHeaders(response.headers, upstream.name));
 
                   response.on('data', (chunk) => {
                     usageCapture.push(chunk);
@@ -13181,6 +14174,7 @@ export function createPoolServer(config, options = {}) {
                 response.on('data', (chunk) => { errorBody += chunk; });
                 response.on('end', () => {
                   recordFailure(state, upstream, key, `HTTP ${statusCode}`, statusCode, response.headers['retry-after']);
+                  recordAvailabilityAttempt(upstream, messagesProtocol, false);
 
                   // Record failed request for Dashboard (only if not retrying)
                   if (!allowRetry || streamingBoundaryReached) {
@@ -13233,6 +14227,7 @@ export function createPoolServer(config, options = {}) {
             upstreamReq.on('error', (error) => {
               if (!streamingBoundaryReached) {
                 recordFailure(state, upstream, key, error.message, 0, null);
+                recordAvailabilityAttempt(upstream, messagesProtocol, false);
 
                 // Record failed request for Dashboard (only if not retrying)
                 if (!allowRetry) {
@@ -13273,6 +14268,7 @@ export function createPoolServer(config, options = {}) {
               upstreamReq.destroy();
               if (!streamingBoundaryReached) {
                 recordFailure(state, upstream, key, 'timeout', 0, null);
+                recordAvailabilityAttempt(upstream, messagesProtocol, false);
 
                 // Record timeout for Dashboard (only if not retrying)
                 if (!allowRetry) {
@@ -13318,6 +14314,7 @@ export function createPoolServer(config, options = {}) {
             return; // Success, exit handler
           } catch (error) {
             recordFailure(state, upstream, key, error.message, 0, null);
+            recordAvailabilityAttempt(upstream, messagesProtocol, false);
             if (!allowRetry) {
               persistStats(state, statsPath);
               return anthropicErrorResponse(res, 502, 'api_error', `upstream request failed: ${error.message}`);
@@ -13352,6 +14349,20 @@ export function createPoolServer(config, options = {}) {
 
       if (state.upstreams.length === 0) {
         return jsonResponse(res, 503, { error: 'no upstreams configured', error_display: noUpstreamsConfiguredDisplay() });
+      }
+
+      // Check for Debug Lock Mode
+      if (isDebugLockActive(state)) {
+        const clientProtocol = pathname === '/v1/messages'
+          ? 'anthropic_messages'
+          : 'responses';
+
+        return await executeDebugLockedRequest(req, res, state, config, {
+          pathname,
+          clientProtocol,
+          statsPath,
+          maxBodyBytes
+        });
       }
 
       const originalBody = await readBody(req, maxBodyBytes);
@@ -13401,9 +14412,11 @@ export function createPoolServer(config, options = {}) {
       let networkAttempt = 1;
       while (networkAttempt <= maxAttempts) {
         const routingAt = now();
+        const sharedTargetProtocol = deriveRecordingProtocol({ pathname, upstreamApi: 'passthrough' });
         const candidate = chooseCandidate(state, tried, {
           preferredModel: requestedModel,
           preferredProtocol: pathname === '/v1/responses' && !shouldUseAnthropicResponsesAdapter(pathname, requestedModel) ? 'responses' : '',
+          targetProtocol: sharedTargetProtocol || '',
           allowUnknownModelFallback: networkAttempt > 1,
           candidateFilter: activeRequiresNativeResponses
             ? (upstream) => {
@@ -13435,6 +14448,18 @@ export function createPoolServer(config, options = {}) {
 
         const { upstream, key } = candidate;
         tried.add(`${upstream.name}:${key.index}`);
+
+        // Codex OAuth: proactively refresh a (near-)expired access token before
+        // forwarding (CORE_FEATURES §12). If refresh is unavailable or fails,
+        // treat this upstream as not currently usable and retry/fallback.
+        if (upstream.codexOAuth) {
+          const refreshed = await ensureCodexOAuthFresh({ upstream, runtime, config });
+          if (!refreshed) {
+            recordFailure(state, upstream, key, 'oauth_refresh_failed', 0, null);
+            continue;
+          }
+        }
+
         const attemptedModel = requestedModel;
         const forwardedModel = forwardModelForUpstream(upstream, attemptedModel);
         const learnedRouteStrategy = routeStrategyForUpstream(upstream, attemptedModel);
@@ -13669,7 +14694,8 @@ export function createPoolServer(config, options = {}) {
                 startedAt: result.startedAt,
                 retried: attempt > 1,
                 succeeded: false,
-                reason
+                reason,
+                protocol: deriveRecordingProtocol({ pathname, upstreamApi: routeTrace?.upstream_api })
               });
               rememberRequest(state, {
                 method: req.method,
@@ -13797,7 +14823,8 @@ export function createPoolServer(config, options = {}) {
                 succeeded: responseSucceeded,
                 routeTrace,
                 compatibility,
-                statsPath
+                statsPath,
+                protocol: deriveRecordingProtocol({ pathname, upstreamApi: routeTrace?.upstream_api })
               });
             } else {
               persistStats(state, statsPath);
@@ -13829,7 +14856,8 @@ export function createPoolServer(config, options = {}) {
             succeeded: false,
             reason: result.reason,
             retryAfter: result.retryAfter,
-            applyFailure: !nativeResponsesUnsupported
+            applyFailure: !nativeResponsesUnsupported,
+            protocol: deriveRecordingProtocol({ pathname, upstreamApi: routeTrace?.upstream_api })
           });
         }
         persistStats(state, statsPath);
@@ -14006,6 +15034,8 @@ export const __testInternals = {
   buildAnthropicRequestHeaders,
   buildProbeHeaders,
   effectiveProbeModelForUpstream,
+  healthProbeOk,
+  healthProbeStatus,
   buildChatCompletionsFromMessages,
   chatCompletionToMessagesJson,
   createChatToMessagesStreamAdapter,
@@ -14015,7 +15045,23 @@ export const __testInternals = {
   initialProtocolCapabilities,
   recordProtocolCapabilityProbe,
   recordProtocolCapabilityRealTraffic,
-  shouldRecheckProtocolCapability
+  shouldRecheckProtocolCapability,
+  joinUrlPath,
+  joinTargetUrl,
+  joinDebugRequestUrl,
+  responsesPathForBaseUrl,
+  chatCompletionsPathForBaseUrl,
+  anthropicMessagesPathForBaseUrl,
+  anthropicModelsPathForBaseUrl,
+  // Exposed for the monitor-only-probe behavior tests (WS2).
+  healthAllowsSelection,
+  upstreamAvailable,
+  chooseCandidate,
+  representativeAvailability,
+  representativeSelectionMultiplier,
+  refreshCodexOAuthToken,
+  ensureCodexOAuthFresh,
+  codexOAuthNeedsRefresh
 };
 
 export async function start(configPath) {

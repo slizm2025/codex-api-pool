@@ -359,5 +359,46 @@ await test('Management API preserves Upstream Model Suffix configuration', async
   }
 });
 
+// ── Alias: CORE_FEATURES.md documents "model_suffix" — accept it as an alias ──
+async function testModelSuffixAlias() {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'claude-opus-4-8-cc' }] }));
+  });
+  const upstreamInfo = await listen(upstream);
+  statsIndex += 1;
+  const pool = createPoolServer({
+    server: { host: '127.0.0.1', port: 0, public_prefix: '/v1', auth_token_env: 'TEST_POOL_TOKEN', admin_auth_token_env: 'TEST_ADMIN_TOKEN' },
+    upstreams: [{
+      name: 'aliased',
+      base_url: upstreamInfo.url,
+      api: 'anthropic',
+      // The documented-but-different key (CORE_FEATURES.md §7 example uses "model_suffix")
+      model_suffix: '-cc',
+      keys: [{ env: 'TEST_UPSTREAM_KEY' }]
+    }]
+  }, { statsPath: path.join(statsRoot, `stats-${statsIndex}.json`) });
+  const poolInfo = await listen(pool);
+  try {
+    const statusResponse = await fetch(`${poolInfo.url}/pool/status`, {
+      headers: { authorization: `Bearer ${process.env.TEST_ADMIN_TOKEN}` }
+    });
+    const status = await statusResponse.json();
+    const u = status.upstreams?.find((item) => item.name === 'aliased');
+    if (u?.model_suffix_strip !== '-cc') {
+      throw new Error(`expected "model_suffix" alias to populate model_suffix_strip=-cc, got ${u?.model_suffix_strip}`);
+    }
+    passed++;
+    console.log('✓ model_suffix config key is accepted as alias for model_suffix_strip');
+  } catch (error) {
+    failed++;
+    console.log(`❌ ${error.message}`);
+  } finally {
+    await close(pool);
+    await close(upstream);
+  }
+}
+await testModelSuffixAlias();
+
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

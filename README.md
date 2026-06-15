@@ -129,7 +129,23 @@ selection_score = weight * availability_multiplier
 | `secrets.local.json` | Codex OAuth secret 存储，按需生成，不提交。 |
 | `stats.local.json` | Runtime State 持久化文件，按需生成，不提交。 |
 | `test/smoke-test.mjs` | 端到端烟测。 |
-| `CONTEXT.md` | 领域词汇说明。 |
+| `test/real-world-scenarios.test.mjs` | S1-S10 常见真实场景模拟，需要本地临时 listener。 |
+| `test/real-world-scenarios-manifest.test.mjs` | 非监听的真实场景清单一致性检查。 |
+
+### 文档导航
+
+| 文档 | 作用 |
+| --- | --- |
+| `CORE_FEATURES.md` | 核心功能规格（15 项功能的权威说明）。 |
+| `CONTEXT.md` | 领域语言与术语表。 |
+| `FEATURE_AUDIT_FINAL.md` | 功能实现一致性审计报告与修复记录。 |
+| `CHANGELOG.md` | 变更日志。 |
+| `docs/MESSAGES-API-GUIDE.md` | Anthropic Messages API（Claude CLI）配置指南。 |
+| `docs/CLAUDE_CLI_COMPATIBILITY.md` | Claude CLI 兼容性请求头说明。 |
+| `docs/PROTOCOL-MAPPING.md` | 三协议族字段映射速查。 |
+| `docs/PROTOCOL_CAPABILITY_OPTIMIZATION.md` | 协议能力管理优化说明。 |
+| `docs/REQUEST_LOGGING.md` | 请求捕获与日志分析指南。 |
+| `docs/adr/0001-0005` | 架构决策记录（Streaming Boundary、Adapter 兼容模式、Probe 非权威性、Messages 支持、Debug Lock）。 |
 
 ## 快速启动
 
@@ -796,15 +812,25 @@ jq 'select(.originalModel == "claude-opus-4-8") | .incomingBody' requests.debug.
 ```bash
 cd /Users/slizm/myprojects/codex-api-pool
 npm run smoke
+npm run scenarios:manifest
 ```
 
 期望看到：
 
 ```text
 smoke ok: ...
+real-world scenario manifest ok: ...
 ```
 
 烟测覆盖鉴权、Fallback、启停 Upstream、Usage/Billing 统计、Availability、运行时添加、配置保留编辑、JSON 导入、模型发现、Anthropic 模型探测、Model Override、流式错误冷却、HTTP 400/522 Fallback、Recent Requests 和 Health Probe。
+
+完整 S1-S10 真实场景模拟可运行：
+
+```bash
+npm run scenarios
+```
+
+该命令会启动本地临时 listener；在受限 sandbox 中可能因 `listen EPERM` 失败，应在允许 localhost 监听的环境中运行。
 
 ## 安全提示
 

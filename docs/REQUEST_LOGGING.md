@@ -1,5 +1,28 @@
 # 请求日志调试功能完整说明
 
+## 快速参考
+
+**一行配置**：`"debug": { "capture_request_headers": true, "request_log_path": "requests.debug.log" }`
+
+```bash
+./scripts/view-request-log.sh              # 查看最近请求
+./scripts/view-request-log.sh follow        # 实时跟踪
+./scripts/analyze-request-log.sh            # 统计分析
+./scripts/extract-request.sh --last-error   # 查看最后失败
+curl -s http://127.0.0.1:8787/pool/status | jq '.recent_requests[0]'   # API 查询
+```
+
+**常用分析**：
+```bash
+jq -r '.upstream // "null"' requests.debug.log | sort | uniq -c | sort -rn   # 按上游统计
+jq -r 'select(.durationMs) | "\(.durationMs) \(.upstream) \(.path)"' requests.debug.log | sort -rn | head -10   # 最慢请求
+jq -r 'select(.outcome == "error") | "\(.at) \(.reason)"' requests.debug.log   # 失败原因
+```
+
+⚠️ 日志包含敏感信息（API Keys、Cookies），已加入 `.gitignore`；分享前脱敏：`jq 'del(.incomingHeaders.authorization)' requests.debug.log`
+
+---
+
 ## 功能概述
 
 Codex API Pool 现在支持完整的请求捕获和日志记录功能，用于调试和分析客户端请求。

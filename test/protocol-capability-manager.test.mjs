@@ -14,6 +14,7 @@ import {
   upstreamHasVerifiedProtocolCapability,
   upstreamHasUserDeclaredProtocolCapability
 } from '../src/protocol-capability-manager.mjs';
+import { deriveVerificationTier } from '../src/verification-tier.mjs';
 
 let testCount = 0;
 let passCount = 0;
@@ -383,6 +384,33 @@ test('Probe state "inconclusive" → capability status "unknown"', () => {
   });
 
   assertEquals(upstream.capabilities.responses.status, 'unknown');
+});
+
+test('non-representative probe classification is preserved in capability evidence', () => {
+  const upstream = createMockUpstream();
+  const result = createMockProbeResult(503, JSON.stringify({
+    error: {
+      message: 'Service Unavailable',
+      type: 'error'
+    },
+    type: 'error'
+  }));
+  const classified = {
+    state: 'inconclusive',
+    error: 'responses probe HTTP 503 is not authoritative for Codex Desktop availability',
+    outcome: 'inconclusive',
+    authoritative: false,
+    representative: false
+  };
+
+  recordProtocolCapabilityProbe(upstream, 'responses', result, classified, {
+    checkedAt: '2026-01-01T00:00:00Z',
+    model: 'gpt-5.5'
+  });
+
+  assertEquals(upstream.capabilities.responses.status, 'unknown');
+  assertEquals(upstream.capabilities.responses.representative, false);
+  assertEquals(upstream.capabilities.responses.last_probe_state, 'inconclusive');
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -788,6 +816,33 @@ test('ProtocolCapabilityManager.applyProbeResult: updates key health and referen
 
   // Upstream health should reference key label
   assertEquals(upstream.health.keyLabel, 'my-key-label');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test Suite: real_traffic evidence vs periodic probes (regression)
+// ══════════════════════════════════════════════════════════════════════════════
+
+test('regression: successful periodic probe must NOT downgrade real_traffic evidence', () => {
+  // JUN was verified by a real Codex request. The 60s periodic Health Probe then
+  // runs and succeeds (state 'ok'). The capability must stay real_traffic, and
+  // the verification tier must stay proven_by_traffic.
+  const upstream = createMockUpstream();
+
+  recordProtocolCapabilityRealTraffic(upstream, 'responses', {
+    checkedAt: '2026-06-14T10:00:00Z',
+    model: 'gpt-5-codex',
+    httpStatus: 200
+  });
+
+  const result = createMockProbeResult(200, '{"id":"x"}', true);
+  const classified = createMockClassified('ok');
+  recordProtocolCapabilityProbe(upstream, 'responses', result, classified, {
+    checkedAt: '2026-06-14T10:01:00Z',
+    model: 'gpt-5-codex'
+  });
+
+  assertEquals(upstream.capabilities.responses.source, 'real_traffic');
+  assertEquals(deriveVerificationTier(upstream), 'proven_by_traffic');
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

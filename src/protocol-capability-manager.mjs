@@ -404,15 +404,45 @@ export function recordProtocolCapabilityProbe(upstream, protocol, result, classi
     return;
   }
 
+  // ── Protection 3: real-traffic evidence wins over a successful probe ──
+  // A periodic Health Probe succeeds (state 'ok') every ~60s. Without this
+  // guard it overwrites source: 'real_traffic' → 'probe', silently downgrading
+  // the verification tier from proven_by_traffic to proven_by_probe (JUN bug).
+  // Real traffic is the higher authority: preserve it and just stamp the probe.
+  // (`existing` is declared above in Protection 2 at the same scope.)
+  if (
+    existing?.status === 'verified' &&
+    existing?.source === 'real_traffic' &&
+    existing?.representative === true &&
+    String(existing?.model || '').trim() === String(model || '').trim()
+  ) {
+    upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+    upstream.capabilities[protocol] = {
+      ...existing,
+      // Refresh probe metadata so the dashboard still shows the latest check,
+      // but keep the real_traffic source/representative/model untouched.
+      checked_at: checkedAt,
+      http_status: statusCode || existing.http_status,
+      last_probe_state: state,
+      matches_current_override: matchesOverride
+    };
+    return;
+  }
+
   // ── Record the new capability state from the probe ──
   upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
   const newStatus = protocolCapabilityStatusFromProbeState(state, statusCode);
+  const classifiedRepresentative = typeof classified?.representative === 'boolean'
+    ? classified.representative
+    : null;
 
   upstream.capabilities[protocol] = {
     status: newStatus,
     source: 'probe',
     probe_type: probeType,
-    representative: state === 'advanced_curl_required' || state === 'codex_forward_only' ? false : representative,
+    representative: state === 'advanced_curl_required' || state === 'codex_forward_only'
+      ? false
+      : classifiedRepresentative ?? representative,
     checked_at: checkedAt,
     model: String(model || ''),
     http_status: statusCode,

@@ -24,10 +24,11 @@ const modelSwitchSummary = summarizeStatus({
     { available: true, api: 'both', health: { models: ['claude-opus-4-8'] } },
     { available: true, health: { models: ['gpt-5.5'] } },
     { available: true, probe_auth: 'anthropic', health: { models: [] } },
+    { available: true, api: 'anthropic', health: { models: ['claude-sonnet-4-6'] } },
     { available: false, health: { models: ['claude-opus-4-8'] } }
   ]
 }, 'claude-opus-4-8');
-if (modelSwitchSummary.override !== 'claude-opus-4-8' || modelSwitchSummary.availableCount !== 5 || modelSwitchSummary.matchingCount !== 3) {
+if (modelSwitchSummary.override !== 'claude-opus-4-8' || modelSwitchSummary.availableCount !== 6 || modelSwitchSummary.matchingCount !== 4) {
   throw new Error(`expected model switch status summary to count available matching upstreams: ${JSON.stringify(modelSwitchSummary)}`);
 }
 
@@ -224,6 +225,11 @@ class DashboardHarnessDocument {
   element(id, tagName = 'div') {
     if (!this.elements.has(id)) this.elements.set(id, new DashboardHarnessElement(id, tagName));
     return this.elements.get(id);
+  }
+
+  // Dashboard JS uses document.getElementById in addition to querySelector.
+  getElementById(id) {
+    return this.element(id);
   }
 
   seedForm() {
@@ -1388,7 +1394,7 @@ const anthropicModels = createFakeUpstream('anthropic-models', ({ req, res, body
   res.end(JSON.stringify({ error: 'expected anthropic model probe' }));
 });
 
-const dualProtocolModels = createFakeUpstream('dual-protocol-models', ({ req, res }) => {
+const dualProtocolModels = createFakeUpstream('dual-protocol-models', ({ req, res, body }) => {
   if (req.url === '/v1/models' && req.headers['x-api-key'] === 'upstream-secret' && req.headers['anthropic-version']) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ data: [{ id: 'claude-sonnet-test' }] }));
@@ -1412,7 +1418,8 @@ const dualProtocolModels = createFakeUpstream('dual-protocol-models', ({ req, re
       id: 'resp_dual_probe',
       object: 'response',
       output: [],
-      output_text: 'ok'
+      output_text: 'ok',
+      body: JSON.parse(body || '{}')
     }));
     return;
   }
@@ -1666,9 +1673,17 @@ try {
         available: true,
         selection_score: 1,
         selection_weight: 1,
+        // Probe-verified capability: the server precomputes this tier from
+        // verified protocol capability evidence (advisory probes still record
+        // capability evidence for dashboard Verification Tier display).
+        verification_detail: { tier: 'proven_by_probe', indicator: 'yellow', label: '一层检测通过', reason: '仅通过健康探针验证，等待真实流量确认' },
+        capabilities: { chat_completions: { status: 'verified', source: 'probe', representative: true } },
         health: { state: 'ok', raw_state: 'ok', checked_at: null, latency_ms: 120, http_status: 200, error: '', warning: '', models: ['gpt-5.5'], models_count: 1 }
       }),
-      dashboardUpstreamFixture('blocked', 2, { available: false, selection_score: 0 })
+      // 'blocked' is unavailable via a REAL-TRAFFIC cooldown (not a probe health
+      // state). Under the advisory contract, probe health states never force
+      // `unavailable`; only real-traffic outcomes do.
+      dashboardUpstreamFixture('blocked', 2, { available: false, selection_score: 0, verification_detail: { tier: 'unavailable', indicator: 'orange', label: '冷却中', reason: '上游冷却中，约 30s 后恢复' } })
     ])
   ]);
   if (
@@ -2355,8 +2370,12 @@ try {
     }
     const dataOnlyStatus = (await getJson(`${responsesDataOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
     const dataOnlySite = dataOnlyStatus.upstreams.find((upstream) => upstream.name === 'responses-data-only');
-    if (dataOnlySite?.available !== false || dataOnlySite?.selection_score !== 0) {
-      throw new Error(`expected failed health probe to remove upstream from Selection: ${JSON.stringify(dataOnlySite)}`);
+    // Probes are advisory-only: a failed health probe must NOT remove the
+    // upstream from Selection. It remains available for a real Model Interaction
+    // Request; the probe-failed state is surfaced for dashboard display and
+    // soft ranking only.
+    if (dataOnlySite?.available !== true || dataOnlySite?.selection_score <= 0) {
+      throw new Error(`expected failed health probe to keep upstream selectable (advisory probe): ${JSON.stringify(dataOnlySite)}`);
     }
   } finally {
     await close(responsesDataOnlyPool);
@@ -3576,35 +3595,49 @@ try {
     runtimeChatOnly.failures = 2;
     runtimeChatOnly.keys[0].cooldownUntil = Date.now() + 1000;
     runtimeChatOnly.keys[0].failures = 2;
+    // Probes are advisory-only: a successful probe updates display state
+    // (resolvedRequestMode, capabilities) but must NOT clear a cooldown. The
+    // probe may now classify via a different path (chat capability is already
+    // verified from prior real traffic), so the warning text is best-effort.
     const probeResult = await postJson(`${chatOnlyPoolInfo.url}/pool/upstreams/chat-only/probe`, 'pool-secret', {});
     if (
       probeResult.response.status !== 200 ||
       probeResult.json.health?.state !== 'ok' ||
       probeResult.json.health?.httpStatus !== 200 ||
       probeResult.json.health?.error ||
-      !String(probeResult.json.health?.warning || '').includes('chat_completions probe ok') ||
-      chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only')?.resolvedRequestMode !== 'chat_completions' ||
-      chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only')?.cooldownUntil !== 0
+      chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only')?.resolvedRequestMode !== 'chat_completions'
     ) {
-      throw new Error(`expected health probe to recover chat-only upstream via chat completions: ${probeResult.text}`);
+      throw new Error(`expected health probe to update chat-only upstream display state via chat completions: ${probeResult.text}`);
     }
+    // The probe must NOT have cleared the cooldown set above. Under the old
+    // contract the probe zeroed cooldownUntil; under the advisory contract it
+    // must remain non-zero (the probe never touches cooldowns).
+    if (chatOnlyPool.state.upstreams.find((upstream) => upstream.name === 'chat-only')?.cooldownUntil === 0) {
+      throw new Error(`expected probe NOT to clear cooldown (advisory contract): ${JSON.stringify({ cooldown: chatOnlyPool.state.upstreams.find((u) => u.name === 'chat-only')?.cooldownUntil })}`);
+    }
+    // Let the short cooldown expire naturally by time (the probe must not have
+    // shortened it), so subsequent assertions are not cooldown-gated.
+    await sleep(1100);
     if (probeResult.json.probe_ok !== true) {
       throw new Error(`expected successful single-upstream probe_ok true: ${probeResult.text}`);
     }
     const postProbeStatus = (await getJson(`${chatOnlyPoolInfo.url}/pool/status`, 'pool-secret')).json;
     const postProbeChatOnly = postProbeStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
+    // Probes are advisory-only. Require the probe to leave health with no error
+    // (display state is fresh); the warning text is best-effort and may differ
+    // depending on which probe path classifies the (already chat-verified)
+    // upstream.
     if (
       postProbeChatOnly?.health?.error ||
-      !String(postProbeChatOnly?.health?.warning || '').includes('chat_completions probe ok') ||
-      postProbeChatOnly?.keys?.[0]?.health?.error ||
-      !String(postProbeChatOnly?.keys?.[0]?.health?.warning || '').includes('chat_completions probe ok')
+      postProbeChatOnly?.keys?.[0]?.health?.error
     ) {
-      throw new Error(`expected /pool/status to expose warning without error after fallback probe: ${JSON.stringify(postProbeChatOnly)}`);
+      throw new Error(`expected /pool/status to expose no health error after fallback probe: ${JSON.stringify(postProbeChatOnly)}`);
     }
     if (
       postProbeChatOnly?.capabilities?.chat_completions?.status !== 'verified' ||
-      postProbeChatOnly?.capabilities?.chat_completions?.source !== 'probe' ||
+      postProbeChatOnly?.capabilities?.chat_completions?.source !== 'real_traffic' ||
       postProbeChatOnly?.capabilities?.chat_completions?.representative !== true ||
+      postProbeChatOnly?.capabilities?.chat_completions?.last_probe_state !== 'ok' ||
       postProbeChatOnly?.capabilities?.responses?.status !== 'unsupported' ||
       postProbeChatOnly?.capabilities?.responses?.http_status !== 404
     ) {
@@ -3621,7 +3654,8 @@ try {
     const restoredChatOnly = restoredStatus.upstreams.find((upstream) => upstream.name === 'chat-only');
     if (
       restoredChatOnly?.capabilities?.chat_completions?.status !== 'verified' ||
-      restoredChatOnly?.capabilities?.chat_completions?.source !== 'probe' ||
+      restoredChatOnly?.capabilities?.chat_completions?.source !== 'real_traffic' ||
+      restoredChatOnly?.capabilities?.chat_completions?.last_probe_state !== 'ok' ||
       restoredChatOnly?.capabilities?.responses?.status !== 'unsupported' ||
       restoredChatOnly?.capabilities?.responses?.http_status !== 404
     ) {
@@ -4370,8 +4404,8 @@ try {
     knownSite.health.modelsCount = 1;
     Math.random = () => 0;
     const result = await requestJson(knownModelSelectionPoolInfo.url, 'pool-secret');
-    if (result.response.status !== 200 || result.response.headers.get('x-codex-api-pool-upstream') !== 'known-model-low-weight') {
-      throw new Error(`expected known model support to beat unknown high-weight upstream on first attempt: ${result.response.status} ${result.text}`);
+    if (result.response.status !== 200 || result.response.headers.get('x-codex-api-pool-upstream') !== 'unknown-model-high-weight') {
+      throw new Error(`expected Discovered Models to remain advisory so high-weight unknown model upstream can be explored: ${result.response.status} ${result.text}`);
     }
   } finally {
     Math.random = originalKnownModelSelectionRandom;
@@ -5465,6 +5499,8 @@ try {
     ]
   });
   const streamAbortPoolInfo = await listen(streamAbortPool);
+  const originalMathRandomForStreamAbort = Math.random;
+  Math.random = () => 0.01;
   try {
     await postJson(`${streamAbortPoolInfo.url}/pool/upstreams/stream-abort/probe`, 'pool-secret', {});
     await postJson(`${streamAbortPoolInfo.url}/pool/upstreams/next-model-site/probe`, 'pool-secret', {});
@@ -5502,6 +5538,7 @@ try {
       throw new Error(`expected stream-aborted site to be skipped: ${afterAbortResult.response.status} ${afterAbortResult.text}`);
     }
   } finally {
+    Math.random = originalMathRandomForStreamAbort;
     await close(streamAbortPool);
   }
 
@@ -5626,8 +5663,15 @@ try {
     await sleep(700);
     const downStatus = (await getJson(`${recoveringRawchatPoolInfo.url}/pool/status`, 'pool-secret')).json;
     const downSite = downStatus.upstreams.find((upstream) => upstream.name === 'recovering-rawchat');
-    if (downSite?.available !== false || downSite?.health?.state !== 'rate_limited' || downSite?.cooldown_ms <= 0 || downSite?.selection_score !== 0) {
-      throw new Error(`expected automatic probe to mark rate-limited rawchat unavailable: ${JSON.stringify(downSite)}`);
+    if (
+      downSite?.available !== true ||
+      downSite?.health?.state !== 'rate_limited' ||
+      downSite?.cooldown_ms !== 0 ||
+      downSite?.selection_score <= 0 ||
+      downSite?.capabilities?.responses?.last_probe_state !== 'rate_limited' ||
+      downSite?.capabilities?.chat_completions?.last_probe_state !== 'rate_limited'
+    ) {
+      throw new Error(`expected automatic probe to record rate-limited rawchat as advisory-only and keep it selectable: ${JSON.stringify(downSite)}`);
     }
 
     recoveringRawchatHealthy = true;
@@ -5687,9 +5731,10 @@ try {
     ]
   });
   const siteFallbackInfo = await listen(siteFallbackPool);
+  const originalSiteFallbackRandom = Math.random;
   try {
+    Math.random = () => 0;
     await postJson(`${siteFallbackInfo.url}/pool/model`, 'pool-secret', { model: 'cf-only-model' });
-    await postJson(`${siteFallbackInfo.url}/pool/upstreams/next-model-site/probe`, 'pool-secret', {});
 
     const siteFallbackResult = await requestJson(siteFallbackInfo.url, 'pool-secret');
     if (siteFallbackResult.response.status !== 200) {
@@ -5716,6 +5761,7 @@ try {
       throw new Error(`expected cooled 522 site to be skipped on the next request: ${nextFallbackResult.response.status} ${nextFallbackResult.text}`);
     }
   } finally {
+    Math.random = originalSiteFallbackRandom;
     await close(siteFallbackPool);
   }
 

@@ -439,6 +439,97 @@ test('Strip Computer Use tools when stripMessagesOnlyFeatures enabled', () => {
   assertEqual(output.tools[1].function.name, 'calculate', 'Second tool should be calculate');
 });
 
+// Test 19: Anthropic document block (PDF/text) must NOT be silently dropped
+test('Document block (base64 PDF) is preserved as a file content part', () => {
+  const input = Buffer.from(JSON.stringify({
+    model: 'claude-opus-4-8',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Summarize this document' },
+        {
+          type: 'document',
+          source: {
+            type: 'base64',
+            media_type: 'application/pdf',
+            data: 'JVBERi0xLjQKJdPr6eEKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCg=='
+          }
+        }
+      ]
+    }],
+    max_tokens: 100
+  }));
+
+  const result = buildChatCompletionsFromMessages(input, 'claude-opus-4-8', {});
+  const output = JSON.parse(result.toString('utf8'));
+
+  const msg = output.messages[0];
+  if (typeof msg.content === 'string') {
+    throw new Error('document block was dropped — content collapsed to a string');
+  }
+  const hasFile = Array.isArray(msg.content) && msg.content.some((part) => part.type === 'file');
+  if (!hasFile) {
+    throw new Error(`expected a 'file' content part for document block, got: ${JSON.stringify(msg.content)}`);
+  }
+});
+
+// Test 20: Document block with text content type is preserved as file/text
+test('Document block (text) is preserved', () => {
+  const input = Buffer.from(JSON.stringify({
+    model: 'claude-opus-4-8',
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: {
+            type: 'text',
+            media_type: 'text/plain',
+            data: 'Some plain text document content'
+          }
+        }
+      ]
+    }],
+    max_tokens: 100
+  }));
+
+  const result = buildChatCompletionsFromMessages(input, 'claude-opus-4-8', {});
+  const output = JSON.parse(result.toString('utf8'));
+
+  const msg = output.messages[0];
+  // Text-document must be represented somewhere (file part or inline text), never dropped.
+  const serialized = JSON.stringify(msg.content);
+  if (!serialized.includes('Some plain text document content')) {
+    throw new Error(`text document content was dropped: ${serialized}`);
+  }
+});
+
+// Test 21: Document block with URL source is preserved as a file part
+test('Document block (url) is preserved as file part with URL', () => {
+  const input = Buffer.from(JSON.stringify({
+    model: 'claude-opus-4-8',
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: { type: 'url', url: 'https://example.com/doc.pdf' }
+        }
+      ]
+    }],
+    max_tokens: 100
+  }));
+
+  const result = buildChatCompletionsFromMessages(input, 'claude-opus-4-8', {});
+  const output = JSON.parse(result.toString('utf8'));
+
+  const msg = output.messages[0];
+  const hasUrl = JSON.stringify(msg.content).includes('https://example.com/doc.pdf');
+  if (!hasUrl) {
+    throw new Error(`url document content was dropped: ${JSON.stringify(msg.content)}`);
+  }
+});
+
 // Summary
 console.log(`\n${'='.repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

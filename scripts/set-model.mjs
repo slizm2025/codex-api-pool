@@ -44,8 +44,7 @@ function upstreamSupportsModel(upstream, model) {
   const isOpenAi = upstream?.api === 'openai' || upstream?.api === 'both' || !upstream?.api;
   if (isClaude && !isAnthropic) return false;
   if (!isClaude && !isOpenAi) return false;
-  const models = upstream.health?.models || [];
-  return models.length === 0 || models.includes(model);
+  return true;
 }
 
 export function summarizeStatus(status, model) {
@@ -119,9 +118,9 @@ export async function main(argv = process.argv.slice(2)) {
   const summary = summarizeStatus(status.json, model);
   console.log(`model override: ${summary.override || 'off'}`);
   console.log(`available upstreams: ${summary.availableCount}`);
-  console.log(`matching upstreams: ${summary.matchingCount}`);
+  console.log(`protocol-compatible upstreams: ${summary.matchingCount}`);
   if (model && summary.matchingCount === 0) {
-    console.warn(`warning: no currently available upstream advertises ${model}`);
+    console.warn(`warning: no currently available upstream is protocol-compatible with ${model}`);
   }
   return 0;
 }

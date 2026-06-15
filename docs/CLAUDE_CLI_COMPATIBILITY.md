@@ -32,7 +32,7 @@ if (keyValue && type === 'anthropic') {
   headers['x-api-key'] = keyValue;
   headers['user-agent'] = 'claude-cli/2.1.177 (external, cli)';  // Claude CLI UA
   headers['anthropic-version'] = '2023-06-01';
-  headers['anthropic-beta'] = 'claude-code-20250219';  // Claude CLI beta
+  headers['anthropic-beta'] = 'claude-code-20250219,...,context-1m-2025-08-07';  // Claude CLI beta
   headers['anthropic-dangerous-direct-browser-access'] = 'true';
   headers['x-app'] = 'cli';
 }
@@ -56,7 +56,7 @@ if (incomingUserAgent && incomingUserAgent.includes('claude-cli')) {
 }
 
 // 默认添加 Claude CLI beta 头
-headers['anthropic-beta'] = incomingHeaders['anthropic-beta'] || 'claude-code-20250219';
+headers['anthropic-beta'] = incomingHeaders['anthropic-beta'] || 'claude-code-20250219,...,context-1m-2025-08-07';
 
 // 添加 Claude CLI 特定头
 headers['anthropic-dangerous-direct-browser-access'] = 
@@ -75,7 +75,7 @@ User-Agent: claude-cli/2.1.177 (external, cli)
 x-api-key: sk-***
 Content-Type: application/json
 anthropic-version: 2023-06-01
-anthropic-beta: claude-code-20250219,interleaved-thinking-2025-05-14,...
+anthropic-beta: claude-code-20250219,interleaved-thinking-2025-05-14,...,context-1m-2025-08-07
 anthropic-dangerous-direct-browser-access: true
 x-app: cli
 ```
@@ -143,7 +143,7 @@ curl -X POST http://127.0.0.1:8787/v1/messages \
 ### 4. 验证上游看到的请求
 检查 `incomingHeaders` 字段，确认转发给上游的请求包含：
 - `user-agent: claude-cli/2.1.177 (external, cli)`
-- `anthropic-beta: claude-code-20250219`
+- `anthropic-beta: claude-code-20250219,...,context-1m-2025-08-07`
 - `anthropic-dangerous-direct-browser-access: true`
 - `x-app: cli`
 

@@ -7,8 +7,11 @@
   "scripts": {
     "start": "node src/server.mjs",
     "smoke": "node test/smoke-test.mjs",
+    "scenarios": "node test/real-world-scenarios.test.mjs",
+    "scenarios:manifest": "node test/real-world-scenarios-manifest.test.mjs",
     "add": "node scripts/add-upstream.mjs",
     "model": "node scripts/set-model.mjs",
+    "debug-lock": "node scripts/view-debug-lock-diagnostics.mjs",
     "prototype:representative-probe": "node scripts/prototype-representative-probe.mjs",
     "service": "node scripts/service.mjs",
     "service:install": "node scripts/service.mjs install",

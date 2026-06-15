@@ -70,7 +70,10 @@ import {
   buildProtocolAttemptSequence,
   shouldFallbackToNextProtocol,
   buildDebugAttemptDiagnostics,
-  addDebugLockHeaders
+  addDebugLockHeaders,
+  appendDebugLockTestPage,
+  getDebugLockPersistenceConfig,
+  persistDebugLockPage
 } from './debug-lock.mjs';
 import {
   deriveVerificationTier,
@@ -4619,6 +4622,7 @@ function createUpstreamState(upstream, index) {
     name: upstream.name || `upstream-${index + 1}`,
     enabled: upstream.enabled !== false,
     quarantined: upstream.enabled !== false && upstream.quarantined === true,
+    pinned: upstream.pinned === true,
     baseUrl: upstream.base_url,
     siteUrl,
     signinAvailable: booleanOption(signinAvailableValue(upstream), Boolean(siteUrl)),
@@ -5230,7 +5234,7 @@ function keyAvailable(keyState, at) {
 
 function upstreamAvailable(upstream, at, expectedModel = undefined) {
   return upstream.enabled
-    && !upstream.quarantined
+    && (upstream.pinned || !upstream.quarantined)
     && upstream.baseUrl
     && healthAllowsSelection(upstream, expectedModel)
     && !codexOAuthExpired(upstream, at)
@@ -7785,6 +7789,10 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
   const originalBody = await readBody(req, maxBodyBytes);
   const responsesJsonOptions = { inferJsonLike: pathname === '/v1/responses' };
 
+  // Sanitize original body for diagnostics (redact sensitive fields)
+  const { sanitizeRequestBodyForDiagnostics } = await import('./debug-lock.mjs');
+  const originalBodyString = sanitizeRequestBodyForDiagnostics(originalBody.toString('utf8'));
+
   // Parse model
   const originalModel = modelFromBody(req, originalBody, responsesJsonOptions);
 
@@ -7910,10 +7918,17 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
         let bodySize = 0;
         const maxBodySize = config.server?.max_body_bytes || 50 * 1024 * 1024;
 
-        for await (const chunk of response) {
-          if (bodySize < maxBodySize) {
-            chunks.push(chunk);
-            bodySize += chunk.length;
+        try {
+          for await (const chunk of response) {
+            if (bodySize < maxBodySize) {
+              chunks.push(chunk);
+              bodySize += chunk.length;
+            }
+          }
+        } finally {
+          // SECURITY FIX: Ensure response stream is destroyed to prevent resource leaks
+          if (response && typeof response.destroy === 'function') {
+            response.destroy();
           }
         }
 
@@ -7950,6 +7965,8 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
           status: statusCode,
           error: statusCode >= 400 ? `HTTP ${statusCode}` : undefined,
           error_body: statusCode >= 400 ? responseText : undefined,
+          request_body: requestBody.toString('utf8'),  // Pool-modified request body
+          response_body: responseText,                  // Full response body (success or failure)
           latency_ms: latencyMs,
           tokens,
           streaming: response.headers['content-type']?.includes('stream')
@@ -7991,6 +8008,8 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
           url: targetUrl,
           status: result.statusCode || 0,
           error: result.reason || 'network error',
+          request_body: requestBody.toString('utf8'),  // Pool-modified request body
+          response_body: null,                          // No response body for network errors
           latency_ms: latencyMs,
           fallback_reason: 'network_error'
         });
@@ -8008,6 +8027,8 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
         url: targetUrl,
         status: 0,
         error: error.message,
+        request_body: requestBody.toString('utf8'),  // Pool-modified request body
+        response_body: null,                          // No response for exceptions
         latency_ms: now() - attemptStart,
         fallback_reason: 'exception'
       });
@@ -8022,15 +8043,22 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
     {
       protocol: clientProtocol,
       model: originalModel,
-      model_sent: requestedModel
+      model_sent: requestedModel,
+      original_body: originalBodyString  // Client's original request body
     }
   );
 
   // Save diagnostics to state for dashboard display
-  // Only save the first test diagnostics, ignore subsequent requests
-  if (!state.debugLock.first_test_completed) {
-    state.debugLock.first_test_completed = true;
-    state.debugLock.first_test_diagnostics = diagnostics;
+  // Each request appends a test page (newest-first, capped at MAX_TEST_PAGES).
+  // getDebugLockState() derives first_test_diagnostics from test_pages[0].
+  appendDebugLockTestPage(state, diagnostics);
+
+  // Optional: persist diagnostics to file if enabled in config
+  const persistConfig = getDebugLockPersistenceConfig(config);
+  if (persistConfig.enabled) {
+    persistDebugLockPage(diagnostics, persistConfig).catch(err => {
+      console.error('[Debug Lock] Failed to persist diagnostics to file:', err);
+    });
   }
 
   // Record to Recent Request Timeline
@@ -10413,7 +10441,9 @@ function dashboardHtml() {
         locked_at: lock.locked_at,
         locked_duration_seconds: lock.locked_duration_seconds,
         first_test_completed: lock.first_test_completed || false,
-        first_test_diagnostics: lock.first_test_diagnostics || null
+        test_pages: lock.test_pages || [],
+        max_test_pages: lock.max_test_pages || 10,
+        first_test_diagnostics: lock.first_test_diagnostics || null  // Back-compat alias
       };
     }
 
@@ -10433,122 +10463,182 @@ function dashboardHtml() {
       const panel = document.getElementById('debugLockDiagnostics');
       const content = document.getElementById('debugLockDiagnosticsContent');
 
-      if (!lockInfo.first_test_diagnostics) {
+      const testPages = lockInfo.test_pages || [];
+      if (testPages.length === 0) {
         panel.style.display = 'none';
         return;
       }
 
       panel.style.display = 'block';
-      const diag = lockInfo.first_test_diagnostics;
+      let html = '';
 
-      // Header: First test notice
-      let html = '<div style="margin-bottom: 12px; padding: 10px; background: rgba(10,100,200,0.08); border-left: 3px solid var(--accent); border-radius: 4px;">';
-      html += '<div style="font-size: 13px; font-weight: 600; margin-bottom: 4px;">🔒 首次测试结果（后续请求不会覆盖此信息）</div>';
-      html += \`<div style="font-size: 12px; color: var(--muted);">测试时间: \${new Date(diag.timestamp).toLocaleString('zh-CN')}</div>\`;
+      // Header: Multi-page notice
+      html += '<div style="margin-bottom: 16px; padding: 12px; background: rgba(10,100,200,0.08); border-left: 3px solid var(--accent); border-radius: 4px;">';
+      html += '<div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">🔒 Debug Lock 诊断结果</div>';
+      html += \`<div style="font-size: 12px; color: var(--muted);">共 \${testPages.length} 个请求页面（最新的在上方，最多保留 \${lockInfo.max_test_pages || 10} 个）</div>\`;
       html += '</div>';
 
-      // Client info
-      html += '<div style="margin-bottom: 12px;">';
-      html += \`<div style="margin-bottom: 8px; color: var(--muted); font-size: 13px;">\`;
-      html += \`客户端协议: <strong>\${esc(diag.client_request?.protocol || 'N/A')}</strong> · \`;
-      html += \`请求模型: <strong>\${esc(diag.client_request?.model || 'N/A')}</strong> · \`;
-      html += \`发送模型: <strong>\${esc(diag.client_request?.model_sent || 'N/A')}</strong>\`;
-      html += '</div>';
+      // Render each test page (newest first)
+      testPages.forEach((diag, pageIndex) => {
+        const pageNumber = pageIndex + 1;
+        const isLatest = pageIndex === 0;
 
-      // Success/failure status
-      if (diag.succeeded_with) {
-        html += \`<div style="padding: 8px; background: rgba(18,128,92,0.1); border-left: 3px solid var(--good); border-radius: 4px;">\`;
-        html += \`✅ 成功：协议 <strong>\${esc(diag.succeeded_with.protocol)}</strong>\`;
-        if (diag.succeeded_with.adapter) {
-          html += \` (使用适配器)\`;
-        } else {
-          html += \` (原生转发)\`;
-        }
+        html += \`<div style="margin-bottom: 16px; border: 2px solid \${isLatest ? 'var(--accent)' : 'var(--line)'}; border-radius: 6px; background: var(--paper); overflow: hidden;">\`;
+
+        // Page header
+        html += \`<div style="padding: 12px; background: \${isLatest ? 'rgba(10,100,200,0.06)' : 'rgba(0,0,0,0.02)'}; border-bottom: 1px solid var(--line);">\`;
+        html += \`<div style="display: flex; justify-content: space-between; align-items: center;">\`;
+        html += \`<div style="font-size: 13px; font-weight: 600;">\`;
+        html += \`📄 请求 #\${pageNumber} \${isLatest ? '<span style="color: var(--accent); margin-left: 8px;">最新</span>' : ''}\`;
         html += \`</div>\`;
-      } else {
-        html += \`<div style="padding: 8px; background: rgba(180,59,50,0.1); border-left: 3px solid var(--bad); border-radius: 4px;">\`;
-        html += \`❌ 所有协议尝试均失败\`;
+        html += \`<div style="font-size: 11px; color: var(--muted);">\${new Date(diag.timestamp).toLocaleString('zh-CN')}</div>\`;
         html += \`</div>\`;
-      }
-      html += '</div>';
+        html += \`</div>\`;
 
-      html += \`<div style="margin-bottom: 12px; color: var(--muted); font-size: 12px;">总尝试: \${diag.total_attempts} 次 · 总延迟: \${diag.total_latency_ms}ms</div>\`;
+        // Page content
+        html += '<div style="padding: 12px;">';
 
-      // Protocol attempts details
-      html += '<div style="margin-bottom: 12px;"><div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">协议尝试详情</div>';
-      html += '<div style="display: grid; gap: 8px;">';
-      for (const attempt of diag.attempts || []) {
-        const isSuccess = attempt.status >= 200 && attempt.status < 300;
-        const borderColor = isSuccess ? 'var(--good)' : 'var(--bad)';
-        const bgColor = isSuccess ? 'rgba(18,128,92,0.05)' : 'rgba(180,59,50,0.05)';
+        // Client request info with original body
+        html += '<div style="margin-bottom: 12px;">';
+        html += '<div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--accent);">📥 客户端请求</div>';
+        html += \`<div style="margin-bottom: 8px; font-size: 12px; color: var(--muted);">\`;
+        html += \`协议: <strong>\${esc(diag.client_request?.protocol || 'N/A')}</strong> · \`;
+        html += \`请求模型: <strong>\${esc(diag.client_request?.model || 'N/A')}</strong> · \`;
+        html += \`发送模型: <strong>\${esc(diag.client_request?.model_sent || 'N/A')}</strong>\`;
+        html += \`</div>\`;
 
-        html += \`<div style="border: 1px solid var(--line); border-left: 3px solid \${borderColor}; background: \${bgColor}; border-radius: 4px; padding: 12px; font-size: 13px;">\`;
-        html += \`<div style="display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: baseline;">\`;
-
-        html += \`<span style="color: var(--muted);">序号:</span><strong>#\${attempt.sequence}</strong>\`;
-        html += \`<span style="color: var(--muted);">协议:</span><strong>\${esc(attempt.protocol)}</strong>\`;
-
-        // Native vs adapter indicator
-        if (attempt.adapter) {
-          html += \`<span style="color: var(--muted);">类型:</span><span style="color: var(--accent);">🔀 适配器</span>\`;
-        } else {
-          html += \`<span style="color: var(--muted);">类型:</span><span style="color: var(--good);">✓ 原生转发</span>\`;
+        // Original request body (collapsible)
+        if (diag.client_request?.original_body) {
+          const originalBodyTruncated = truncateBody(diag.client_request.original_body, 200);
+          html += \`<details style="margin-top: 8px;"><summary style="cursor: pointer; font-size: 12px; color: var(--accent);">📋 原始请求体 (点击展开)</summary>\`;
+          html += \`<pre style="margin: 8px 0 0 0; padding: 8px; background: rgba(0,0,0,0.02); border: 1px solid var(--line); border-radius: 4px; font-size: 10px; overflow-x: auto; max-height: 300px;">\${esc(originalBodyTruncated)}</pre>\`;
+          html += \`</details>\`;
         }
-
-        html += \`<span style="color: var(--muted);">端点:</span><code style="font-size: 11px;">\${esc(attempt.endpoint)}</code>\`;
-        if (attempt.model_sent) {
-          html += \`<span style="color: var(--muted);">发送模型:</span><strong>\${esc(attempt.model_sent)}</strong>\`;
-        }
-        html += \`<span style="color: var(--muted);">状态:</span><strong style="color: \${isSuccess ? 'var(--good)' : 'var(--bad)'};">\${attempt.status}</strong>\`;
-        html += \`<span style="color: var(--muted);">延迟:</span><span>\${attempt.latency_ms}ms</span>\`;
-
-        if (attempt.adapter && attempt.adapter_conversions?.length) {
-          html += \`<span style="color: var(--muted);">转换:</span><code style="font-size: 11px;">\${esc(attempt.adapter_conversions.join(', '))}</code>\`;
-        }
-
-        if (attempt.production_disabled) {
-          html += \`<span style="color: var(--muted);">注意:</span><span style="color: var(--warn);">⚠️ 此适配器在生产环境未启用</span>\`;
-        }
-
-        if (attempt.error) {
-          html += \`<span style="color: var(--muted);">错误:</span><strong style="color: var(--bad); font-size: 12px;">\${esc(attempt.error)}</strong>\`;
-        }
-
-        if (attempt.fallback_reason) {
-          html += \`<span style="color: var(--muted);">回退原因:</span><span style="font-size: 11px; color: var(--muted);">\${esc(attempt.fallback_reason)}</span>\`;
-        }
-
-        if (attempt.tokens) {
-          html += \`<span style="color: var(--muted);">Token:</span><span style="font-size: 11px;">输入 \${attempt.tokens.prompt_tokens} · 输出 \${attempt.tokens.completion_tokens}</span>\`;
-        }
-
         html += '</div>';
 
-        if (attempt.error_body && attempt.error_body.length > 0) {
-          // Try to parse as JSON first
-          let errorDisplay = attempt.error_body;
-          try {
-            const parsed = JSON.parse(attempt.error_body);
-            errorDisplay = JSON.stringify(parsed, null, 2);
-          } catch {
-            // Not JSON, display as-is (no truncation in debug mode)
-            errorDisplay = attempt.error_body;
+        // Success/failure status
+        html += '<div style="margin-bottom: 12px;">';
+        if (diag.succeeded_with) {
+          html += \`<div style="padding: 8px; background: rgba(18,128,92,0.1); border-left: 3px solid var(--good); border-radius: 4px; font-size: 12px;">\`;
+          html += \`✅ 成功：协议 <strong>\${esc(diag.succeeded_with.protocol)}</strong>\`;
+          if (diag.succeeded_with.adapter) {
+            html += \` (适配器转换)\`;
+          } else {
+            html += \` (原生转发)\`;
           }
-          html += \`<details open style="margin-top: 8px;"><summary style="cursor: pointer; color: var(--muted); font-size: 12px;">上游错误详情</summary>\`;
-          html += \`<pre style="margin: 8px 0 0 0; padding: 8px; background: var(--paper); border-radius: 4px; font-size: 11px; overflow-x: auto; max-height: 500px;">\${esc(errorDisplay)}</pre>\`;
-          html += '</details>';
+          html += \`</div>\`;
+        } else {
+          html += \`<div style="padding: 8px; background: rgba(180,59,50,0.1); border-left: 3px solid var(--bad); border-radius: 4px; font-size: 12px;">\`;
+          html += \`❌ 所有协议均失败\`;
+          html += \`</div>\`;
+        }
+        html += '</div>';
+
+        html += \`<div style="margin-bottom: 12px; color: var(--muted); font-size: 11px;">总尝试: \${diag.total_attempts} 次 · 总延迟: \${diag.total_latency_ms}ms</div>\`;
+
+        // Protocol attempts details
+        html += '<div style="margin-bottom: 12px;"><div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">🔄 协议尝试详情</div>';
+        html += '<div style="display: grid; gap: 10px;">';
+
+        for (const attempt of diag.attempts || []) {
+          html += renderAttemptCard(attempt);
         }
 
-        html += '</div>';
-      }
-      html += '</div></div>';
+        html += '</div></div>';
+
+        html += '</div>'; // End page content
+        html += '</div>'; // End page container
+      });
 
       // Re-test instruction
-      html += '<div style="margin-top: 16px; padding: 8px; background: rgba(166,106,5,0.08); border-left: 3px solid var(--warn); border-radius: 4px; font-size: 12px; color: var(--muted);">';
-      html += '💡 提示：后续客户端重连/重试请求不会覆盖此信息。要重新测试，请先解锁，再重新锁定。';
+      html += '<div style="margin-top: 16px; padding: 10px; background: rgba(166,106,5,0.08); border-left: 3px solid var(--warn); border-radius: 4px; font-size: 12px; color: var(--muted);">';
+      html += '💡 提示：每次客户端请求都会追加一个新页面。要清空历史，请先解锁再重新锁定。';
       html += '</div>';
 
       content.innerHTML = html;
+    }
+
+    // Helper: Render a single attempt card with request/response bodies
+    function renderAttemptCard(attempt) {
+      const isSuccess = attempt.status >= 200 && attempt.status < 300;
+      const borderColor = isSuccess ? 'var(--good)' : 'var(--bad)';
+      const bgColor = isSuccess ? 'rgba(18,128,92,0.05)' : 'rgba(180,59,50,0.05)';
+
+      let html = \`<div style="border: 1px solid var(--line); border-left: 3px solid \${borderColor}; background: \${bgColor}; border-radius: 4px; padding: 12px; font-size: 12px;">\`;
+
+      // Attempt metadata
+      html += \`<div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: baseline; margin-bottom: 10px;">\`;
+      html += \`<span style="color: var(--muted);">序号:</span><strong>#\${attempt.sequence}</strong>\`;
+      html += \`<span style="color: var(--muted);">协议:</span><strong>\${esc(attempt.protocol)}</strong>\`;
+
+      if (attempt.adapter) {
+        html += \`<span style="color: var(--muted);">类型:</span><span style="color: var(--accent);">🔀 适配器</span>\`;
+      } else {
+        html += \`<span style="color: var(--muted);">类型:</span><span style="color: var(--good);">✓ 原生</span>\`;
+      }
+
+      html += \`<span style="color: var(--muted);">端点:</span><code style="font-size: 10px;">\${esc(attempt.endpoint)}</code>\`;
+      if (attempt.model_sent) {
+        html += \`<span style="color: var(--muted);">发送模型:</span><strong>\${esc(attempt.model_sent)}</strong>\`;
+      }
+      html += \`<span style="color: var(--muted);">状态:</span><strong style="color: \${isSuccess ? 'var(--good)' : 'var(--bad)'};">\${attempt.status}</strong>\`;
+      html += \`<span style="color: var(--muted);">延迟:</span><span>\${attempt.latency_ms}ms</span>\`;
+
+      if (attempt.adapter && attempt.adapter_conversions?.length) {
+        html += \`<span style="color: var(--muted);">转换:</span><code style="font-size: 10px;">\${esc(attempt.adapter_conversions.join(', '))}</code>\`;
+      }
+
+      if (attempt.production_disabled) {
+        html += \`<span style="color: var(--muted);">注意:</span><span style="color: var(--warn);">⚠️ 生产环境未启用</span>\`;
+      }
+
+      if (attempt.error) {
+        html += \`<span style="color: var(--muted);">错误:</span><strong style="color: var(--bad);">\${esc(attempt.error)}</strong>\`;
+      }
+
+      if (attempt.fallback_reason) {
+        html += \`<span style="color: var(--muted);">回退原因:</span><span style="font-size: 10px; color: var(--muted);">\${esc(attempt.fallback_reason)}</span>\`;
+      }
+
+      if (attempt.tokens) {
+        html += \`<span style="color: var(--muted);">Token:</span><span style="font-size: 10px;">输入 \${attempt.tokens.prompt_tokens} · 输出 \${attempt.tokens.completion_tokens}</span>\`;
+      }
+      html += '</div>';
+
+      // Pool-modified request body (collapsible)
+      if (attempt.request_body) {
+        const requestBodyTruncated = truncateBody(attempt.request_body, 200);
+        html += \`<details style="margin-bottom: 8px;"><summary style="cursor: pointer; font-size: 11px; color: var(--accent);">📤 Pool 修改后的请求体</summary>\`;
+        html += \`<pre style="margin: 6px 0 0 0; padding: 6px; background: rgba(0,0,0,0.02); border: 1px solid var(--line); border-radius: 3px; font-size: 9px; overflow-x: auto; max-height: 250px;">\${esc(requestBodyTruncated)}</pre>\`;
+        html += \`</details>\`;
+      }
+
+      // Response body (success or failure, collapsible)
+      if (attempt.response_body) {
+        let responseDisplay = attempt.response_body;
+        try {
+          const parsed = JSON.parse(attempt.response_body);
+          responseDisplay = JSON.stringify(parsed, null, 2);
+        } catch {
+          // Not JSON, display as-is
+        }
+        const responseBodyTruncated = truncateBody(responseDisplay, 300);
+        const summaryLabel = isSuccess ? '✅ 上游响应体' : '❌ 上游错误响应';
+        html += \`<details \${!isSuccess ? 'open' : ''}><summary style="cursor: pointer; font-size: 11px; color: \${isSuccess ? 'var(--good)' : 'var(--bad)'};">\${summaryLabel}</summary>\`;
+        html += \`<pre style="margin: 6px 0 0 0; padding: 6px; background: var(--paper); border: 1px solid var(--line); border-radius: 3px; font-size: 9px; overflow-x: auto; max-height: 400px;">\${esc(responseBodyTruncated)}</pre>\`;
+        html += \`</details>\`;
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    // Helper: Truncate body for display (keep first N chars + "..." + last 1KB)
+    function truncateBody(body, previewChars) {
+      if (!body || body.length <= previewChars + 1024) return body;
+      const start = body.substring(0, previewChars);
+      const end = body.substring(body.length - 1024);
+      return start + \`\n\n... (\${body.length - previewChars - 1024} 字符已省略) ...\n\n\` + end;
     }
 
     function isDebugLockRequest(request) {
@@ -12808,6 +12898,7 @@ function createUpstreamStatusView(upstream, config, state, at, today) {
     verification_tier: deriveVerificationTier(upstream),
     verification_detail: deriveVerificationDetail(upstream, { now: at }),
     enabled: upstream.enabled,
+    pinned: upstream.pinned === true,
     quarantined: upstream.quarantined === true,
     weight: upstream.weight,
     selection_weight: roundedSelectionValue(selectionWeight),
@@ -13406,6 +13497,7 @@ function validateUpstreamPayload(payload, config) {
   const declaredProtocolCapabilities = normalizeDeclaredProtocolCapabilities(protocolCapabilitiesInput);
   const enabled = hasOwn('enabled') ? payload.enabled !== false : existing?.enabled !== false;
   const quarantined = enabled && (hasOwn('quarantined') ? payload.quarantined === true : existing?.quarantined === true);
+  const pinned = hasOwn('pinned') ? payload.pinned === true : existing?.pinned === true;
 
   return {
     name,
@@ -13447,7 +13539,8 @@ function validateUpstreamPayload(payload, config) {
     weight: Number(hasOwn('weight') ? payload.weight || 1 : existing?.weight || 1),
     keys,
     enabled,
-    quarantined: quarantined || undefined
+    quarantined: quarantined || undefined,
+    pinned: pinned || undefined
   };
 }
 

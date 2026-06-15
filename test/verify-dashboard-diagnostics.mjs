@@ -57,13 +57,21 @@ async function test() {
   }
   console.log('   ✅ debug_lock.enabled = true');
 
-  if (!status.debug_lock.last_diagnostics) {
-    console.error('   ❌ Missing last_diagnostics');
+  if (!status.debug_lock.first_test_diagnostics) {
+    console.error('   ❌ Missing first_test_diagnostics / test_pages');
     process.exit(1);
   }
-  console.log('   ✅ debug_lock.last_diagnostics present');
+  console.log('   ✅ debug_lock.first_test_diagnostics present (alias of newest test_pages entry)');
 
-  const diag = status.debug_lock.last_diagnostics;
+  // Multi-page diagnostics: confirm test_pages array is present and non-empty.
+  const pages = status.debug_lock.test_pages;
+  if (!Array.isArray(pages) || pages.length === 0) {
+    console.error('   ❌ Missing or empty test_pages array');
+    process.exit(1);
+  }
+  console.log(`   ✅ test_pages present (${pages.length} page${pages.length === 1 ? '' : 's'}, newest-first)`);
+
+  const diag = status.debug_lock.first_test_diagnostics;
 
   // Verify diagnostics structure
   const requiredFields = [
@@ -104,7 +112,7 @@ async function test() {
   console.log('\n' + '═'.repeat(80));
   console.log('✅ Dashboard diagnostics format verified!');
   console.log('\nThe Dashboard JavaScript will receive:');
-  console.log('  - lockInfo.last_diagnostics with full attempt details');
+  console.log('  - lockInfo.first_test_diagnostics with full attempt details');
   console.log('  - updateDebugLockDiagnostics() will render the panel');
   console.log('  - Panel will show all protocol attempts with status, errors, latency');
 

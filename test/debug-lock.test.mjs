@@ -191,7 +191,9 @@ test('buildProtocolAttemptSequence: Messages request sequence', () => {
   const sequence = buildProtocolAttemptSequence('anthropic_messages');
 
   assertDeepEquals(sequence, [
-    { protocol: 'anthropic_messages', adapter: false }
+    { protocol: 'anthropic_messages', adapter: false },
+    { protocol: 'chat_completions', adapter: true },
+    { protocol: 'responses', adapter: true }
   ]);
 });
 
@@ -288,7 +290,10 @@ test('shouldFallbackToNextProtocol: 503 does not fallback', () => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 import {
-  buildDebugAttemptDiagnostics
+  buildDebugAttemptDiagnostics,
+  shouldSaveDebugLockDiagnostics,
+  appendDebugLockTestPage,
+  DEBUG_LOCK_MAX_TEST_PAGES
 } from '../src/debug-lock.mjs';
 
 test('buildDebugAttemptDiagnostics: generates complete diagnostics', () => {
@@ -302,6 +307,8 @@ test('buildDebugAttemptDiagnostics: generates complete diagnostics', () => {
       status: 404,
       error: 'Not Found',
       error_body: '{"error": {"message": "Endpoint not found"}}',
+      request_body: '{"model":"gpt-5.5","input":"hi"}',
+      response_body: '{"error": {"message": "Endpoint not found"}}',
       latency_ms: 123,
       fallback_reason: 'endpoint_not_found'
     },
@@ -315,6 +322,8 @@ test('buildDebugAttemptDiagnostics: generates complete diagnostics', () => {
       production_disabled: false,
       url: 'https://api.example.com/v1/chat/completions',
       status: 200,
+      request_body: '{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}',
+      response_body: '{"id":"chatcmpl-1","choices":[]}',
       latency_ms: 456,
       tokens: {
         prompt_tokens: 10,
@@ -334,7 +343,8 @@ test('buildDebugAttemptDiagnostics: generates complete diagnostics', () => {
   const clientRequest = {
     protocol: 'responses',
     model: 'gpt-5.5',
-    model_sent: 'gpt-5.5'
+    model_sent: 'gpt-5.5',
+    original_body: '{"model":"gpt-5.5","input":"hi"}'
   };
 
   const diagnostics = buildDebugAttemptDiagnostics(attempts, debugLockState, clientRequest);
@@ -346,6 +356,8 @@ test('buildDebugAttemptDiagnostics: generates complete diagnostics', () => {
   assert(diagnostics.client_request, 'should have client_request section');
   assertEquals(diagnostics.client_request.protocol, 'responses');
   assertEquals(diagnostics.client_request.model, 'gpt-5.5');
+  // New: real client request body is captured on the diagnostics payload.
+  assertEquals(diagnostics.client_request.original_body, '{"model":"gpt-5.5","input":"hi"}');
 
   assert(Array.isArray(diagnostics.attempts), 'should have attempts array');
   assertEquals(diagnostics.attempts.length, 2);
@@ -353,6 +365,13 @@ test('buildDebugAttemptDiagnostics: generates complete diagnostics', () => {
   assertEquals(diagnostics.attempts[0].protocol, 'responses');
   assertEquals(diagnostics.attempts[1].sequence, 2);
   assertEquals(diagnostics.attempts[1].protocol, 'chat_completions');
+
+  // New: each attempt carries the pool-modified request body AND the upstream
+  // response body (success or failure) for diagnostics display.
+  assert(typeof diagnostics.attempts[0].request_body === 'string', 'attempt should carry request_body');
+  assert(typeof diagnostics.attempts[0].response_body === 'string', 'attempt should carry response_body');
+  assertEquals(diagnostics.attempts[1].request_body, '{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}');
+  assertEquals(diagnostics.attempts[1].response_body, '{"id":"chatcmpl-1","choices":[]}');
 
   assert(diagnostics.succeeded_with, 'should have succeeded_with');
   assertEquals(diagnostics.succeeded_with.protocol, 'chat_completions');
@@ -384,6 +403,78 @@ test('buildDebugAttemptDiagnostics: handles all-failed case', () => {
 
   assertEquals(diagnostics.succeeded_with, null);
   assertEquals(diagnostics.total_attempts, 2);
+});
+
+test('shouldSaveDebugLockDiagnostics: later success replaces frozen all-failed first sample', () => {
+  const state = {
+    first_test_completed: true,
+    first_test_diagnostics: {
+      attempts: [
+        { sequence: 1, protocol: 'responses', status: 404 },
+        { sequence: 2, protocol: 'chat_completions', status: 502 },
+        { sequence: 3, protocol: 'anthropic_messages', status: 502 }
+      ],
+      succeeded_with: null
+    }
+  };
+
+  const streamingSuccess = {
+    attempts: [
+      { sequence: 1, protocol: 'responses', status: 200, streaming: true }
+    ],
+    succeeded_with: { protocol: 'responses', adapter: false, sequence: 1 }
+  };
+
+  assertEquals(shouldSaveDebugLockDiagnostics(state, streamingSuccess), true);
+});
+
+test('shouldSaveDebugLockDiagnostics: deprecated shim always returns true (multi-page appends instead)', () => {
+  // The old "freeze on first success" semantics were replaced by multi-page
+  // appending (appendDebugLockTestPage). The deprecated shim must not block any
+  // request from being recorded as its own page.
+  const state = {
+    first_test_completed: true,
+    first_test_diagnostics: {
+      attempts: [{ sequence: 1, protocol: 'responses', status: 200 }],
+      succeeded_with: { protocol: 'responses', adapter: false, sequence: 1 }
+    }
+  };
+
+  const laterSuccess = {
+    attempts: [{ sequence: 1, protocol: 'chat_completions', status: 200 }],
+    succeeded_with: { protocol: 'chat_completions', adapter: true, sequence: 1 }
+  };
+
+  assertEquals(shouldSaveDebugLockDiagnostics(state, laterSuccess), true);
+});
+
+test('appendDebugLockTestPage: appends pages newest-first and never overwrites', () => {
+  const state = { debugLock: { enabled: true, test_pages: [] } };
+  const page1 = { timestamp: '2026-06-15T10:00:00Z', total_attempts: 1 };
+  const page2 = { timestamp: '2026-06-15T10:00:05Z', total_attempts: 1 };
+
+  appendDebugLockTestPage(state, page1);
+  assertEquals(state.debugLock.test_pages.length, 1);
+  assertEquals(state.debugLock.test_pages[0], page1);
+  assert(state.debugLock.first_test_completed === true, 'should mark first_test_completed');
+
+  // Second request (e.g. a retry) appends, not overwrites.
+  appendDebugLockTestPage(state, page2);
+  assertEquals(state.debugLock.test_pages.length, 2);
+  assertEquals(state.debugLock.test_pages[0], page2, 'newest page should be first');
+  assertEquals(state.debugLock.test_pages[1], page1, 'older page preserved below');
+});
+
+test('appendDebugLockTestPage: caps at DEBUG_LOCK_MAX_TEST_PAGES (10)', () => {
+  const state = { debugLock: { enabled: true, test_pages: [] } };
+  for (let i = 0; i < DEBUG_LOCK_MAX_TEST_PAGES + 5; i++) {
+    appendDebugLockTestPage(state, { timestamp: `t${i}`, index: i });
+  }
+  assertEquals(state.debugLock.test_pages.length, DEBUG_LOCK_MAX_TEST_PAGES);
+  // The most recently appended (highest index) should be on top.
+  assertEquals(state.debugLock.test_pages[0].index, DEBUG_LOCK_MAX_TEST_PAGES + 4);
+  // The oldest retained page is index 5 (indices 0..4 were evicted).
+  assertEquals(state.debugLock.test_pages[DEBUG_LOCK_MAX_TEST_PAGES - 1].index, 5);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

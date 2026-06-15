@@ -10,6 +10,7 @@ import {
   initialProtocolCapabilities,
   recordProtocolCapabilityProbe,
   recordProtocolCapabilityRealTraffic,
+  recordProtocolCapabilityUnsupported,
   shouldRecheckProtocolCapability,
   upstreamHasVerifiedProtocolCapability,
   upstreamHasUserDeclaredProtocolCapability
@@ -454,6 +455,35 @@ test('Real traffic overwrites probe evidence', () => {
 
   assertEquals(upstream.capabilities.responses.status, 'verified');
   assertEquals(upstream.capabilities.responses.source, 'real_traffic');
+});
+
+test('recordProtocolCapabilityUnsupported marks endpoint failures as unsupported', () => {
+  const upstream = createMockUpstream();
+
+  const recorded = recordProtocolCapabilityUnsupported(upstream, 'responses', {
+    checkedAt: '2026-01-01T02:00:00Z',
+    model: 'gpt-5.5',
+    httpStatus: 404,
+    reason: 'HTTP 404'
+  });
+
+  assertEquals(recorded, true);
+  assertEquals(upstream.capabilities.responses.status, 'unsupported');
+  assertEquals(upstream.capabilities.responses.source, 'real_traffic_failure');
+  assertEquals(upstream.capabilities.responses.endpoint_unsupported, true);
+  assertEquals(upstream.capabilities.responses.http_status, 404);
+});
+
+test('recordProtocolCapabilityUnsupported ignores non-endpoint failures', () => {
+  const upstream = createMockUpstream();
+
+  const recorded = recordProtocolCapabilityUnsupported(upstream, 'responses', {
+    httpStatus: 500,
+    reason: 'HTTP 500'
+  });
+
+  assertEquals(recorded, false);
+  assertEquals(normalizeProtocolCapabilities(upstream.capabilities).responses.status, 'unknown');
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -479,6 +479,60 @@ export function recordProtocolCapabilityRealTraffic(upstream, protocol, {
   };
 }
 
+export function recordProtocolCapabilityUnsupported(upstream, protocol, {
+  checkedAt = new Date().toISOString(),
+  model = '',
+  httpStatus = 0,
+  reason = '',
+  currentModelOverride = undefined
+} = {}) {
+  const statusCode = Number(httpStatus || 0) || 0;
+  if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return false;
+  if (!NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(statusCode)) return false;
+  upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+
+  const matchesOverride = calculateMatchesCurrentOverride(model, currentModelOverride);
+  upstream.capabilities[protocol] = {
+    status: 'unsupported',
+    source: 'real_traffic_failure',
+    probe_type: 'real_traffic_failure',
+    representative: true,
+    checked_at: checkedAt,
+    model: String(model || ''),
+    http_status: statusCode,
+    reason: String(reason || `${protocol} endpoint returned HTTP ${statusCode}`),
+    endpoint_unsupported: true,
+    last_probe_state: 'endpoint_unsupported',
+    matches_current_override: matchesOverride
+  };
+  return true;
+}
+
+export function revokeRealTrafficVerification(upstream, protocol, {
+  checkedAt = new Date().toISOString(),
+  reason = '',
+  httpStatus = 0
+} = {}) {
+  if (!upstream || !PROTOCOL_CAPABILITY_NAMES.includes(protocol)) return false;
+  upstream.capabilities = normalizeProtocolCapabilities(upstream.capabilities);
+  const existing = upstream.capabilities[protocol];
+  if (existing?.source !== 'real_traffic' || existing?.status !== 'verified') return false;
+
+  upstream.capabilities[protocol] = {
+    ...existing,
+    status: 'failed',
+    source: 'real_traffic_failure',
+    probe_type: 'real_traffic_failure',
+    representative: false,
+    checked_at: checkedAt,
+    http_status: Number(httpStatus || 0) || 0,
+    reason: String(reason || `real traffic failed for ${protocol}`),
+    endpoint_unsupported: false,
+    last_probe_state: 'real_traffic_failure'
+  };
+  return true;
+}
+
 // ── Health State Derivation ───────────────────────────────────────────────────
 
 /**

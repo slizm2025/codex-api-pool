@@ -63,6 +63,18 @@ lowerFailureKey.keys[1].failures = 0;
 selected = chooseCandidate(makeState(lowerFailureKey), new Set(), { preferredModel: 'gpt-5.5' });
 assert(selected?.key?.label === 'key-two', `expected Selection to prefer lower-failure key-two, got ${selected?.key?.label}`);
 
+const leastRecentlyUsedKey = makeUpstream();
+leastRecentlyUsedKey.keys[0].stats.lastUsedAt = new Date(at).toISOString();
+leastRecentlyUsedKey.keys[1].stats.lastUsedAt = new Date(at - 60_000).toISOString();
+selected = chooseCandidate(makeState(leastRecentlyUsedKey), new Set(), { preferredModel: 'gpt-5.5' });
+assert(selected?.key?.label === 'key-two', `expected Selection to prefer least-recently-used key-two, got ${selected?.key?.label}`);
+
+const neverUsedKey = makeUpstream();
+neverUsedKey.keys[0].stats.lastUsedAt = new Date(at).toISOString();
+neverUsedKey.keys[1].stats.lastUsedAt = null;
+selected = chooseCandidate(makeState(neverUsedKey), new Set(), { preferredModel: 'gpt-5.5' });
+assert(selected?.key?.label === 'key-two', `expected Selection to prefer never-used key-two, got ${selected?.key?.label}`);
+
 const noKeysAvailable = makeUpstream();
 noKeysAvailable.keys[0].cooldownUntil = at + 60_000;
 noKeysAvailable.keys[1].value = '';

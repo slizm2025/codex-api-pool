@@ -51,7 +51,9 @@ import {
   upstreamHasUserDeclaredProtocolCapability,
   shouldRecheckProtocolCapability,
   recordProtocolCapabilityProbe,
-  recordProtocolCapabilityRealTraffic
+  recordProtocolCapabilityRealTraffic,
+  recordProtocolCapabilityUnsupported,
+  revokeRealTrafficVerification
 } from './protocol-capability-manager.mjs';
 import {
   ProtocolProbeOrchestrator,
@@ -92,6 +94,7 @@ import {
 const DEFAULT_CONFIG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config.local.json');
 const DEFAULT_RETRYABLE_STATUS = [400, 401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504, 521, 522, 523, 524];
 const KEY_SCOPED_FAILURE_STATUS = new Set([401, 403, 429]);
+const REAL_TRAFFIC_REVOCATION_FAILURE_THRESHOLD = 3;
 const DEFAULT_NATIVE_RESPONSES_RECHECK_MS = 30 * 60 * 1000;
 const STREAM_ERROR_STATUS = 502;
 const HOP_BY_HOP_HEADERS = new Set([
@@ -1963,6 +1966,19 @@ function requestRouteTrace({
     native_required: false,
     native_only: nativeOnly,
     transform: ['passthrough']
+  };
+}
+
+function messagesRouteTrace({ useAdapter = false } = {}) {
+  return {
+    input_api: 'messages',
+    upstream_api: useAdapter ? 'chat_completions' : 'anthropic_messages',
+    adapter: useAdapter ? 'messages_to_chat_completions' : 'native_messages_passthrough',
+    native_required: false,
+    native_only: {},
+    transform: useAdapter
+      ? ['messages_to_chat_completions', 'chat_response_to_messages']
+      : ['passthrough']
   };
 }
 
@@ -4502,6 +4518,7 @@ function createUpstreamState(upstream, index) {
       value: resolved.value,
       failures: 0,
       nonAuthoritativeFailures: 0,
+      realTrafficFailures: {},
       cooldownUntil: 0,
       health: {
         state: resolved.value ? 'unknown' : 'missing_key',
@@ -4700,6 +4717,7 @@ function statsSnapshot(state) {
         stats: key.stats,
         quota: key.quota,
         health: key.health,
+        realTrafficFailures: key.realTrafficFailures || {},
         representativeEvidence: key.representativeEvidence || {}
       }]))
     }]))
@@ -4964,6 +4982,7 @@ function restoreStats(state, statsPath) {
         key.stats = { ...key.stats, ...(oldKey.stats || {}) };
         ensureAvailability(key.stats, state.availability);
         key.quota = { ...key.quota, ...(oldKey.quota || {}) };
+        key.realTrafficFailures = oldKey.realTrafficFailures || {};
         key.representativeEvidence = oldKey.representativeEvidence || {};
         if (oldKey.health) key.health = { ...key.health, ...oldKey.health };
       }
@@ -5081,6 +5100,7 @@ function copyRuntimeState(target, source, { preserveHealth, availabilityConfig }
     if (!oldKey) continue;
     key.failures = oldKey.failures;
     key.cooldownUntil = oldKey.cooldownUntil;
+    key.realTrafficFailures = oldKey.realTrafficFailures || {};
     key.stats = { ...key.stats, ...oldKey.stats };
     ensureAvailability(key.stats, availabilityConfig);
     key.quota = { ...key.quota, ...oldKey.quota };
@@ -5155,6 +5175,10 @@ function chooseCandidate(state, tried, options = {}) {
     // Per-protocol cooldown: an upstream may be cooled for one protocol while
     // still serving others. Additive to the global cooldownUntil check above.
     if (targetProtocol && isUpstreamInProtocolCooldown(upstream, targetProtocol, at)) return false;
+    if (targetProtocol) {
+      const targetCapabilityStatus = protocolCapabilityStatus(upstream, targetProtocol);
+      if (targetCapabilityStatus === 'unsupported' || targetCapabilityStatus === 'disabled') return false;
+    }
     if (candidateFilter && !candidateFilter(upstream)) return false;
     return upstream.keys.some((key) => keyAvailable(key, at) && !tried.has(`${upstream.name}:${key.index}`));
   });
@@ -5204,7 +5228,14 @@ function chooseCandidate(state, tried, options = {}) {
 
   const keys = selected.keys
     .filter((key) => keyAvailable(key, at) && !tried.has(`${selected.name}:${key.index}`))
-    .sort((a, b) => a.failures - b.failures);
+    .sort((a, b) => {
+      const failureDelta = a.failures - b.failures;
+      if (failureDelta !== 0) return failureDelta;
+      const aLastUsed = timestampMs(a.stats?.lastUsedAt) || 0;
+      const bLastUsed = timestampMs(b.stats?.lastUsedAt) || 0;
+      if (aLastUsed !== bLastUsed) return aLastUsed - bLastUsed;
+      return a.index - b.index;
+    });
 
   if (keys.length === 0) return null;
   return { upstream: selected, key: keys[0] };
@@ -6944,8 +6975,44 @@ function realTrafficFailureAuthoritative(statusCode, reason = '') {
   return /timeout|timed out|network|tls|socket|invalid[_ -]?api[_ -]?key|unauthorized|permission_denied|quota|rate.?limit/i.test(String(reason || ''));
 }
 
-function recordRealTrafficFailure(state, upstream, key, reason, statusCode, retryAfter) {
-  if (realTrafficFailureAuthoritative(statusCode, reason)) {
+function upstreamHasRealTrafficVerification(upstream) {
+  const capabilities = normalizeProtocolCapabilities(upstream?.capabilities);
+  return PROTOCOL_CAPABILITY_NAMES.some((candidateProtocol) => {
+    const capability = capabilities[candidateProtocol];
+    return capability?.status === 'verified' && capability?.source === 'real_traffic';
+  });
+}
+
+function clearStaleRealTrafficHealth(upstream, reason) {
+  if (upstream?.health?.source !== 'real_traffic') return;
+  if (upstreamHasRealTrafficVerification(upstream)) return;
+  upstream.health = {
+    ...upstream.health,
+    state: 'unknown',
+    source: '',
+    checkedAt: null,
+    error: String(reason || 'real traffic verification revoked')
+  };
+}
+
+function recordRealTrafficFailure(state, upstream, key, reason, statusCode, retryAfter, protocol) {
+  const authoritative = realTrafficFailureAuthoritative(statusCode, reason);
+  if (authoritative) {
+    if (key && protocol && PROTOCOL_CAPABILITY_NAMES.includes(protocol)) {
+      key.realTrafficFailures = key.realTrafficFailures && typeof key.realTrafficFailures === 'object' && !Array.isArray(key.realTrafficFailures)
+        ? key.realTrafficFailures
+        : {};
+      const nextFailures = Number(key.realTrafficFailures[protocol] || 0) + 1;
+      key.realTrafficFailures[protocol] = nextFailures;
+      if (nextFailures >= REAL_TRAFFIC_REVOCATION_FAILURE_THRESHOLD) {
+        key.realTrafficFailures[protocol] = 0;
+        const revoked = revokeRealTrafficVerification(upstream, protocol, {
+          reason,
+          httpStatus: statusCode
+        });
+        if (revoked) clearStaleRealTrafficHealth(upstream, reason);
+      }
+    }
     key.nonAuthoritativeFailures = 0;
     recordFailure(state, upstream, key, reason, statusCode, retryAfter);
     return;
@@ -6980,14 +7047,25 @@ function recordModelInteractionOutcome({
   recordResponseStats(upstream, key, statusCode, retried, succeeded);
   recordAttemptOutcome(state, upstream, key, succeeded, protocol);
   const recordedTokens = succeeded ? recordTokenUsage(upstream, tokenCount, startedAt) : emptyTokenUsage();
+  if (!succeeded && protocol && NATIVE_RESPONSES_UNSUPPORTED_ENDPOINT_STATUS.has(Number(statusCode || 0))) {
+    const failureReason = reason || `HTTP ${statusCode}`;
+    const markedUnsupported = recordProtocolCapabilityUnsupported(upstream, protocol, {
+      reason: failureReason,
+      httpStatus: statusCode
+    });
+    if (markedUnsupported) clearStaleRealTrafficHealth(upstream, failureReason);
+  }
   if (succeeded) {
     recordSuccess(upstream, startedAt, statusCode);
     key.nonAuthoritativeFailures = 0;
+    if (key.realTrafficFailures && protocol) {
+      key.realTrafficFailures[protocol] = 0;
+    }
     // A real-traffic success clears any per-protocol cooldown for this protocol.
     if (protocol) clearProtocolCooldown(upstream, protocol);
   } else if (applyFailure) {
     const failureReason = reason || `HTTP ${statusCode}`;
-    recordRealTrafficFailure(state, upstream, key, failureReason, statusCode, retryAfter);
+    recordRealTrafficFailure(state, upstream, key, failureReason, statusCode, retryAfter, protocol);
     // Apply per-protocol cooldown alongside the global cooldown. This is additive:
     // recordRealTrafficFailure / recordFailure already set upstream.cooldownUntil
     // when warranted; here we additionally cool the specific protocol when the
@@ -11892,8 +11970,10 @@ function dashboardHtml() {
     }
     async function setCompatibilityFromControls() {
       const enabled = compatStrip.checked;
+      const currentCompatibility = latestStatus?.compatibility?.adapter_mode || {};
       const payload = {
         strip_responses_only_features: enabled,
+        strip_messages_only_features: currentCompatibility.strip_messages_only_features === true,
         adapters: {
           anthropic_messages: enabled && compatAnthropic.checked,
           chat_completions: enabled && compatChat.checked
@@ -11973,14 +12053,15 @@ function dashboardHtml() {
         : \`未设置模型覆盖；后续请求将使用 Codex 原始 model。已探测到 \${knownModels.length} 个模型。\`;
       const compatibility = data.compatibility?.adapter_mode || {};
       const compatEnabled = compatibility.strip_responses_only_features === true;
+      const messagesCompatEnabled = compatibility.strip_messages_only_features === true;
       compatStrip.checked = compatEnabled;
       compatAnthropic.checked = compatibility.adapters?.anthropic_messages === true;
       compatChat.checked = compatibility.adapters?.chat_completions === true;
       compatAnthropic.disabled = !compatEnabled;
       compatChat.disabled = !compatEnabled;
       compatReadout.textContent = compatEnabled
-        ? \`非原生 adapter 可在无 Native Responses Route 时剔除 Responses-only Features；Anthropic \${compatAnthropic.checked ? '开' : '关'}，Chat \${compatChat.checked ? '开' : '关'}。\`
-        : '严格模式：含 Responses-only Features 的请求需要 Native Responses Route。';
+        ? \`非原生 adapter 可在无 Native Responses Route 时剔除 Responses-only Features；Anthropic \${compatAnthropic.checked ? '开' : '关'}，Chat \${compatChat.checked ? '开' : '关'}；Messages 剥离 \${messagesCompatEnabled ? '开' : '关'}。\`
+        : \`严格模式：含 Responses-only Features 的请求需要 Native Responses Route；Messages 剥离 \${messagesCompatEnabled ? '开' : '关'}。\`;
       renderRecentRequests(data.recent_requests || []);
       const nextCardsSignature = cardSignature(ups, activeModel);
       if (nextCardsSignature !== cardsSignature) {
@@ -12630,6 +12711,7 @@ function createStatusPayload(config, state) {
     compatibility: {
       adapter_mode: {
         strip_responses_only_features: state.compatibility?.adapterMode?.stripResponsesOnlyFeatures === true,
+        strip_messages_only_features: state.compatibility?.adapterMode?.stripMessagesOnlyFeatures === true,
         adapters: {
           anthropic_messages: state.compatibility?.adapterMode?.adapters?.anthropicMessages === true,
           chat_completions: state.compatibility?.adapterMode?.adapters?.chatCompletions === true
@@ -13420,6 +13502,9 @@ async function handlePoolApi(req, res, config, state, options, statsPath, runtim
     if (Object.prototype.hasOwnProperty.call(payload, 'strip_responses_only_features')) {
       adapterMode.strip_responses_only_features = booleanOption(payload.strip_responses_only_features, false);
     }
+    if (Object.prototype.hasOwnProperty.call(payload, 'strip_messages_only_features')) {
+      adapterMode.strip_messages_only_features = booleanOption(payload.strip_messages_only_features, false);
+    }
     if (payload.adapters && typeof payload.adapters === 'object' && !Array.isArray(payload.adapters)) {
       adapterMode.adapters = {
         ...(adapterMode.adapters && typeof adapterMode.adapters === 'object' && !Array.isArray(adapterMode.adapters) ? adapterMode.adapters : {}),
@@ -13841,8 +13926,13 @@ export function createPoolServer(config, options = {}) {
           return anthropicErrorResponse(res, 401, 'authentication_error', 'unauthorized: invalid API pool token');
         }
 
-        if (state.upstreams.length === 0) {
-          return anthropicErrorResponse(res, 503, 'overloaded_error', 'no upstreams configured');
+        if (isDebugLockActive(state)) {
+          return await executeDebugLockedRequest(req, res, state, config, {
+            pathname,
+            clientProtocol: 'anthropic_messages',
+            statsPath,
+            maxBodyBytes
+          });
         }
 
         const originalBody = await readBody(req, maxBodyBytes);
@@ -13869,6 +13959,10 @@ export function createPoolServer(config, options = {}) {
         const originalModel = payload.model;
         const requestedModel = state.modelOverride || originalModel;
 
+        if (state.upstreams.length === 0) {
+          return anthropicErrorResponse(res, 503, 'overloaded_error', 'no upstreams configured');
+        }
+
         // Strict validation: Messages API only supports Claude models
         if (requestedModel && !isClaudeModel(requestedModel)) {
           return anthropicErrorResponse(
@@ -13879,11 +13973,15 @@ export function createPoolServer(config, options = {}) {
           );
         }
 
-        // Check if we have any Anthropic-capable upstreams
-        const hasAnthropicUpstream = state.upstreams.some(upstream => {
-          if (!upstream.enabled || upstream.quarantined) return false;
-          const api = upstream.api || 'openai';
-          return api === 'anthropic' || api === 'both';
+        // Check whether a native Anthropic Messages route is actually selectable
+        // now. Static api=anthropic evidence is only useful if the upstream/key is
+        // not disabled, quarantined, cooled down, or explicitly unsupported.
+        const nativeMessagesAvailableAt = now();
+        const hasNativeMessagesRoute = state.upstreams.some(upstream => {
+          if (!upstreamAvailable(upstream, nativeMessagesAvailableAt, requestedModel)) return false;
+          if (!isAnthropicUpstream(upstream)) return false;
+          const status = protocolCapabilityStatus(upstream, 'anthropic_messages');
+          return status !== 'unsupported' && status !== 'disabled';
         });
 
         // Check for adapter mode configuration
@@ -13895,11 +13993,10 @@ export function createPoolServer(config, options = {}) {
         const hasMessagesOnlyFeatures = messagesOnlyFeatures.length > 0;
 
         // Decide routing strategy
-        const canUseAdapter = !hasAnthropicUpstream && adapterModeEnabled;
-        const needsAdapter = canUseAdapter || (hasMessagesOnlyFeatures && !hasAnthropicUpstream);
+        const allowAdapterFallback = adapterModeEnabled && (!hasMessagesOnlyFeatures || stripMessagesOnlyFeatures);
 
         // Block if we have Messages-only features but can't handle them
-        if (hasMessagesOnlyFeatures && !hasAnthropicUpstream && !adapterModeEnabled) {
+        if (hasMessagesOnlyFeatures && !hasNativeMessagesRoute && !adapterModeEnabled) {
           const featureList = messagesOnlyFeatures.join(', ');
           return anthropicErrorResponse(
             res,
@@ -13909,7 +14006,7 @@ export function createPoolServer(config, options = {}) {
           );
         }
 
-        if (hasMessagesOnlyFeatures && !hasAnthropicUpstream && !stripMessagesOnlyFeatures) {
+        if (hasMessagesOnlyFeatures && !hasNativeMessagesRoute && !stripMessagesOnlyFeatures) {
           const featureList = messagesOnlyFeatures.join(', ');
           return anthropicErrorResponse(
             res,
@@ -13921,27 +14018,36 @@ export function createPoolServer(config, options = {}) {
 
         const tried = new Set();
         const maxAttempts = Math.max(1, state.retry.maxAttempts);
+        let adapterFallbackActive = !hasNativeMessagesRoute && allowAdapterFallback;
 
         let networkAttempt = 1;
         while (networkAttempt <= maxAttempts) {
           const routingAt = now();
+          const routeViaAdapter = adapterFallbackActive;
+          const targetProtocol = routeViaAdapter ? 'chat_completions' : 'anthropic_messages';
 
           // Select upstream based on routing strategy
           const candidate = chooseCandidate(state, tried, {
             preferredModel: requestedModel,
-            preferredProtocol: 'anthropic_messages',
-            targetProtocol: 'anthropic_messages',
+            preferredProtocol: targetProtocol,
+            targetProtocol,
             allowUnknownModelFallback: networkAttempt > 1,
-            candidateFilter: canUseAdapter
-              ? null  // Allow any upstream when using adapter
+            candidateFilter: routeViaAdapter
+              ? (upstream) => isOpenAiUpstream(upstream)
               : (upstream) => {
                   // Only select Anthropic-capable upstreams for native forwarding
-                  const api = upstream.api || 'openai';
-                  return api === 'anthropic' || api === 'both';
+                  return isAnthropicUpstream(upstream);
                 }
           });
 
-          if (!candidate) break;
+          if (!candidate) {
+            if (!adapterFallbackActive && allowAdapterFallback) {
+              adapterFallbackActive = true;
+              tried.clear();
+              continue;
+            }
+            break;
+          }
 
           const { upstream, key } = candidate;
           tried.add(`${upstream.name}:${key.index}`);
@@ -13952,8 +14058,7 @@ export function createPoolServer(config, options = {}) {
           const allowRetry = attempt < maxAttempts;
 
           // Determine if we need to use the adapter for this upstream
-          const upstreamApi = upstream.api || 'openai';
-          const useAdapter = upstreamApi === 'openai' || (upstreamApi === 'both' && canUseAdapter);
+          const useAdapter = routeViaAdapter;
           // When the Messages→Chat adapter strips Messages-only features, surface
           // the conversion in the response header and Recent Request Timeline so
           // stripping is never silent (CORE_FEATURES §3, §11).
@@ -13961,7 +14066,7 @@ export function createPoolServer(config, options = {}) {
             ? buildMessagesAdapterCompatibility(originalBody)
             : null;
           const messagesProtocol = deriveRecordingProtocol({ pathname: '/v1/messages', useAdapter });
-          const routeTrace = attachForwardedModelTrace(requestRouteTrace({ pathname }), requestedModel, forwardedModel);
+          const routeTrace = attachForwardedModelTrace(messagesRouteTrace({ useAdapter }), requestedModel, forwardedModel);
 
           let targetUrl, requestBody, requestHeaders;
 
@@ -13991,336 +14096,331 @@ export function createPoolServer(config, options = {}) {
             requestHeaders = buildAnthropicRequestHeaders(targetUrl, key.value, req.headers, upstream.probeHeaders);
           }
 
+          if (isModelInteractionRequest(req.method, pathname)) recordAttempt(upstream, key);
+
+          let result;
           try {
-            // Choose http or https based on targetUrl protocol
-            const protocol = new URL(targetUrl).protocol === 'https:' ? https : http;
-            const upstreamReq = protocol.request(targetUrl, {
+            result = await requestTrackedUpstream({
+              req,
+              body: requestBody,
+              targetUrl,
+              upstream,
+              key,
+              timeoutMs,
+              allowRetry,
+              retryableStatus: state.retry.retryableStatus,
               method: 'POST',
-              headers: requestHeaders,
-              timeout: timeoutMs
+              headers: requestHeaders
             });
-
-            const attemptStart = now();
-            let streamingBoundaryReached = false;
-            const isStreaming = payload.stream === true;
-
-            upstreamReq.on('response', (response) => {
-              const statusCode = response.statusCode || 500;
-
-              if (statusCode >= 200 && statusCode < 300) {
-                streamingBoundaryReached = true;
-                recordSuccess(upstream, attemptStart, statusCode);
-                recordAvailabilityAttempt(upstream, messagesProtocol, true);
-
-                // Create usage capture for native forwarding
-                const usageCapture = createUsageCapture(response.headers);
-
-                // Handle response conversion if using adapter
-                if (useAdapter) {
-                  const contentType = response.headers['content-type'] || '';
-
-                  if (isStreaming && contentType.includes('text/event-stream')) {
-                    // Streaming adapter: Chat SSE → Messages SSE
-                    const adapterHeaders = {
-                      'content-type': 'text/event-stream',
-                      'cache-control': 'no-cache',
-                      'connection': 'keep-alive',
-                      'x-codex-api-pool-upstream': upstream.name
-                    };
-                    if (messagesAdapterCompatibility) {
-                      adapterHeaders['x-codex-api-pool-stripped'] = compatibilityStrippedHeader(messagesAdapterCompatibility.stripped);
-                      adapterHeaders['x-codex-api-pool-compatibility'] = messagesAdapterCompatibility.mode;
-                    }
-                    res.writeHead(200, adapterHeaders);
-
-                    const adapter = createChatToMessagesStreamAdapter(res, requestedModel);
-                    response.on('data', (chunk) => {
-                      usageCapture.push(chunk);
-                      adapter.write(chunk);
-                    });
-                    response.on('end', () => {
-                      adapter.end();
-                      const capturedUsage = usageCapture.result();
-                      const recordedTokens = recordTokenUsage(upstream, capturedUsage.tokens, attemptStart);
-
-                      const routingStrategy = 'messages_to_chat_completions';
-                      rememberRequest(state, {
-                        method: 'POST',
-                        path: '/v1/messages',
-                        entry_protocol: 'messages',
-                        ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                        routing_strategy: routingStrategy,
-                        upstream: upstream.name,
-                        key: key.label,
-                        model: requestedModel,
-                        actualModel: requestedModel,
-                        status: statusCode,
-                        streaming: isStreaming,
-                        retried: attempt > 1,
-                        succeeded: true,
-                        route: routeTrace,
-                        tokens: recordedTokens.totalTokens,
-                        inputTokens: recordedTokens.inputTokens,
-                        outputTokens: recordedTokens.outputTokens,
-                        durationMs: now() - attemptStart,
-                        outcome: 'ok',
-                        compatibility: messagesAdapterCompatibility ? compatibilitySummary(messagesAdapterCompatibility, routeTrace) : null
-                      });
-                      persistStats(state, statsPath);
-                    });
-                    response.on('error', (err) => {
-                      console.error('Streaming adapter error:', err);
-                      if (!res.writableEnded) res.end();
-                    });
-                  } else {
-                    // JSON adapter: Chat JSON → Messages JSON
-                    let responseBody = Buffer.alloc(0);
-                    response.on('data', (chunk) => {
-                      usageCapture.push(chunk);
-                      responseBody = Buffer.concat([responseBody, chunk]);
-                    });
-                    response.on('end', () => {
-                      try {
-                        const convertedBody = chatCompletionToMessagesJson(responseBody, requestedModel);
-                        const jsonAdapterHeaders = {
-                          'content-type': 'application/json',
-                          'content-length': convertedBody.length,
-                          'x-codex-api-pool-upstream': upstream.name
-                        };
-                        if (messagesAdapterCompatibility) {
-                          jsonAdapterHeaders['x-codex-api-pool-stripped'] = compatibilityStrippedHeader(messagesAdapterCompatibility.stripped);
-                          jsonAdapterHeaders['x-codex-api-pool-compatibility'] = messagesAdapterCompatibility.mode;
-                        }
-                        res.writeHead(200, jsonAdapterHeaders);
-                        res.end(convertedBody);
-
-                        const capturedUsage = usageCapture.result();
-                        const recordedTokens = recordTokenUsage(upstream, capturedUsage.tokens, attemptStart);
-
-                        const routingStrategy = 'messages_to_chat_completions';
-                        rememberRequest(state, {
-                          method: 'POST',
-                          path: '/v1/messages',
-                          entry_protocol: 'messages',
-                          ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                          routing_strategy: routingStrategy,
-                          upstream: upstream.name,
-                          key: key.label,
-                          model: requestedModel,
-                          actualModel: requestedModel,
-                          status: statusCode,
-                          streaming: isStreaming,
-                          retried: attempt > 1,
-                          succeeded: true,
-                          route: routeTrace,
-                          tokens: recordedTokens.totalTokens,
-                          inputTokens: recordedTokens.inputTokens,
-                          outputTokens: recordedTokens.outputTokens,
-                          durationMs: now() - attemptStart,
-                          outcome: 'ok',
-                          compatibility: messagesAdapterCompatibility ? compatibilitySummary(messagesAdapterCompatibility, routeTrace) : null
-                        });
-                        persistStats(state, statsPath);
-                      } catch (error) {
-                        console.error('Response conversion error:', error);
-                        anthropicErrorResponse(res, 500, 'api_error', 'Response conversion failed');
-                      }
-                    });
-                  }
-                } else {
-                  // Native forwarding: capture usage while forwarding
-                  res.writeHead(statusCode, sanitizeResponseHeaders(response.headers, upstream.name));
-
-                  response.on('data', (chunk) => {
-                    usageCapture.push(chunk);
-                    res.write(chunk);
-                  });
-
-                  response.on('end', () => {
-                    res.end();
-
-                    const capturedUsage = usageCapture.result();
-                    const recordedTokens = recordTokenUsage(upstream, capturedUsage.tokens, attemptStart);
-
-                    const routingStrategy = 'native_messages';
-                    rememberRequest(state, {
-                      method: 'POST',
-                      path: '/v1/messages',
-                      entry_protocol: 'messages',
-                      ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                      routing_strategy: routingStrategy,
-                      upstream: upstream.name,
-                      key: key.label,
-                      model: requestedModel,
-                      actualModel: requestedModel,
-                      status: statusCode,
-                      streaming: isStreaming,
-                      retried: attempt > 1,
-                      succeeded: true,
-                      route: routeTrace,
-                      tokens: recordedTokens.totalTokens,
-                      inputTokens: recordedTokens.inputTokens,
-                      outputTokens: recordedTokens.outputTokens,
-                      durationMs: now() - attemptStart,
-                      outcome: 'ok'
-                    });
-                    persistStats(state, statsPath);
-                  });
-                }
-              } else {
-                // Error response
-                let errorBody = '';
-                response.setEncoding('utf8');
-                response.on('data', (chunk) => { errorBody += chunk; });
-                response.on('end', () => {
-                  recordFailure(state, upstream, key, `HTTP ${statusCode}`, statusCode, response.headers['retry-after']);
-                  recordAvailabilityAttempt(upstream, messagesProtocol, false);
-
-                  // Record failed request for Dashboard (only if not retrying)
-                  if (!allowRetry || streamingBoundaryReached) {
-                    const routingStrategy = useAdapter
-                      ? 'messages_to_chat_completions'
-                      : 'native_messages';
-
-                    rememberRequest(state, {
-                      method: 'POST',
-                      path: '/v1/messages',
-                      entry_protocol: 'messages',
-                      ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                      routing_strategy: routingStrategy,
-                      upstream: upstream.name,
-                      key: key.label,
-                      model: requestedModel,
-                      actualModel: requestedModel,
-                      status: statusCode,
-                      streaming: isStreaming,
-                      retried: attempt > 1,
-                      succeeded: false,
-                      reason: `HTTP ${statusCode}`,
-                      route: routeTrace
-                    });
-                  }
-
-                  if (allowRetry && !streamingBoundaryReached) {
-                    return; // Will retry in next loop iteration
-                  }
-
-                  // Return error (convert if using adapter)
-                  if (useAdapter) {
-                    // Try to convert OpenAI error to Anthropic format
-                    try {
-                      const openaiError = JSON.parse(errorBody);
-                      const message = openaiError.error?.message || errorBody;
-                      anthropicErrorResponse(res, statusCode, 'api_error', message);
-                    } catch {
-                      res.writeHead(statusCode, { 'content-type': 'text/plain' });
-                      res.end(errorBody);
-                    }
-                  } else {
-                    res.writeHead(statusCode, response.headers);
-                    res.end(errorBody);
-                  }
-                });
-              }
-            });
-
-            upstreamReq.on('error', (error) => {
-              if (!streamingBoundaryReached) {
-                recordFailure(state, upstream, key, error.message, 0, null);
-                recordAvailabilityAttempt(upstream, messagesProtocol, false);
-
-                // Record failed request for Dashboard (only if not retrying)
-                if (!allowRetry) {
-                  const routingStrategy = useAdapter
-                    ? 'messages_to_chat_completions'
-                    : 'native_messages';
-
-                  rememberRequest(state, {
-                    method: 'POST',
-                    path: '/v1/messages',
-                    entry_protocol: 'messages',
-                    ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                    routing_strategy: routingStrategy,
-                    upstream: upstream.name,
-                    key: key.label,
-                    model: requestedModel,
-                    actualModel: requestedModel,
-                    status: 0,
-                    streaming: isStreaming,
-                    retried: attempt > 1,
-                    succeeded: false,
-                    reason: error.message,
-                    route: routeTrace
-                  });
-                }
-
-                if (allowRetry) {
-                  return; // Will retry in next loop iteration
-                }
-              }
-
-              if (!res.headersSent) {
-                return anthropicErrorResponse(res, 502, 'api_error', `upstream request failed: ${error.message}`);
-              }
-            });
-
-            upstreamReq.on('timeout', () => {
-              upstreamReq.destroy();
-              if (!streamingBoundaryReached) {
-                recordFailure(state, upstream, key, 'timeout', 0, null);
-                recordAvailabilityAttempt(upstream, messagesProtocol, false);
-
-                // Record timeout for Dashboard (only if not retrying)
-                if (!allowRetry) {
-                  const routingStrategy = useAdapter
-                    ? 'messages_to_chat_completions'
-                    : 'native_messages';
-
-                  rememberRequest(state, {
-                    method: 'POST',
-                    path: '/v1/messages',
-                    entry_protocol: 'messages',
-                    ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-                    routing_strategy: routingStrategy,
-                    upstream: upstream.name,
-                    key: key.label,
-                    model: requestedModel,
-                    actualModel: requestedModel,
-                    status: 504,
-                    streaming: isStreaming,
-                    retried: attempt > 1,
-                    succeeded: false,
-                    reason: 'timeout',
-                    route: routeTrace
-                  });
-                }
-              }
-              if (!res.headersSent) {
-                return anthropicErrorResponse(res, 504, 'timeout_error', 'upstream request timeout');
-              }
-            });
-
-            upstreamReq.write(requestBody);
-            upstreamReq.end();
-
-            // Wait for response to complete
-            await new Promise((resolve, reject) => {
-              upstreamReq.on('error', reject);
-              res.on('finish', resolve);
-              res.on('error', reject);
-            });
-
-            persistStats(state, statsPath);
-            return; // Success, exit handler
           } catch (error) {
-            recordFailure(state, upstream, key, error.message, 0, null);
-            recordAvailabilityAttempt(upstream, messagesProtocol, false);
-            if (!allowRetry) {
-              persistStats(state, statsPath);
-              return anthropicErrorResponse(res, 502, 'api_error', `upstream request failed: ${error.message}`);
-            }
-            // Continue to next attempt
+            result = { type: 'retry', statusCode: 0, headers: {}, reason: error.message, startedAt: now() };
           }
+
+          if (result.type !== 'response') {
+            applyQuota(upstream, key, result.headers || {});
+            recordModelInteractionOutcome({
+              state,
+              upstream,
+              key,
+              statusCode: result.statusCode || 0,
+              startedAt: result.startedAt,
+              retried: attempt > 1,
+              succeeded: false,
+              reason: result.reason,
+              retryAfter: result.retryAfter,
+              protocol: messagesProtocol
+            });
+            rememberRequest(state, {
+              method: 'POST',
+              path: '/v1/messages',
+              entry_protocol: 'messages',
+              ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+              routing_strategy: useAdapter ? 'messages_to_chat_completions' : 'native_messages',
+              upstream: upstream.name,
+              key: key.label,
+              model: requestedModel,
+              actualModel: requestedModel,
+              status: result.statusCode || 0,
+              streaming: payload.stream === true,
+              retried: attempt > 1,
+              succeeded: false,
+              reason: result.reason,
+              route: routeTrace,
+              compatibility: messagesAdapterCompatibility ? compatibilitySummary(messagesAdapterCompatibility, routeTrace) : null
+            });
+            persistStats(state, statsPath);
+            if (allowRetry) {
+              await sleep(Math.min(1000, 100 * attempt));
+              continue;
+            }
+            return anthropicErrorResponse(res, result.statusCode === 504 ? 504 : 502, result.statusCode === 504 ? 'timeout_error' : 'api_error', `upstream request failed: ${result.reason}`);
+          }
+
+          applyQuota(upstream, key, result.response.headers);
+          const usageCapture = createUsageCapture(result.response.headers);
+          const statusCode = result.statusCode;
+          const isStreaming = payload.stream === true;
+          const compatibility = messagesAdapterCompatibility ? compatibilitySummary(messagesAdapterCompatibility, routeTrace) : null;
+          if (statusCode >= 200 && statusCode < 300) {
+            const contentType = String(result.response.headers['content-type'] || '').toLowerCase();
+            const headers = useAdapter
+              ? {
+                  'content-type': isStreaming && contentType.includes('text/event-stream') ? 'text/event-stream' : 'application/json',
+                  'x-codex-api-pool-upstream': upstream.name
+                }
+              : sanitizeResponseHeaders(result.response.headers, upstream.name);
+            addRouteTraceHeaders(headers, routeTrace);
+            if (compatibility) {
+              headers['x-codex-api-pool-compatibility'] = compatibility.mode;
+              headers['x-codex-api-pool-compatibility-trigger'] = compatibility.trigger;
+              headers['x-codex-api-pool-stripped'] = compatibilityStrippedHeader(compatibility.stripped);
+              headers['x-codex-api-pool-converted'] = compatibilityBucketHeader(compatibility.converted);
+              headers['x-codex-api-pool-downgraded'] = compatibilityBucketHeader(compatibility.downgraded);
+            }
+
+            if (useAdapter && isStreaming && contentType.includes('text/event-stream')) {
+              deleteHeader(headers, 'content-length');
+              res.writeHead(200, headers);
+              const adapter = createChatToMessagesStreamAdapter(res, requestedModel);
+              let streamFailed = false;
+              result.response.on('data', (chunk) => {
+                usageCapture.push(chunk);
+                adapter.write(chunk);
+              });
+              result.response.on('error', (error) => {
+                streamFailed = true;
+                if (!res.destroyed) res.destroy(error);
+              });
+              result.response.on('end', () => {
+                adapter.end();
+                upstream.inFlight = Math.max(0, upstream.inFlight - 1);
+                const capturedUsage = usageCapture.result();
+                const responseSucceeded = !streamFailed && capturedUsage.hasOutput && !capturedUsage.hasExplicitZeroOutputTokens;
+                const recordedTokens = recordModelInteractionOutcome({
+                  state,
+                  upstream,
+                  key,
+                  statusCode,
+                  startedAt: result.startedAt,
+                  retried: attempt > 1,
+                  succeeded: responseSucceeded,
+                  reason: responseSucceeded ? `HTTP ${statusCode}` : `HTTP ${statusCode} without concrete output`,
+                  tokenCount: capturedUsage.tokens,
+                  protocol: messagesProtocol
+                });
+                if (responseSucceeded) {
+                  const checkedAt = new Date().toISOString();
+                  recordProtocolCapabilityRealTraffic(upstream, messagesProtocol, { checkedAt, model: requestedModel, httpStatus: statusCode });
+                  updateHealthFromRealTraffic(upstream, key, { checkedAt, model: requestedModel, httpStatus: statusCode, latencyMs: now() - result.startedAt, protocol: messagesProtocol });
+                }
+                rememberRequest(state, {
+                  method: 'POST',
+                  path: '/v1/messages',
+                  entry_protocol: 'messages',
+                  ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+                  routing_strategy: 'messages_to_chat_completions',
+                  upstream: upstream.name,
+                  key: key.label,
+                  model: requestedModel,
+                  actualModel: requestedModel,
+                  status: statusCode,
+                  streaming: true,
+                  retried: attempt > 1,
+                  succeeded: responseSucceeded,
+                  route: routeTrace,
+                  tokens: recordedTokens.totalTokens,
+                  inputTokens: recordedTokens.inputTokens,
+                  outputTokens: recordedTokens.outputTokens,
+                  durationMs: now() - result.startedAt,
+                  outcome: responseSucceeded ? 'ok' : 'error',
+                  compatibility
+                });
+                persistStats(state, statsPath);
+              });
+              return;
+            }
+
+            if (useAdapter) {
+              const chunks = [];
+              let size = 0;
+              result.response.on('data', (chunk) => {
+                usageCapture.push(chunk);
+                size += chunk.length;
+                chunks.push(chunk);
+              });
+              await new Promise((resolve, reject) => {
+                result.response.on('end', resolve);
+                result.response.on('error', reject);
+              });
+              upstream.inFlight = Math.max(0, upstream.inFlight - 1);
+              const responseBody = Buffer.concat(chunks, size);
+              let convertedBody;
+              try {
+                convertedBody = chatCompletionToMessagesJson(responseBody, requestedModel);
+              } catch (error) {
+                persistStats(state, statsPath);
+                return anthropicErrorResponse(res, 500, 'api_error', `Response conversion failed: ${error.message}`);
+              }
+              headers['content-length'] = String(convertedBody.length);
+              res.writeHead(200, headers);
+              res.end(convertedBody);
+              const capturedUsage = usageCapture.result();
+              const responseSucceeded = hasConcreteOutputFromBody(convertedBody) && !capturedUsage.hasExplicitZeroOutputTokens;
+              const recordedTokens = recordModelInteractionOutcome({
+                state,
+                upstream,
+                key,
+                statusCode,
+                startedAt: result.startedAt,
+                retried: attempt > 1,
+                succeeded: responseSucceeded,
+                reason: responseSucceeded ? `HTTP ${statusCode}` : `HTTP ${statusCode} without concrete output`,
+                tokenCount: capturedUsage.tokens,
+                protocol: messagesProtocol
+              });
+              if (responseSucceeded) {
+                const checkedAt = new Date().toISOString();
+                recordProtocolCapabilityRealTraffic(upstream, messagesProtocol, { checkedAt, model: requestedModel, httpStatus: statusCode });
+                updateHealthFromRealTraffic(upstream, key, { checkedAt, model: requestedModel, httpStatus: statusCode, latencyMs: now() - result.startedAt, protocol: messagesProtocol });
+              }
+              rememberRequest(state, {
+                method: 'POST',
+                path: '/v1/messages',
+                entry_protocol: 'messages',
+                ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+                routing_strategy: 'messages_to_chat_completions',
+                upstream: upstream.name,
+                key: key.label,
+                model: requestedModel,
+                actualModel: requestedModel,
+                status: statusCode,
+                streaming: false,
+                retried: attempt > 1,
+                succeeded: responseSucceeded,
+                route: routeTrace,
+                tokens: recordedTokens.totalTokens,
+                inputTokens: recordedTokens.inputTokens,
+                outputTokens: recordedTokens.outputTokens,
+                durationMs: now() - result.startedAt,
+                outcome: responseSucceeded ? 'ok' : 'error',
+                compatibility
+              });
+              persistStats(state, statsPath);
+              return;
+            }
+
+            res.writeHead(statusCode, headers);
+            let streamFailed = false;
+            result.response.on('data', (chunk) => {
+              usageCapture.push(chunk);
+              res.write(chunk);
+            });
+            result.response.on('error', (error) => {
+              streamFailed = true;
+              if (!res.destroyed) res.destroy(error);
+            });
+            result.response.on('end', () => {
+              res.end();
+              upstream.inFlight = Math.max(0, upstream.inFlight - 1);
+              const capturedUsage = usageCapture.result();
+              const responseSucceeded = !streamFailed && capturedUsage.hasOutput && !capturedUsage.hasExplicitZeroOutputTokens;
+              const recordedTokens = recordModelInteractionOutcome({
+                state,
+                upstream,
+                key,
+                statusCode,
+                startedAt: result.startedAt,
+                retried: attempt > 1,
+                succeeded: responseSucceeded,
+                reason: responseSucceeded ? `HTTP ${statusCode}` : `HTTP ${statusCode} without concrete output`,
+                tokenCount: capturedUsage.tokens,
+                protocol: messagesProtocol
+              });
+              if (responseSucceeded) {
+                const checkedAt = new Date().toISOString();
+                recordProtocolCapabilityRealTraffic(upstream, messagesProtocol, { checkedAt, model: requestedModel, httpStatus: statusCode });
+                updateHealthFromRealTraffic(upstream, key, { checkedAt, model: requestedModel, httpStatus: statusCode, latencyMs: now() - result.startedAt, protocol: messagesProtocol });
+              }
+              rememberRequest(state, {
+                method: 'POST',
+                path: '/v1/messages',
+                entry_protocol: 'messages',
+                ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+                routing_strategy: 'native_messages',
+                upstream: upstream.name,
+                key: key.label,
+                model: requestedModel,
+                actualModel: requestedModel,
+                status: statusCode,
+                streaming: isStreaming,
+                retried: attempt > 1,
+                succeeded: responseSucceeded,
+                route: routeTrace,
+                tokens: recordedTokens.totalTokens,
+                inputTokens: recordedTokens.inputTokens,
+                outputTokens: recordedTokens.outputTokens,
+                durationMs: now() - result.startedAt,
+                outcome: responseSucceeded ? 'ok' : 'error'
+              });
+              persistStats(state, statsPath);
+            });
+            return;
+          }
+
+          const chunks = [];
+          let size = 0;
+          result.response.on('data', (chunk) => {
+            size += chunk.length;
+            chunks.push(chunk);
+          });
+          await new Promise((resolve, reject) => {
+            result.response.on('end', resolve);
+            result.response.on('error', reject);
+          });
+          upstream.inFlight = Math.max(0, upstream.inFlight - 1);
+          const errorBody = Buffer.concat(chunks, size).toString('utf8');
+          recordModelInteractionOutcome({
+            state,
+            upstream,
+            key,
+            statusCode,
+            startedAt: result.startedAt,
+            retried: attempt > 1,
+            succeeded: false,
+            reason: errorBody ? `HTTP ${statusCode}: ${errorBody.slice(0, 1000)}` : `HTTP ${statusCode}`,
+            retryAfter: result.response.headers?.['retry-after'],
+            protocol: messagesProtocol
+          });
+          rememberRequest(state, {
+            method: 'POST',
+            path: '/v1/messages',
+            entry_protocol: 'messages',
+            ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
+            routing_strategy: useAdapter ? 'messages_to_chat_completions' : 'native_messages',
+            upstream: upstream.name,
+            key: key.label,
+            model: requestedModel,
+            actualModel: requestedModel,
+            status: statusCode,
+            streaming: isStreaming,
+            retried: attempt > 1,
+            succeeded: false,
+            reason: `HTTP ${statusCode}`,
+            route: routeTrace,
+            compatibility
+          });
+          persistStats(state, statsPath);
+          if (useAdapter) {
+            try {
+              const openaiError = JSON.parse(errorBody);
+              return anthropicErrorResponse(res, statusCode, 'api_error', openaiError.error?.message || errorBody);
+            } catch {
+              return anthropicErrorResponse(res, statusCode, 'api_error', errorBody || `HTTP ${statusCode}`);
+            }
+          }
+          res.writeHead(statusCode, sanitizeResponseHeaders(result.response.headers, upstream.name));
+          res.end(errorBody);
+          return;
         }
 
         // No candidates or all attempts failed
@@ -14329,7 +14429,7 @@ export function createPoolServer(config, options = {}) {
           path: '/v1/messages',
           entry_protocol: 'messages',
           ...requestDebugFields(incomingHeaderSample, config.debug?.capture_request_headers === true ? originalBody : undefined),
-          routing_strategy: hasAnthropicUpstream ? 'native_messages' : (adapterModeEnabled ? 'messages_to_chat_completions' : 'none'),
+          routing_strategy: adapterFallbackActive ? 'messages_to_chat_completions' : (hasNativeMessagesRoute ? 'native_messages' : 'none'),
           upstream: null,
           key: null,
           model: requestedModel,
@@ -15045,6 +15145,8 @@ export const __testInternals = {
   initialProtocolCapabilities,
   recordProtocolCapabilityProbe,
   recordProtocolCapabilityRealTraffic,
+  recordProtocolCapabilityUnsupported,
+  revokeRealTrafficVerification,
   shouldRecheckProtocolCapability,
   joinUrlPath,
   joinTargetUrl,

@@ -133,9 +133,9 @@ console.log('Test 9: Field mappings');
   const hasMaxTokens = /max_tokens.*max_completion_tokens/.test(serverCode);
   const hasTemperature = /payload\.temperature.*chat\.temperature/.test(serverCode);
   const hasTopP = /payload\.top_p.*chat\.top_p/.test(serverCode);
-  const hasStop = /stop_sequences.*chat\.stop/.test(serverCode);
-  const hasResponseFormat = /output_config.*response_format/.test(serverCode);
-  const hasUserMetadata = /metadata\?\.user_id.*chat\.user/.test(serverCode);
+  const hasStop = /stop_sequences[\s\S]{0,160}chat\.stop/.test(serverCode);
+  const hasResponseFormat = /output_config[\s\S]{0,240}response_format/.test(serverCode);
+  const hasUserMetadata = /metadata\?\.user_id[\s\S]{0,120}chat\.user/.test(serverCode);
 
   if (hasMaxTokens && hasTemperature && hasTopP && hasStop && hasResponseFormat && hasUserMetadata) {
     console.log('  ✓ All field mappings present\n');

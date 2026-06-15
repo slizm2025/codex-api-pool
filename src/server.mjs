@@ -7881,14 +7881,12 @@ async function executeDebugLockedRequest(req, res, state, config, options) {
           }
           // Don't break - continue to test remaining protocols
         } else {
-          // Check if should fallback to next protocol
+          // Record fallback reason for diagnostics
           const { fallback, reason } = shouldFallbackToNextProtocol(statusCode, responseText);
           attempts[attempts.length - 1].fallback_reason = reason;
 
-          if (!fallback || i === sequence.length - 1) {
-            // Don't fallback or this is the last attempt
-            break;
-          }
+          // In debug lock mode, always continue testing remaining protocols
+          // even if fallback is false, to provide complete protocol diagnostics
         }
 
         // Continue to next protocol
